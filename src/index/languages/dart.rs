@@ -1,7 +1,9 @@
 use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
-use crate::index::symbols::{ExtractedImport, ExtractedSymbol, ParseResult, SymbolKind};
+use crate::index::symbols::{
+    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+};
 
 pub struct DartSupport;
 
@@ -21,12 +23,13 @@ impl LanguageSupport for DartSupport {
     fn extract(&self, source: &[u8], tree: &tree_sitter::Tree) -> ParseResult {
         let mut symbols = Vec::new();
         let mut imports = Vec::new();
+        let mut references = Vec::new();
         let root = tree.root_node();
-        extract_from_node(root, source, &mut symbols, &mut imports);
+        extract_from_node(root, source, &mut symbols, &mut imports, &mut references, None);
         ParseResult {
             symbols,
             imports,
-            references: Vec::new(),
+            references,
         }
     }
 }
@@ -48,6 +51,8 @@ fn extract_from_node(
     source: &[u8],
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
+    references: &mut Vec<ExtractedReference>,
+    enclosing: Option<usize>,
 ) {
     match node.kind() {
         "class_declaration" => {
@@ -55,6 +60,12 @@ fn extract_from_node(
                 let idx = symbols.len();
                 symbols.push(sym);
                 extract_class_body(node, source, idx, symbols);
+                // Sweep method bodies / field initializers for call + type
+                // references. The class itself owns references that occur
+                // directly in the header (superclass, `with`, `implements`);
+                // method-body references are attributed to the enclosing
+                // method below via a second pass on each function_body.
+                collect_references(node, source, Some(idx), references);
             }
             return;
         }
@@ -63,12 +74,15 @@ fn extract_from_node(
                 let idx = symbols.len();
                 symbols.push(sym);
                 extract_class_body(node, source, idx, symbols);
+                collect_references(node, source, Some(idx), references);
             }
             return;
         }
         "enum_declaration" => {
             if let Some(sym) = extract_named_decl(node, source, SymbolKind::Enum) {
+                let idx = symbols.len();
                 symbols.push(sym);
+                collect_references(node, source, Some(idx), references);
             }
             return;
         }
@@ -77,19 +91,34 @@ fn extract_from_node(
                 let idx = symbols.len();
                 symbols.push(sym);
                 extract_class_body(node, source, idx, symbols);
+                collect_references(node, source, Some(idx), references);
             }
             return;
         }
         "type_alias" => {
             if let Some(sym) = extract_type_alias(node, source) {
+                let idx = symbols.len();
                 symbols.push(sym);
+                collect_references(node, source, Some(idx), references);
             }
             return;
         }
         "function_signature" => {
             if is_top_level(node)
                 && let Some(sym) = extract_function(node, source) {
+                    let idx = symbols.len();
                     symbols.push(sym);
+                    // Sweep the signature (for param/return type refs) and
+                    // the adjacent function_body sibling (for call and
+                    // type refs in the body). Using the shared source_file
+                    // parent here would bleed references from unrelated
+                    // top-level declarations into this function.
+                    collect_references(node, source, Some(idx), references);
+                    if let Some(body) = node.next_sibling()
+                        && body.kind() == "function_body"
+                    {
+                        collect_references(body, source, Some(idx), references);
+                    }
                 }
             return;
         }
@@ -109,12 +138,14 @@ fn extract_from_node(
             if is_top_level(node) {
                 let kind = resolve_variable_kind(node);
                 extract_variable_list(node, source, kind, symbols);
+                collect_references(node, source, enclosing, references);
             }
             return;
         }
         "initialized_identifier_list" => {
             if is_top_level(node) {
                 extract_initialized_list(node, source, symbols);
+                collect_references(node, source, enclosing, references);
             }
             return;
         }
@@ -122,7 +153,7 @@ fn extract_from_node(
     }
 
     for child in children(node) {
-        extract_from_node(child, source, symbols, imports);
+        extract_from_node(child, source, symbols, imports, references, enclosing);
     }
 }
 
@@ -498,6 +529,125 @@ fn node_text(node: Node, source: &[u8]) -> String {
         .to_string()
 }
 
+/// Walks `root` and records call-site and type-reference edges. Dart's
+/// tree-sitter grammar exposes call sites under a handful of parent kinds
+/// (`function_expression_invocation`, `method_invocation`,
+/// `invocation_expression`, `selector`) where the callee lives in an
+/// `identifier` child. We treat a `type_identifier` as a TypeRef unless its
+/// parent is itself a declaration header (class/mixin/enum/extension/type
+/// alias), to avoid recording a class as a reference to itself.
+///
+/// References inside method bodies are attributed to the enclosing class
+/// symbol (not the individual method), matching what `extract_class_body`
+/// records as the symbol unit. This is coarser than TypeScript's
+/// per-method attribution but still produces meaningful call edges at the
+/// file level, and it keeps the initial Dart port small.
+fn collect_references(
+    root: Node,
+    source: &[u8],
+    enclosing: Option<usize>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let mut cursor = root.walk();
+    let mut stack: Vec<Node> = children(root).collect();
+    while let Some(node) = stack.pop() {
+        record_reference(node, source, enclosing, references);
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn record_reference(
+    node: Node,
+    source: &[u8],
+    enclosing: Option<usize>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let line = node.start_position().row as u32 + 1;
+    match node.kind() {
+        // Tree-sitter-dart emits calls as two sibling nodes under the
+        // parent: an `identifier` for the callee and a `selector` that
+        // contains an `argument_part`. Detect the shape by looking at the
+        // selector: if it wraps an argument_part, the previous sibling's
+        // identifier text is the callee.
+        "selector" => {
+            let has_args = children(node).any(|c| c.kind() == "argument_part");
+            if !has_args {
+                return;
+            }
+            let Some(prev) = node.prev_sibling() else {
+                return;
+            };
+            if prev.kind() != "identifier" {
+                return;
+            }
+            let name = node_text(prev, source);
+            if name.is_empty() {
+                return;
+            }
+            references.push(ExtractedReference {
+                name,
+                line: prev.start_position().row as u32 + 1,
+                from_symbol_idx: enclosing,
+                kind: ReferenceKind::Call,
+            });
+        }
+        // Type positions: parameter annotations, field/variable types,
+        // return types. The grammar uses `type_identifier` only here;
+        // declaration headers (`class Foo`) use plain `identifier`, so no
+        // self-reference filtering is needed.
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() && !is_dart_builtin_type(&name) {
+                references.push(ExtractedReference {
+                    name,
+                    line,
+                    from_symbol_idx: enclosing,
+                    kind: ReferenceKind::TypeRef,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_dart_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "double"
+            | "num"
+            | "bool"
+            | "String"
+            | "void"
+            | "dynamic"
+            | "Object"
+            | "Null"
+            | "Never"
+            | "List"
+            | "Map"
+            | "Set"
+            | "Iterable"
+            | "Future"
+            | "Stream"
+            | "Function"
+            | "Symbol"
+            | "Type"
+            | "Record"
+            | "Enum"
+            | "Comparable"
+            | "DateTime"
+            | "Duration"
+            | "RegExp"
+            | "Uri"
+            | "BigInt"
+            | "StackTrace"
+            | "Error"
+            | "Exception"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,5 +854,159 @@ final appName = 'MyApp';
             .find(|i| i.source == "model.dart")
             .unwrap();
         assert!(part.is_reexport);
+    }
+
+    #[test]
+    #[ignore = "debug aid — dumps AST"]
+    fn _dump_ast_for_calls() {
+        let src = r#"
+class Animal {}
+class Dog {
+  final Animal parent;
+  Dog(this.parent);
+  Animal get ancestor => parent;
+}
+Dog adopt(Animal a) => Dog(a);
+Duration wait = Duration(seconds: 1);
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&Language::new(tree_sitter_dart::LANGUAGE))
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        fn walk(n: Node, src: &[u8], d: usize) {
+            let t: String = std::str::from_utf8(&src[n.start_byte()..n.end_byte().min(src.len())])
+                .unwrap_or("")
+                .chars()
+                .take(40)
+                .collect();
+            eprintln!("{}{} {:?}", "  ".repeat(d), n.kind(), t);
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                walk(ch, src, d + 1);
+            }
+        }
+        walk(tree.root_node(), src.as_bytes(), 0);
+    }
+
+    #[test]
+    fn extracts_call_references() {
+        let source = r#"
+void helper() {}
+
+void main() {
+  helper();
+  print('hi');
+}
+"#;
+        let result = parse_dart(source);
+        let calls: Vec<&str> = result
+            .references
+            .iter()
+            .filter(|r| matches!(r.kind, ReferenceKind::Call))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"helper"),
+            "expected `helper` call ref, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&"print"),
+            "expected `print` call ref, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_type_references() {
+        let source = r#"
+class Greeter {
+  final Duration delay;
+  Greeter(this.delay);
+  DateTime now() => DateTime.now();
+}
+"#;
+        let result = parse_dart(source);
+        let type_refs: Vec<&str> = result
+            .references
+            .iter()
+            .filter(|r| matches!(r.kind, ReferenceKind::TypeRef))
+            .map(|r| r.name.as_str())
+            .collect();
+        // Duration and DateTime are Dart builtins — they must be filtered.
+        assert!(
+            !type_refs.contains(&"Duration"),
+            "builtin Duration should not be a type ref, got {type_refs:?}"
+        );
+        assert!(
+            !type_refs.contains(&"DateTime"),
+            "builtin DateTime should not be a type ref, got {type_refs:?}"
+        );
+        // Greeter is the declared class itself — its own header must not
+        // produce a self-reference.
+        let self_refs: Vec<_> = result
+            .references
+            .iter()
+            .filter(|r| r.name == "Greeter")
+            .collect();
+        assert!(
+            self_refs.is_empty(),
+            "declared class name must not appear as its own reference, got {self_refs:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_user_type_references() {
+        let source = r#"
+class Animal {}
+
+class Dog {
+  final Animal parent;
+  Dog(this.parent);
+}
+
+Dog adopt(Animal a) => Dog(a);
+"#;
+        let result = parse_dart(source);
+        let type_refs: Vec<&str> = result
+            .references
+            .iter()
+            .filter(|r| matches!(r.kind, ReferenceKind::TypeRef))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            type_refs.contains(&"Animal"),
+            "expected `Animal` type ref, got {type_refs:?}"
+        );
+    }
+
+    #[test]
+    fn attributes_references_to_enclosing_symbol() {
+        let source = r#"
+void helper() {}
+
+class Worker {
+  void run() {
+    helper();
+  }
+}
+"#;
+        let result = parse_dart(source);
+        // The `helper()` call inside Worker.run should be attributed to
+        // the enclosing Worker class symbol (coarse but correct).
+        let worker_idx = result
+            .symbols
+            .iter()
+            .position(|s| s.name == "Worker")
+            .expect("Worker symbol exists");
+        let helper_call = result
+            .references
+            .iter()
+            .find(|r| r.name == "helper" && matches!(r.kind, ReferenceKind::Call))
+            .expect("helper call ref exists");
+        assert_eq!(
+            helper_call.from_symbol_idx,
+            Some(worker_idx),
+            "helper() inside Worker.run should attribute to Worker"
+        );
     }
 }
