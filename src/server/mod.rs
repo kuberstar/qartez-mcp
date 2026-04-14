@@ -2623,7 +2623,7 @@ impl QartezServer {
 
     #[tool(
         name = "qartez_project",
-        description = "Run project commands (test, build, lint, typecheck) with auto-detected toolchain (Cargo, npm/bun/yarn, Go, Python, Make). Use action='info' to see detected commands. Use filter for targeted runs (e.g., test name).",
+        description = "Run project commands (test, build, lint, typecheck) with auto-detected toolchain (Cargo, npm/bun/yarn/pnpm, Go, Python, Dart/Flutter, Maven, Gradle, sbt, Ruby, Make). Use action='info' to see detected commands. Use filter for targeted runs (e.g., test name).",
         annotations(
             title = "Run Project Command",
             read_only_hint = false,
@@ -2641,7 +2641,7 @@ impl QartezServer {
 
         if action == ProjectAction::Info {
             if all_toolchains.is_empty() {
-                return Err("No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, Gemfile, Makefile".to_string());
+                return Err("No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string());
             }
             let mut out = String::new();
             for (i, tc) in all_toolchains.iter().enumerate() {
@@ -2669,7 +2669,7 @@ impl QartezServer {
         }
 
         let tc = all_toolchains.into_iter().next().ok_or_else(|| {
-            "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, Gemfile, Makefile".to_string()
+            "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string()
         })?;
 
         if action == ProjectAction::Run {

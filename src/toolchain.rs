@@ -130,6 +130,35 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
         });
     }
 
+    if project_root.join("pubspec.yaml").exists() {
+        let pubspec = std::fs::read_to_string(project_root.join("pubspec.yaml")).unwrap_or_default();
+        let is_flutter = pubspec_uses_flutter(&pubspec);
+        let has_build_runner = pubspec.contains("build_runner:");
+        let driver = if is_flutter { "flutter" } else { "dart" };
+
+        let build_cmd = if has_build_runner {
+            vec![
+                "dart".into(),
+                "run".into(),
+                "build_runner".into(),
+                "build".into(),
+                "--delete-conflicting-outputs".into(),
+            ]
+        } else {
+            vec![driver.into(), "pub".into(), "get".into()]
+        };
+
+        toolchains.push(DetectedToolchain {
+            name: if is_flutter { "flutter".into() } else { "dart".into() },
+            build_tool: driver.into(),
+            test_cmd: vec![driver.into(), "test".into()],
+            build_cmd,
+            lint_cmd: Some(vec![driver.into(), "analyze".into()]),
+            // `dart analyze` covers static type checking — no separate typechecker.
+            typecheck_cmd: Some(vec![driver.into(), "analyze".into()]),
+        });
+    }
+
     if project_root.join("Makefile").exists() {
         toolchains.push(DetectedToolchain {
             name: "make".to_string(),
@@ -157,6 +186,43 @@ pub fn binary_available(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn pubspec_uses_flutter(pubspec: &str) -> bool {
+    // Flutter projects declare `flutter:` under `dependencies:` with `sdk: flutter`,
+    // or include a top-level `flutter:` configuration block. Either signal is enough.
+    let mut in_deps = false;
+    let mut saw_flutter_key = false;
+    for raw in pubspec.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = trimmed.len() - trimmed.trim_start().len();
+        let body = trimmed.trim_start();
+
+        if indent == 0 {
+            in_deps = matches!(body, "dependencies:" | "dev_dependencies:");
+            if body == "flutter:" {
+                return true;
+            }
+            saw_flutter_key = false;
+            continue;
+        }
+
+        if in_deps && indent == 2 && body == "flutter:" {
+            saw_flutter_key = true;
+            continue;
+        }
+        if saw_flutter_key && indent >= 4 && body.starts_with("sdk:") && body.contains("flutter") {
+            return true;
+        }
+        if indent <= 2 {
+            saw_flutter_key = false;
+        }
+    }
+    false
 }
 
 fn detect_node_package_manager(project_root: &Path) -> String {
@@ -425,6 +491,77 @@ mod tests {
 
         let tc = detect_toolchain(dir.path()).unwrap();
         assert_eq!(tc.name, "scala");
+    }
+
+    #[test]
+    fn test_detect_dart_library() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: my_lib\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\n",
+        )
+        .unwrap();
+
+        let tc = detect_toolchain(dir.path()).unwrap();
+        assert_eq!(tc.name, "dart");
+        assert_eq!(tc.build_tool, "dart");
+        assert_eq!(tc.test_cmd, vec!["dart", "test"]);
+        assert_eq!(tc.build_cmd, vec!["dart", "pub", "get"]);
+        assert_eq!(tc.lint_cmd.unwrap(), vec!["dart", "analyze"]);
+        assert_eq!(tc.typecheck_cmd.unwrap(), vec!["dart", "analyze"]);
+    }
+
+    #[test]
+    fn test_detect_dart_with_build_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: my_lib\ndev_dependencies:\n  build_runner: ^2.4.0\n",
+        )
+        .unwrap();
+
+        let tc = detect_toolchain(dir.path()).unwrap();
+        assert_eq!(tc.name, "dart");
+        assert_eq!(
+            tc.build_cmd,
+            vec![
+                "dart",
+                "run",
+                "build_runner",
+                "build",
+                "--delete-conflicting-outputs",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_detect_flutter_via_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+
+        let tc = detect_toolchain(dir.path()).unwrap();
+        assert_eq!(tc.name, "flutter");
+        assert_eq!(tc.build_tool, "flutter");
+        assert_eq!(tc.test_cmd, vec!["flutter", "test"]);
+        assert_eq!(tc.build_cmd, vec!["flutter", "pub", "get"]);
+        assert_eq!(tc.lint_cmd.unwrap(), vec!["flutter", "analyze"]);
+    }
+
+    #[test]
+    fn test_detect_flutter_via_top_level_block() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: my_app\nflutter:\n  uses-material-design: true\n",
+        )
+        .unwrap();
+
+        let tc = detect_toolchain(dir.path()).unwrap();
+        assert_eq!(tc.name, "flutter");
     }
 
     #[test]
