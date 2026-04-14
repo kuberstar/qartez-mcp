@@ -59,13 +59,17 @@ fn extract_from_node(
             if let Some(sym) = extract_class(node, source) {
                 let idx = symbols.len();
                 symbols.push(sym);
-                extract_class_body(node, source, idx, symbols);
-                // Sweep method bodies / field initializers for call + type
-                // references. The class itself owns references that occur
-                // directly in the header (superclass, `with`, `implements`);
-                // method-body references are attributed to the enclosing
-                // method below via a second pass on each function_body.
-                collect_references(node, source, Some(idx), references);
+                // Class-header references (superclass, `with`, `implements`)
+                // attribute to the class. Skip the body — `extract_class_body`
+                // walks each member and attributes per-method.
+                collect_references_skip(
+                    node,
+                    source,
+                    Some(idx),
+                    references,
+                    &["class_body"],
+                );
+                extract_class_body(node, source, idx, symbols, references);
             }
             return;
         }
@@ -73,8 +77,14 @@ fn extract_from_node(
             if let Some(sym) = extract_named_decl(node, source, SymbolKind::Trait) {
                 let idx = symbols.len();
                 symbols.push(sym);
-                extract_class_body(node, source, idx, symbols);
-                collect_references(node, source, Some(idx), references);
+                collect_references_skip(
+                    node,
+                    source,
+                    Some(idx),
+                    references,
+                    &["class_body"],
+                );
+                extract_class_body(node, source, idx, symbols, references);
             }
             return;
         }
@@ -90,8 +100,14 @@ fn extract_from_node(
             if let Some(sym) = extract_named_decl(node, source, SymbolKind::Class) {
                 let idx = symbols.len();
                 symbols.push(sym);
-                extract_class_body(node, source, idx, symbols);
-                collect_references(node, source, Some(idx), references);
+                collect_references_skip(
+                    node,
+                    source,
+                    Some(idx),
+                    references,
+                    &["extension_body"],
+                );
+                extract_class_body(node, source, idx, symbols, references);
             }
             return;
         }
@@ -289,6 +305,7 @@ fn extract_class_body(
     source: &[u8],
     class_idx: usize,
     symbols: &mut Vec<ExtractedSymbol>,
+    references: &mut Vec<ExtractedReference>,
 ) {
     let body = children(class_node)
         .find(|c| c.kind() == "class_body" || c.kind() == "extension_body");
@@ -301,7 +318,29 @@ fn extract_class_body(
             continue;
         }
         if let Some(sym) = extract_member(member, source, class_idx) {
+            let method_idx = symbols.len();
             symbols.push(sym);
+            // Walk this method's body (and signature) for call + type
+            // references attributed to the method itself, not the class.
+            let method_body = member
+                .child_by_field_name("body")
+                .or_else(|| children(member).find(|c| c.kind() == "function_body"));
+            if let Some(b) = method_body {
+                collect_references(b, source, Some(method_idx), references);
+            }
+            // Sweep the signature too so parameter and return types attribute
+            // to the method.
+            collect_references_skip(
+                member,
+                source,
+                Some(method_idx),
+                references,
+                &["function_body"],
+            );
+        } else {
+            // Non-method member (e.g. field with initializer): attribute any
+            // references to the enclosing class.
+            collect_references(member, source, Some(class_idx), references);
         }
     }
 }
@@ -550,21 +589,39 @@ fn node_text(node: Node, source: &[u8]) -> String {
 /// parent is itself a declaration header (class/mixin/enum/extension/type
 /// alias), to avoid recording a class as a reference to itself.
 ///
-/// References inside method bodies are attributed to the enclosing class
-/// symbol (not the individual method), matching what `extract_class_body`
-/// records as the symbol unit. This is coarser than TypeScript's
-/// per-method attribution but still produces meaningful call edges at the
-/// file level, and it keeps the initial Dart port small.
+/// References inside method bodies are attributed per-method by
+/// `extract_class_body`; this function is invoked separately on each
+/// method body with `enclosing = method_idx`. Class-level call sites pass
+/// `["class_body"]` (or `["extension_body"]`) to `collect_references_skip`
+/// so the class header sweep stops at the body boundary.
 fn collect_references(
     root: Node,
     source: &[u8],
     enclosing: Option<usize>,
     references: &mut Vec<ExtractedReference>,
 ) {
+    collect_references_skip(root, source, enclosing, references, &[]);
+}
+
+/// Like `collect_references` but does not descend into nodes whose kind is
+/// listed in `skip_kinds`. Used so that a class-level sweep can record
+/// references in the class header (superclass, `with`, `implements`) without
+/// also bleeding every method-body call into the class symbol — those are
+/// attributed per-method by `extract_class_body`.
+fn collect_references_skip(
+    root: Node,
+    source: &[u8],
+    enclosing: Option<usize>,
+    references: &mut Vec<ExtractedReference>,
+    skip_kinds: &[&str],
+) {
     let mut cursor = root.walk();
     let mut stack: Vec<Node> = children(root).collect();
     while let Some(node) = stack.pop() {
         record_reference(node, source, enclosing, references);
+        if skip_kinds.contains(&node.kind()) {
+            continue;
+        }
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
@@ -1062,7 +1119,7 @@ Dog adopt(Animal a) => Dog(a);
     }
 
     #[test]
-    fn attributes_references_to_enclosing_symbol() {
+    fn attributes_method_body_calls_to_method() {
         let source = r#"
 void helper() {}
 
@@ -1073,13 +1130,11 @@ class Worker {
 }
 "#;
         let result = parse_dart(source);
-        // The `helper()` call inside Worker.run should be attributed to
-        // the enclosing Worker class symbol (coarse but correct).
-        let worker_idx = result
+        let run_idx = result
             .symbols
             .iter()
-            .position(|s| s.name == "Worker")
-            .expect("Worker symbol exists");
+            .position(|s| s.name == "run")
+            .expect("run method exists");
         let helper_call = result
             .references
             .iter()
@@ -1087,8 +1142,72 @@ class Worker {
             .expect("helper call ref exists");
         assert_eq!(
             helper_call.from_symbol_idx,
-            Some(worker_idx),
-            "helper() inside Worker.run should attribute to Worker"
+            Some(run_idx),
+            "helper() inside Worker.run should attribute to run, not Worker"
+        );
+    }
+
+    #[test]
+    fn cross_class_method_call_attributes_to_caller_method() {
+        let source = r#"
+class A {
+  void foo() {}
+}
+
+class B {
+  void bar() {
+    foo();
+  }
+}
+"#;
+        let result = parse_dart(source);
+        let bar_idx = result
+            .symbols
+            .iter()
+            .position(|s| s.name == "bar")
+            .expect("bar method exists");
+        let b_idx = result
+            .symbols
+            .iter()
+            .position(|s| s.name == "B")
+            .expect("B class exists");
+        let foo_call = result
+            .references
+            .iter()
+            .find(|r| r.name == "foo" && matches!(r.kind, ReferenceKind::Call))
+            .expect("foo call ref exists");
+        assert_eq!(
+            foo_call.from_symbol_idx,
+            Some(bar_idx),
+            "foo() inside B.bar should attribute to bar (not B)"
+        );
+        assert_ne!(foo_call.from_symbol_idx, Some(b_idx));
+    }
+
+    #[test]
+    fn class_header_type_refs_attribute_to_class() {
+        let source = r#"
+abstract class Animal {}
+
+class Dog extends Animal {
+  void bark() {}
+}
+"#;
+        let result = parse_dart(source);
+        let dog_idx = result
+            .symbols
+            .iter()
+            .position(|s| s.name == "Dog")
+            .expect("Dog class exists");
+        let animal_ref = result
+            .references
+            .iter()
+            .find(|r| r.name == "Animal" && matches!(r.kind, ReferenceKind::TypeRef))
+            .expect("Animal type ref exists");
+        assert_eq!(
+            animal_ref.from_symbol_idx,
+            Some(dog_idx),
+            "Animal in `extends Animal` should attribute to Dog (class header)"
         );
     }
 }
