@@ -83,6 +83,7 @@ impl LanguageSupport for HelmSupport {
                     line,
                     from_symbol_idx: None,
                     kind: ReferenceKind::Call,
+                    receiver_type_hint: None,
                 });
             }
         }

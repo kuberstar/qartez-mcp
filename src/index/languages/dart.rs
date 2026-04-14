@@ -1,9 +1,17 @@
+use std::collections::HashMap;
+
 use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
 };
+
+/// Identifier → declared type name, populated from formal parameters, typed
+/// locals, and (for methods) enclosing-class fields. Used by the resolver's
+/// receiver-type heuristic: a call `receiver.method(...)` emits a hint when
+/// `receiver` is a bare identifier found in this map.
+type ScopeEnv = HashMap<String, String>;
 
 pub struct DartSupport;
 
@@ -129,11 +137,14 @@ fn extract_from_node(
                     // type refs in the body). Using the shared source_file
                     // parent here would bleed references from unrelated
                     // top-level declarations into this function.
-                    collect_references(node, source, Some(idx), references);
+                    let mut env = ScopeEnv::new();
+                    collect_param_types(node, source, &mut env);
+                    collect_references_scoped(node, source, Some(idx), references, &[], Some(&env));
                     if let Some(body) = node.next_sibling()
                         && body.kind() == "function_body"
                     {
-                        collect_references(body, source, Some(idx), references);
+                        collect_local_types(body, source, &mut env);
+                        collect_references_scoped(body, source, Some(idx), references, &[], Some(&env));
                     }
                 }
             return;
@@ -313,6 +324,10 @@ fn extract_class_body(
         Some(b) => b,
         None => return,
     };
+    // Build the class-level field type environment once; every method below
+    // layers its params + locals on top of this base.
+    let mut class_fields = ScopeEnv::new();
+    collect_class_field_types(class_node, source, &mut class_fields);
     for member in children(body) {
         if member.kind() != "class_member" {
             continue;
@@ -325,22 +340,42 @@ fn extract_class_body(
             let method_body = member
                 .child_by_field_name("body")
                 .or_else(|| children(member).find(|c| c.kind() == "function_body"));
+            let mut method_env = class_fields.clone();
+            collect_param_types(member, source, &mut method_env);
             if let Some(b) = method_body {
-                collect_references(b, source, Some(method_idx), references);
+                collect_local_types(b, source, &mut method_env);
+                collect_references_scoped(
+                    b,
+                    source,
+                    Some(method_idx),
+                    references,
+                    &[],
+                    Some(&method_env),
+                );
             }
             // Sweep the signature too so parameter and return types attribute
             // to the method.
-            collect_references_skip(
+            collect_references_scoped(
                 member,
                 source,
                 Some(method_idx),
                 references,
                 &["function_body"],
+                Some(&method_env),
             );
         } else {
             // Non-method member (e.g. field with initializer): attribute any
-            // references to the enclosing class.
-            collect_references(member, source, Some(class_idx), references);
+            // references to the enclosing class. Field initializers can see
+            // sibling field types (useful for `this.x` patterns) so pass the
+            // class env.
+            collect_references_scoped(
+                member,
+                source,
+                Some(class_idx),
+                references,
+                &[],
+                Some(&class_fields),
+            );
         }
     }
 }
@@ -600,7 +635,7 @@ fn collect_references(
     enclosing: Option<usize>,
     references: &mut Vec<ExtractedReference>,
 ) {
-    collect_references_skip(root, source, enclosing, references, &[]);
+    collect_references_scoped(root, source, enclosing, references, &[], None);
 }
 
 /// Like `collect_references` but does not descend into nodes whose kind is
@@ -615,10 +650,21 @@ fn collect_references_skip(
     references: &mut Vec<ExtractedReference>,
     skip_kinds: &[&str],
 ) {
+    collect_references_scoped(root, source, enclosing, references, skip_kinds, None);
+}
+
+fn collect_references_scoped(
+    root: Node,
+    source: &[u8],
+    enclosing: Option<usize>,
+    references: &mut Vec<ExtractedReference>,
+    skip_kinds: &[&str],
+    env: Option<&ScopeEnv>,
+) {
     let mut cursor = root.walk();
     let mut stack: Vec<Node> = children(root).collect();
     while let Some(node) = stack.pop() {
-        record_reference(node, source, enclosing, references);
+        record_reference(node, source, enclosing, references, env);
         if skip_kinds.contains(&node.kind()) {
             continue;
         }
@@ -633,6 +679,7 @@ fn record_reference(
     source: &[u8],
     enclosing: Option<usize>,
     references: &mut Vec<ExtractedReference>,
+    env: Option<&ScopeEnv>,
 ) {
     let line = node.start_position().row as u32 + 1;
     match node.kind() {
@@ -667,8 +714,12 @@ fn record_reference(
             let Some(prev) = node.prev_sibling() else {
                 return;
             };
-            let (callee_text, callee_line) = match prev.kind() {
-                "identifier" => (node_text(prev, source), prev.start_position().row as u32 + 1),
+            let (callee_text, callee_line, receiver_type_hint) = match prev.kind() {
+                "identifier" => (
+                    node_text(prev, source),
+                    prev.start_position().row as u32 + 1,
+                    None,
+                ),
                 "selector" => {
                     let Some(member) = children(prev).find_map(|c| {
                         if c.kind() == "unconditional_assignable_selector"
@@ -681,9 +732,24 @@ fn record_reference(
                     }) else {
                         return;
                     };
+                    // Receiver hint: walk back one more sibling past the
+                    // dot-selector. For `foo.method()` that sibling is the
+                    // bare `identifier "foo"`. Skip cases where the receiver
+                    // is anything else (a `this`, another selector chain,
+                    // parenthesized expression) — those belong to option (c)
+                    // full inference.
+                    let hint = prev.prev_sibling().and_then(|recv| {
+                        if recv.kind() == "identifier" {
+                            let name = node_text(recv, source);
+                            env.and_then(|e| e.get(&name)).cloned()
+                        } else {
+                            None
+                        }
+                    });
                     (
                         node_text(member, source),
                         member.start_position().row as u32 + 1,
+                        hint,
                     )
                 }
                 _ => return,
@@ -696,6 +762,7 @@ fn record_reference(
                 line: callee_line,
                 from_symbol_idx: enclosing,
                 kind: ReferenceKind::Call,
+                receiver_type_hint,
             });
         }
         // Type positions: parameter annotations, field/variable types,
@@ -710,10 +777,145 @@ fn record_reference(
                     line,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    receiver_type_hint: None,
                 });
             }
         }
         _ => {}
+    }
+}
+
+/// Collect `field_name -> type_name` entries from a class/mixin/extension
+/// body. Walks each `class_member`'s leading `declaration` subtree; a field
+/// is a declaration whose first `type_identifier` child (non-builtin) is
+/// followed by an `initialized_identifier_list`. Methods are skipped because
+/// their `declaration` carries a `function_signature` / `method_signature`
+/// instead of a typed identifier list.
+fn collect_class_field_types(class_node: Node, source: &[u8], env: &mut ScopeEnv) {
+    let Some(body) = children(class_node)
+        .find(|c| c.kind() == "class_body" || c.kind() == "extension_body")
+    else {
+        return;
+    };
+    for member in children(body) {
+        if member.kind() != "class_member" {
+            continue;
+        }
+        // A field member wraps a `declaration` whose sibling is `;`. Method
+        // members wrap a `method_signature`. Skip anything without a bare
+        // declaration.
+        let Some(decl) = children(member).find(|c| c.kind() == "declaration") else {
+            continue;
+        };
+        // Method declarations nest a `function_signature`/`getter_signature`/etc.
+        // Field declarations do not.
+        let has_sig = children(decl).any(|c| {
+            matches!(
+                c.kind(),
+                "function_signature"
+                    | "method_signature"
+                    | "getter_signature"
+                    | "setter_signature"
+                    | "constructor_signature"
+                    | "factory_constructor_signature"
+            )
+        });
+        if has_sig {
+            continue;
+        }
+        let type_name = children(decl)
+            .find(|c| c.kind() == "type_identifier")
+            .map(|c| node_text(c, source));
+        let Some(type_name) = type_name else { continue };
+        if type_name.is_empty() || is_dart_builtin_type(&type_name) {
+            continue;
+        }
+        // Field names live under `initialized_identifier_list` →
+        // `initialized_identifier` → `identifier`. Static/final field lists
+        // use `static_final_declaration_list` with the same leaf shape.
+        for list in children(decl) {
+            let list_kind = list.kind();
+            if list_kind != "initialized_identifier_list"
+                && list_kind != "static_final_declaration_list"
+            {
+                continue;
+            }
+            for init in children(list) {
+                let ident = match init.kind() {
+                    "initialized_identifier" => children(init).find(|c| c.kind() == "identifier"),
+                    "static_final_declaration" => children(init).find(|c| c.kind() == "identifier"),
+                    _ => None,
+                };
+                if let Some(id) = ident {
+                    let name = node_text(id, source);
+                    if !name.is_empty() {
+                        env.insert(name, type_name.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Walk a `formal_parameter_list` (or any node containing one) and insert
+/// `param_name -> type_name` entries. Dart's tree-sitter emits
+/// `formal_parameter` with a direct `type_identifier` child (the annotation)
+/// and an `identifier` child (the parameter name). Untyped parameters and
+/// `this.x` constructor params are silently skipped.
+fn collect_param_types(sig_node: Node, source: &[u8], env: &mut ScopeEnv) {
+    let mut cursor = sig_node.walk();
+    let mut stack: Vec<Node> = vec![sig_node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "formal_parameter" {
+            let type_name = children(n)
+                .find(|c| c.kind() == "type_identifier")
+                .map(|c| node_text(c, source));
+            let var_name = children(n)
+                .find(|c| c.kind() == "identifier")
+                .map(|c| node_text(c, source));
+            if let (Some(t), Some(v)) = (type_name, var_name)
+                && !t.is_empty()
+                && !v.is_empty()
+                && !is_dart_builtin_type(&t)
+            {
+                env.insert(v, t);
+            }
+            continue;
+        }
+        for c in n.children(&mut cursor) {
+            stack.push(c);
+        }
+    }
+}
+
+/// Walk a function body and insert `local_name -> type_name` for typed locals
+/// declared via `final T x = ...;`, `T x = ...;`, or `const T x = ...;`. The
+/// relevant AST shape is `initialized_variable_definition` with direct
+/// `type_identifier` and `identifier` children.
+fn collect_local_types(body: Node, source: &[u8], env: &mut ScopeEnv) {
+    let mut cursor = body.walk();
+    let mut stack: Vec<Node> = vec![body];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "initialized_variable_definition" {
+            let type_name = children(n)
+                .find(|c| c.kind() == "type_identifier")
+                .map(|c| node_text(c, source));
+            let var_name = children(n)
+                .find(|c| c.kind() == "identifier")
+                .map(|c| node_text(c, source));
+            if let (Some(t), Some(v)) = (type_name, var_name)
+                && !t.is_empty()
+                && !v.is_empty()
+                && !is_dart_builtin_type(&t)
+            {
+                env.insert(v, t);
+            }
+            // Still descend — nested closures may declare further typed
+            // locals we want to pick up.
+        }
+        for c in n.children(&mut cursor) {
+            stack.push(c);
+        }
     }
 }
 
@@ -987,6 +1189,35 @@ final appName = 'MyApp';
 
     #[test]
     #[ignore = "debug aid — dumps AST"]
+    fn _dump_ast_for_typed_scope() {
+        let src = r#"
+class Foo { void doit() {} }
+class Bar {
+  final Foo foo;
+  Bar(this.foo);
+  void run(Foo other) {
+    foo.doit();
+    other.doit();
+    final Foo local = Foo();
+    local.doit();
+  }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&Language::new(tree_sitter_dart::LANGUAGE)).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        fn w(n: Node, src: &[u8], d: usize) {
+            let t: String = std::str::from_utf8(&src[n.start_byte()..n.end_byte().min(src.len())])
+                .unwrap_or("").chars().take(60).collect();
+            eprintln!("{}{} {:?}", "  ".repeat(d), n.kind(), t);
+            let mut c = n.walk();
+            for ch in n.children(&mut c) { w(ch, src, d + 1); }
+        }
+        w(tree.root_node(), src.as_bytes(), 0);
+    }
+
+    #[test]
+    #[ignore = "debug aid — dumps AST"]
     fn _dump_ast_for_calls() {
         let src = r#"
 void setUp() {
@@ -1208,6 +1439,127 @@ class Dog extends Animal {
             animal_ref.from_symbol_idx,
             Some(dog_idx),
             "Animal in `extends Animal` should attribute to Dog (class header)"
+        );
+    }
+
+    fn call_ref<'a>(result: &'a ParseResult, name: &str) -> &'a ExtractedReference {
+        result
+            .references
+            .iter()
+            .find(|r| r.name == name && matches!(r.kind, ReferenceKind::Call))
+            .unwrap_or_else(|| panic!("expected call ref to `{name}`"))
+    }
+
+    #[test]
+    fn typed_local_populates_receiver_hint() {
+        let source = r#"
+class Foo { void doit() {} }
+
+void run() {
+  final Foo local = Foo();
+  local.doit();
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "doit");
+        assert_eq!(
+            call.receiver_type_hint.as_deref(),
+            Some("Foo"),
+            "local.doit() should carry Foo receiver hint"
+        );
+    }
+
+    #[test]
+    fn typed_parameter_populates_receiver_hint() {
+        let source = r#"
+class Foo { void doit() {} }
+
+void run(Foo other) {
+  other.doit();
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "doit");
+        assert_eq!(
+            call.receiver_type_hint.as_deref(),
+            Some("Foo"),
+            "parameter `Foo other` should carry Foo receiver hint at other.doit()"
+        );
+    }
+
+    #[test]
+    fn typed_field_populates_receiver_hint() {
+        let source = r#"
+class Foo { void doit() {} }
+
+class Bar {
+  final Foo foo;
+  Bar(this.foo);
+  void run() {
+    foo.doit();
+  }
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "doit");
+        assert_eq!(
+            call.receiver_type_hint.as_deref(),
+            Some("Foo"),
+            "class field `Foo foo` should carry Foo hint at foo.doit()"
+        );
+    }
+
+    #[test]
+    fn untyped_receiver_leaves_hint_none() {
+        let source = r#"
+class Foo { void doit() {} }
+
+void run() {
+  var x = Foo();
+  x.doit();
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "doit");
+        assert!(
+            call.receiver_type_hint.is_none(),
+            "untyped `var x` must not produce a receiver hint, got {:?}",
+            call.receiver_type_hint
+        );
+    }
+
+    #[test]
+    fn bare_call_has_no_receiver_hint() {
+        let source = r#"
+void helper() {}
+
+void run() {
+  helper();
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "helper");
+        assert!(
+            call.receiver_type_hint.is_none(),
+            "bare calls have no receiver; hint must stay None"
+        );
+    }
+
+    #[test]
+    fn builtin_typed_receiver_is_skipped() {
+        // `String` is filtered by is_dart_builtin_type; even though we know
+        // the type, emitting a hint for it is pointless — there is no
+        // user-defined symbol named `String` in the project index.
+        let source = r#"
+void run(String s) {
+  s.trim();
+}
+"#;
+        let result = parse_dart(source);
+        let call = call_ref(&result, "trim");
+        assert!(
+            call.receiver_type_hint.is_none(),
+            "builtin types must not emit hints"
         );
     }
 }

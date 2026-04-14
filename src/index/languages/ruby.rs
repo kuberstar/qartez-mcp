@@ -157,6 +157,7 @@ fn record_reference(
             line: node.start_position().row as u32 + 1,
             from_symbol_idx: enclosing,
             kind: ReferenceKind::Call,
+            receiver_type_hint: None,
         });
     }
 }

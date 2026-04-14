@@ -373,6 +373,7 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                receiver_type_hint: None,
             });
         }
     }
@@ -388,6 +389,7 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                receiver_type_hint: None,
             });
         }
     }
@@ -403,6 +405,7 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                receiver_type_hint: None,
             });
         }
     }
@@ -416,6 +419,7 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                receiver_type_hint: None,
             });
         }
     }
@@ -440,6 +444,7 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                receiver_type_hint: None,
             });
         }
     }

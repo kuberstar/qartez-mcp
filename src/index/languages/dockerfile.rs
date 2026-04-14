@@ -150,6 +150,7 @@ impl LanguageSupport for DockerfileSupport {
                         line: line_num,
                         from_symbol_idx: None,
                         kind: ReferenceKind::Use,
+                        receiver_type_hint: None,
                     });
                 }
             }
