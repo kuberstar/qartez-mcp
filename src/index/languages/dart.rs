@@ -571,6 +571,24 @@ fn record_reference(
         // selector: if it wraps an argument_part, the previous sibling's
         // identifier text is the callee.
         "selector" => {
+            // Calls in tree-sitter-dart show up as a `selector` whose child
+            // is an `argument_part`. The callee lives in the previous
+            // sibling. Two shapes:
+            //
+            //   bare/constructor call    `Foo(args)`
+            //     identifier "Foo"         <-- prev sibling
+            //     selector "(args)"        <-- this node
+            //
+            //   method call              `obj.method(args)`
+            //     identifier "obj"
+            //     selector ".method"       <-- prev sibling (no argument_part)
+            //       unconditional_assignable_selector
+            //         identifier "method"  <-- the callee
+            //     selector "(args)"        <-- this node
+            //
+            // For the bare shape we read the identifier directly; for the
+            // method shape we descend into the prev selector to find the
+            // member identifier.
             let has_args = children(node).any(|c| c.kind() == "argument_part");
             if !has_args {
                 return;
@@ -578,16 +596,33 @@ fn record_reference(
             let Some(prev) = node.prev_sibling() else {
                 return;
             };
-            if prev.kind() != "identifier" {
-                return;
-            }
-            let name = node_text(prev, source);
-            if name.is_empty() {
+            let (callee_text, callee_line) = match prev.kind() {
+                "identifier" => (node_text(prev, source), prev.start_position().row as u32 + 1),
+                "selector" => {
+                    let Some(member) = children(prev).find_map(|c| {
+                        if c.kind() == "unconditional_assignable_selector"
+                            || c.kind() == "conditional_assignable_selector"
+                        {
+                            children(c).find(|g| g.kind() == "identifier")
+                        } else {
+                            None
+                        }
+                    }) else {
+                        return;
+                    };
+                    (
+                        node_text(member, source),
+                        member.start_position().row as u32 + 1,
+                    )
+                }
+                _ => return,
+            };
+            if callee_text.is_empty() {
                 return;
             }
             references.push(ExtractedReference {
-                name,
-                line: prev.start_position().row as u32 + 1,
+                name: callee_text,
+                line: callee_line,
                 from_symbol_idx: enclosing,
                 kind: ReferenceKind::Call,
             });
@@ -863,14 +898,11 @@ final appName = 'MyApp';
     #[ignore = "debug aid — dumps AST"]
     fn _dump_ast_for_calls() {
         let src = r#"
-class Animal {}
-class Dog {
-  final Animal parent;
-  Dog(this.parent);
-  Animal get ancestor => parent;
+void setUp() {
+  facade = SweFacade(swe, ephePath: ephePath);
+  obj.method(arg);
+  Body.Sun;
 }
-Dog adopt(Animal a) => Dog(a);
-Duration wait = Duration(seconds: 1);
 "#;
         let mut parser = Parser::new();
         parser
@@ -900,6 +932,8 @@ void helper() {}
 void main() {
   helper();
   print('hi');
+  facade = SweFacade(swe);
+  obj.method(arg);
 }
 "#;
         let result = parse_dart(source);
@@ -916,6 +950,17 @@ void main() {
         assert!(
             calls.contains(&"print"),
             "expected `print` call ref, got {calls:?}"
+        );
+        // Constructor-style call inside an assignment must be picked up.
+        assert!(
+            calls.contains(&"SweFacade"),
+            "expected `SweFacade` call ref (constructor in assignment), got {calls:?}"
+        );
+        // Method call `obj.method(arg)` — the method name (not the receiver)
+        // is the call target.
+        assert!(
+            calls.contains(&"method"),
+            "expected `method` call ref (method invocation), got {calls:?}"
         );
     }
 
