@@ -14,7 +14,7 @@ use crate::storage::read;
 use crate::storage::write;
 
 use parser::ParserPool;
-use symbols::{ExtractedImport, ExtractedReference, compute_shape_hash};
+use symbols::{ExtractedImport, ExtractedReference, ReferenceKind, compute_shape_hash};
 
 struct IndexedFile {
     file_id: i64,
@@ -216,19 +216,58 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
 /// using file-level import edges — which target is the most plausible.
 /// Ambiguous names that match many symbols and no import are dropped to
 /// keep the edge count manageable on large codebases.
+/// Candidate entry in the resolver's name index: symbol id, its file id,
+/// and its declared symbol kind. Kind is stored so the resolver can filter
+/// candidates by reference kind — a Call cannot target a variable or
+/// field; a TypeRef cannot target a method.
+type Candidate = (i64, i64, String);
+
+/// Returns true if a symbol of `sym_kind` is a plausible target for a
+/// reference of `ref_kind`. Unknown kinds fall through conservatively
+/// (we would rather keep a questionable edge than drop a valid one when
+/// a language extractor emits a kind we have not mapped here yet).
+fn kind_is_compatible(ref_kind: ReferenceKind, sym_kind: &str) -> bool {
+    match ref_kind {
+        // Plain functions + methods are the obvious case. Classes/structs/
+        // enums/interfaces are included because languages like Dart, Java,
+        // and Kotlin write constructor calls as `Foo(x)` — syntactically a
+        // Call whose target is the type symbol. `type` covers typedefs
+        // used as constructor aliases.
+        ReferenceKind::Call => matches!(
+            sym_kind,
+            "function"
+                | "method"
+                | "class"
+                | "struct"
+                | "enum"
+                | "interface"
+                | "trait"
+                | "type"
+        ),
+        // Type positions resolve only to type-like symbols.
+        ReferenceKind::TypeRef => matches!(
+            sym_kind,
+            "class" | "struct" | "enum" | "interface" | "trait" | "type"
+        ),
+        // Bare identifier use is too underspecified to filter safely.
+        ReferenceKind::Use => true,
+    }
+}
+
 fn resolve_symbol_references(
     conn: &Connection,
     indexed: &[IndexedFile],
     imports_by_file: &HashMap<i64, HashSet<i64>>,
 ) -> Result<()> {
-    // (name -> [(symbol_id, file_id)]) built once for the whole project.
+    // (name -> [(symbol_id, file_id, kind)]) built once for the whole project.
     let all_syms = read::get_all_symbols_with_path(conn)?;
-    let mut name_index: HashMap<String, Vec<(i64, i64)>> = HashMap::with_capacity(all_syms.len());
+    let mut name_index: HashMap<String, Vec<Candidate>> =
+        HashMap::with_capacity(all_syms.len());
     for (sym, _path) in &all_syms {
         name_index
             .entry(sym.name.clone())
             .or_default()
-            .push((sym.id, sym.file_id));
+            .push((sym.id, sym.file_id, sym.kind.clone()));
     }
 
     let mut batch: Vec<(i64, i64, &'static str)> = Vec::new();
@@ -236,6 +275,7 @@ fn resolve_symbol_references(
     let mut dropped_no_enclosing = 0usize;
     let mut dropped_no_candidate = 0usize;
     let mut dropped_ambiguous = 0usize;
+    let mut resolved_by_kind_filter = 0usize;
 
     for entry in indexed {
         let empty_imports = HashSet::new();
@@ -257,27 +297,47 @@ fn resolve_symbol_references(
                 continue;
             };
 
-            let candidates = match name_index.get(&reference.name) {
-                Some(c) if !c.is_empty() => c,
+            let raw_candidates = match name_index.get(&reference.name) {
+                Some(c) if !c.is_empty() => c.as_slice(),
                 _ => {
                     dropped_no_candidate += 1;
                     continue;
                 }
             };
 
+            // Kind filter: restrict candidates to kinds that a reference
+            // of this kind could plausibly resolve to. Keeps an ambiguous
+            // name (e.g. a variable `length` and a method `length`) from
+            // being dropped at P3 when one of the candidates is the only
+            // plausible target given the call-vs-type context.
+            let filtered: Vec<&Candidate> = raw_candidates
+                .iter()
+                .filter(|(_, _, k)| kind_is_compatible(reference.kind, k))
+                .collect();
+            let narrowed_by_kind =
+                !filtered.is_empty() && filtered.len() < raw_candidates.len();
+            // Fall back to the raw list if kind-filtering erased every
+                // option — avoids silently dropping edges when a language
+                // extractor emits a kind this resolver has not mapped.
+            let candidates: Vec<&Candidate> = if filtered.is_empty() {
+                raw_candidates.iter().collect()
+            } else {
+                filtered
+            };
+
             // Priority 1: target lives in the same file as the caller.
             let mut picked: Vec<i64> = candidates
                 .iter()
-                .filter(|(sid, fid)| *fid == entry.file_id && *sid != from_id)
-                .map(|(sid, _)| *sid)
+                .filter(|(sid, fid, _)| *fid == entry.file_id && *sid != from_id)
+                .map(|(sid, _, _)| *sid)
                 .collect();
 
             // Priority 2: target lives in a file this caller imports from.
             if picked.is_empty() {
                 picked = candidates
                     .iter()
-                    .filter(|(_, fid)| imported.contains(fid))
-                    .map(|(sid, _)| *sid)
+                    .filter(|(_, fid, _)| imported.contains(fid))
+                    .map(|(sid, _, _)| *sid)
                     .collect();
             }
 
@@ -294,6 +354,10 @@ fn resolve_symbol_references(
                 }
             }
 
+            if narrowed_by_kind {
+                resolved_by_kind_filter += 1;
+            }
+
             for target in picked {
                 batch.push((from_id, target, reference.kind.as_str()));
                 resolved += 1;
@@ -304,8 +368,9 @@ fn resolve_symbol_references(
     write::insert_symbol_refs(conn, &batch)?;
 
     tracing::info!(
-        "symbol references: {} resolved, {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
+        "symbol references: {} resolved ({} via kind filter), {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
         resolved,
+        resolved_by_kind_filter,
         dropped_no_enclosing,
         dropped_no_candidate,
         dropped_ambiguous,
