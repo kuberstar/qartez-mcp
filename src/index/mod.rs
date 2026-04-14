@@ -609,13 +609,20 @@ fn read_go_module(root: &Path) -> Option<String> {
 /// Resolves a Dart `import`/`part` specifier to a file path relative to `root`.
 ///
 /// Handles three specifier shapes:
-///   * `dart:io`, `dart:async`      → SDK, not in the workspace, return empty.
-///   * `package:NAME/a/b.dart`      → look up NAME in the workspace package
-///                                    map and rewrite to `<pkg-dir>/lib/a/b.dart`.
+///   * `dart:io`, `dart:async` — SDK, not in the workspace, return empty.
+///   * `package:NAME/a/b.dart` — look up NAME in the workspace package map
+///     and rewrite to `<pkg-dir>/lib/a/b.dart`.
 ///   * relative (`./x.dart`, `../x.dart`, `x.dart`) — including `part`
-///                                    directives, which always carry a
-///                                    relative URI — fall through to the
-///                                    generic relative resolver.
+///     directives, which always carry a relative URI — fall through to the
+///     generic relative resolver.
+///
+/// **Scope:** workspace-only. Only packages whose `pubspec.yaml` lives inside
+/// `root` are resolvable; path-/git-dependencies outside the workspace and
+/// pub-cache packages are intentionally ignored. We do not consult
+/// `.dart_tool/package_config.json` — it requires `pub get` to be fresh and
+/// would pull cache paths that are irrelevant for symbol indexing. A
+/// `package:` import whose package name is not in the workspace map returns
+/// no edge.
 fn resolve_dart_import(
     rel_path: &str,
     specifier: &str,

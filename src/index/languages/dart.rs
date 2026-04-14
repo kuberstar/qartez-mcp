@@ -399,16 +399,29 @@ fn extract_import(node: Node, source: &[u8]) -> Option<ExtractedImport> {
     if uri.is_empty() {
         return None;
     }
+    // Dart's `import_or_export` covers both `import '…';` and `export '…';`.
+    // A barrel library re-exports its internal files so every consumer of the
+    // barrel transitively depends on them — we record that as an edge (with
+    // is_reexport=true) so impact/blast analysis walks through the barrel.
+    let is_reexport = is_export_directive(node);
     Some(ExtractedImport {
         source: uri,
         specifiers: vec![],
-        is_reexport: false,
+        is_reexport,
     })
+}
+
+fn is_export_directive(node: Node) -> bool {
+    children(node).any(|c| matches!(c.kind(), "library_export" | "export_specification"))
 }
 
 fn find_configurable_uri(node: Node, source: &[u8]) -> Option<String> {
     for child in children(node) {
-        if child.kind() == "library_import" || child.kind() == "import_specification" {
+        if child.kind() == "library_import"
+            || child.kind() == "import_specification"
+            || child.kind() == "library_export"
+            || child.kind() == "export_specification"
+        {
             return find_configurable_uri(child, source);
         }
         if child.kind() == "configurable_uri" {
@@ -759,6 +772,30 @@ mod tests {
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].source, "package:flutter/material.dart");
         assert!(!result.imports[0].is_reexport);
+    }
+
+    #[test]
+    fn test_export_directive_is_tracked_as_reexport() {
+        // Barrel libraries re-export internal files so downstream importers
+        // of the barrel transitively reach them. The edge must be recorded,
+        // and is_reexport must be true so consumers can tell it apart from a
+        // real `import`.
+        let result = parse_dart(
+            r#"library arrow_swe;
+
+export 'src/swe_facade.dart';
+export 'src/eph_snapshot.dart';
+"#,
+        );
+        assert_eq!(result.imports.len(), 2, "two export edges expected");
+        assert!(
+            result.imports.iter().all(|i| i.is_reexport),
+            "export directives must set is_reexport=true, got {:?}",
+            result.imports
+        );
+        let sources: Vec<&str> = result.imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(sources.contains(&"src/swe_facade.dart"));
+        assert!(sources.contains(&"src/eph_snapshot.dart"));
     }
 
     #[test]

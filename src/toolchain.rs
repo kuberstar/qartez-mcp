@@ -189,9 +189,12 @@ pub fn binary_available(name: &str) -> bool {
 }
 
 fn pubspec_uses_flutter(pubspec: &str) -> bool {
-    // Flutter projects declare `flutter:` under `dependencies:` with `sdk: flutter`,
-    // or include a top-level `flutter:` configuration block. Either signal is enough.
-    let mut in_deps = false;
+    // Flutter projects declare `flutter:` under *runtime* `dependencies:` with
+    // `sdk: flutter`, or include a top-level `flutter:` configuration block.
+    // `dev_dependencies:` is explicitly excluded — pure-Dart packages commonly
+    // test with `flutter_test`, and we must not flip those to the Flutter
+    // toolchain.
+    let mut in_runtime_deps = false;
     let mut saw_flutter_key = false;
     for raw in pubspec.lines() {
         let line = raw.split('#').next().unwrap_or("");
@@ -203,7 +206,7 @@ fn pubspec_uses_flutter(pubspec: &str) -> bool {
         let body = trimmed.trim_start();
 
         if indent == 0 {
-            in_deps = matches!(body, "dependencies:" | "dev_dependencies:");
+            in_runtime_deps = body == "dependencies:";
             if body == "flutter:" {
                 return true;
             }
@@ -211,7 +214,7 @@ fn pubspec_uses_flutter(pubspec: &str) -> bool {
             continue;
         }
 
-        if in_deps && indent == 2 && body == "flutter:" {
+        if in_runtime_deps && indent == 2 && body == "flutter:" {
             saw_flutter_key = true;
             continue;
         }
@@ -549,6 +552,28 @@ mod tests {
         assert_eq!(tc.test_cmd, vec!["flutter", "test"]);
         assert_eq!(tc.build_cmd, vec!["flutter", "pub", "get"]);
         assert_eq!(tc.lint_cmd.unwrap(), vec!["flutter", "analyze"]);
+    }
+
+    #[test]
+    fn test_flutter_sdk_under_dev_dependencies_stays_dart() {
+        // Pure-Dart libraries commonly depend on `flutter_test` for their
+        // widget tests, which pulls `flutter: sdk: flutter` into
+        // `dev_dependencies`. The toolchain must stay `dart`, not flip to
+        // `flutter`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: pure_dart_lib\n\
+             dev_dependencies:\n\
+             \u{0020}\u{0020}flutter:\n\
+             \u{0020}\u{0020}\u{0020}\u{0020}sdk: flutter\n\
+             \u{0020}\u{0020}flutter_test:\n\
+             \u{0020}\u{0020}\u{0020}\u{0020}sdk: flutter\n",
+        )
+        .unwrap();
+
+        let tc = detect_toolchain(dir.path()).unwrap();
+        assert_eq!(tc.name, "dart", "dev-only flutter must stay dart toolchain");
     }
 
     #[test]
