@@ -1777,6 +1777,11 @@ fn test_analyze_cochanges_file_count_filtering() {
     make_commit(&repo, &["c.rs"], "one file");
 
     let conn = setup();
+    // Pre-register files as `full_index` would: co-change no longer creates
+    // phantom rows, so paths must already exist in `files` to participate.
+    write::get_or_create_file(&conn, "a.rs").unwrap();
+    write::get_or_create_file(&conn, "b.rs").unwrap();
+    write::get_or_create_file(&conn, "c.rs").unwrap();
     let config = CoChangeConfig {
         commit_limit: 100,
         min_files: 2,
@@ -1900,6 +1905,10 @@ fn test_analyze_cochanges_subdirectory_dotfile_not_filtered() {
     make_commit(&repo, &[".github/ci.yml", "src/main.rs"], "github ci");
 
     let conn = setup();
+    // Pre-register files as `full_index` would — co-change now skips paths
+    // that aren't in the files table.
+    write::get_or_create_file(&conn, ".github/ci.yml").unwrap();
+    write::get_or_create_file(&conn, "src/main.rs").unwrap();
     analyze_cochanges(&conn, dir.path(), &CoChangeConfig::default()).unwrap();
 
     // .github/ci.yml should NOT be filtered because only the filename
