@@ -33,6 +33,7 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     let files = walker::walk_source_files(root);
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
+    let dart_packages = read_dart_packages(root);
 
     tracing::info!("found {} source files on disk", files.len());
 
@@ -168,6 +169,7 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
                 root,
                 &known_paths,
                 go_module.as_deref(),
+                Some(&dart_packages),
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -318,6 +320,7 @@ fn resolve_targets(
     root: &Path,
     known_files: &HashSet<String>,
     go_module: Option<&str>,
+    dart_packages: Option<&HashMap<String, String>>,
 ) -> Vec<String> {
     match language {
         "rust" => resolve_rust_import(rel_path, specifier, known_files)
@@ -327,6 +330,7 @@ fn resolve_targets(
             .into_iter()
             .collect(),
         "go" => resolve_go_import(specifier, known_files, go_module),
+        "dart" => resolve_dart_import(rel_path, specifier, root, known_files, dart_packages),
         _ => {
             let importing_file = root.join(rel_path);
             resolve_import(&importing_file, specifier, root, known_files)
@@ -599,6 +603,126 @@ fn read_go_module(root: &Path) -> Option<String> {
     })
 }
 
+// --- Dart ---
+
+/// Resolves a Dart `import`/`part` specifier to a file path relative to `root`.
+///
+/// Handles three specifier shapes:
+///   * `dart:io`, `dart:async`      → SDK, not in the workspace, return empty.
+///   * `package:NAME/a/b.dart`      → look up NAME in the workspace package
+///                                    map and rewrite to `<pkg-dir>/lib/a/b.dart`.
+///   * relative (`./x.dart`, `../x.dart`, `x.dart`) — including `part`
+///                                    directives, which always carry a
+///                                    relative URI — fall through to the
+///                                    generic relative resolver.
+fn resolve_dart_import(
+    rel_path: &str,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+    dart_packages: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    if specifier.starts_with("dart:") {
+        return vec![];
+    }
+
+    if let Some(rest) = specifier.strip_prefix("package:") {
+        let packages = match dart_packages {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let (name, tail) = match rest.split_once('/') {
+            Some(parts) => parts,
+            None => return vec![],
+        };
+        let pkg_dir = match packages.get(name) {
+            Some(d) => d,
+            None => return vec![],
+        };
+        let candidate = if pkg_dir.is_empty() {
+            format!("lib/{tail}")
+        } else {
+            format!("{pkg_dir}/lib/{tail}")
+        };
+        let normalized = normalize_path(Path::new(&candidate))
+            .to_string_lossy()
+            .to_string();
+        if known_files.contains(&normalized) {
+            return vec![normalized];
+        }
+        return vec![];
+    }
+
+    let importing_file = root.join(rel_path);
+    resolve_import(&importing_file, specifier, root, known_files)
+        .into_iter()
+        .collect()
+}
+
+/// Walks the workspace for `pubspec.yaml` files and returns a map from each
+/// declared package name to its directory (relative to `root`, forward-slash
+/// form, empty string for a pubspec at the root). Used by
+/// `resolve_dart_import` to translate `package:foo/…` imports to real files.
+fn read_dart_packages(root: &Path) -> HashMap<String, String> {
+    let mut packages = HashMap::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("pubspec.yaml") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let Some(name) = parse_pubspec_name(&content) else {
+            continue;
+        };
+
+        let rel_dir = match path.parent().and_then(|p| p.strip_prefix(root).ok()) {
+            Some(p) => p.to_string_lossy().replace('\\', "/"),
+            None => continue,
+        };
+
+        packages.insert(name, rel_dir);
+    }
+
+    packages
+}
+
+/// Extracts the top-level `name:` field from a `pubspec.yaml` body. Only
+/// unindented `name:` keys count — an indented `name:` under some other
+/// mapping must not hijack the package identity.
+fn parse_pubspec_name(pubspec: &str) -> Option<String> {
+    for raw in pubspec.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            let value = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 // --- Helpers ---
 
 fn normalize_path(path: &Path) -> std::path::PathBuf {
@@ -649,6 +773,7 @@ pub fn incremental_index(
 
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
+    let dart_packages = read_dart_packages(root);
 
     let tx = conn.unchecked_transaction()?;
 
@@ -766,6 +891,7 @@ pub fn incremental_index(
                 root,
                 &known_paths,
                 go_module.as_deref(),
+                Some(&dart_packages),
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -1053,6 +1179,199 @@ mod tests {
         let known = HashSet::new();
         let result = resolve_go_import("pkg/utils", &known, None);
         assert!(result.is_empty());
+    }
+
+    // --- Dart resolver ---
+
+    #[test]
+    fn test_parse_pubspec_name_simple() {
+        let yaml = "name: arrow_core\nversion: 0.1.0\n";
+        assert_eq!(parse_pubspec_name(yaml), Some("arrow_core".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_quoted() {
+        assert_eq!(
+            parse_pubspec_name("name: 'arrow_core'\n"),
+            Some("arrow_core".to_string())
+        );
+        assert_eq!(
+            parse_pubspec_name("name: \"arrow_core\"\n"),
+            Some("arrow_core".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_ignores_indented() {
+        let yaml = "dev_dependencies:\n  pkg:\n    name: nested\n";
+        assert_eq!(parse_pubspec_name(yaml), None);
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_ignores_comments() {
+        let yaml = "# name: wrong\nname: right\n";
+        assert_eq!(parse_pubspec_name(yaml), Some("right".to_string()));
+    }
+
+    #[test]
+    fn test_read_dart_packages_monorepo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("options")).unwrap();
+        fs::create_dir_all(root.join("core")).unwrap();
+        fs::write(root.join("options/pubspec.yaml"), "name: arrow_options\n").unwrap();
+        fs::write(root.join("core/pubspec.yaml"), "name: arrow_core\n").unwrap();
+
+        let packages = read_dart_packages(root);
+        assert_eq!(packages.get("arrow_options"), Some(&"options".to_string()));
+        assert_eq!(packages.get("arrow_core"), Some(&"core".to_string()));
+    }
+
+    #[test]
+    fn test_read_dart_packages_root_pubspec() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("pubspec.yaml"), "name: arrow\n").unwrap();
+
+        let packages = read_dart_packages(root);
+        assert_eq!(packages.get("arrow"), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_dart_import_package() {
+        let mut pkgs = HashMap::new();
+        pkgs.insert("arrow_options".to_string(), "options".to_string());
+        let mut known = HashSet::new();
+        known.insert("options/lib/src/body.dart".to_string());
+        known.insert("options/lib/arrow_options.dart".to_string());
+
+        let result = resolve_dart_import(
+            "core/lib/src/chart.dart",
+            "package:arrow_options/src/body.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["options/lib/src/body.dart".to_string()]);
+
+        let result = resolve_dart_import(
+            "core/lib/src/chart.dart",
+            "package:arrow_options/arrow_options.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["options/lib/arrow_options.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_dart_import_package_at_root() {
+        let mut pkgs = HashMap::new();
+        pkgs.insert("arrow".to_string(), "".to_string());
+        let mut known = HashSet::new();
+        known.insert("lib/src/chart.dart".to_string());
+
+        let result = resolve_dart_import(
+            "lib/main.dart",
+            "package:arrow/src/chart.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["lib/src/chart.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_dart_import_sdk_is_empty() {
+        let pkgs = HashMap::new();
+        let known = HashSet::new();
+        assert!(
+            resolve_dart_import(
+                "lib/main.dart",
+                "dart:async",
+                Path::new("/"),
+                &known,
+                Some(&pkgs)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_resolve_dart_import_unknown_package_is_empty() {
+        let pkgs = HashMap::new();
+        let known = HashSet::new();
+        assert!(
+            resolve_dart_import(
+                "lib/main.dart",
+                "package:flutter/material.dart",
+                Path::new("/"),
+                &known,
+                Some(&pkgs)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_resolve_dart_import_relative() {
+        let pkgs = HashMap::new();
+        let mut known = HashSet::new();
+        known.insert("lib/src/helper.dart".to_string());
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let result = resolve_dart_import(
+            "lib/src/main.dart",
+            "./helper.dart",
+            root,
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["lib/src/helper.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_full_index_resolves_dart_package_imports() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("options/lib/src")).unwrap();
+        fs::create_dir_all(root.join("core/lib/src")).unwrap();
+        fs::write(root.join("options/pubspec.yaml"), "name: arrow_options\n").unwrap();
+        fs::write(root.join("core/pubspec.yaml"), "name: arrow_core\n").unwrap();
+        fs::write(
+            root.join("options/lib/src/body.dart"),
+            "enum Body { sun, moon }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("core/lib/src/chart.dart"),
+            "import 'package:arrow_options/src/body.dart';\n\
+             class Chart { Body? sun; }\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, true).unwrap();
+
+        let chart_id = read::get_file_by_path(&conn, "core/lib/src/chart.dart")
+            .unwrap()
+            .unwrap()
+            .id;
+        let body_id = read::get_file_by_path(&conn, "options/lib/src/body.dart")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let edges = read::get_all_edges(&conn).unwrap();
+        let has_edge = edges
+            .iter()
+            .any(|e| e.0 == chart_id && e.1 == body_id);
+        assert!(
+            has_edge,
+            "expected chart.dart → body.dart import edge, got edges {edges:?}"
+        );
     }
 
     // --- Integration tests ---
