@@ -30,23 +30,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Database ready at {}", config.db_path.display());
 
     if config.has_project {
-        for root in &config.project_roots {
-            tracing::info!("Indexing root: {}", root.display());
-            index::full_index(&conn, root, config.reindex)?;
-        }
-        graph::pagerank::compute_pagerank(&conn, &Default::default())?;
-        graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
-        git::cochange::analyze_cochanges(
-            &conn,
-            &config.primary_root,
-            &git::cochange::CoChangeConfig {
-                commit_limit: config.git_depth,
-                ..Default::default()
-            },
-        )?;
-        tracing::info!("Index complete for {} root(s)", config.project_roots.len());
-
         if let Some(wiki_path) = cli.wiki.as_ref() {
+            // Wiki generation depends on a fresh index + pagerank + co-change,
+            // and the CLI caller is explicitly waiting for the output file.
+            // Keep this path synchronous.
+            for root in &config.project_roots {
+                tracing::info!("Indexing root: {}", root.display());
+                index::full_index(&conn, root, config.reindex)?;
+            }
+            graph::pagerank::compute_pagerank(&conn, &Default::default())?;
+            graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
+            git::cochange::analyze_cochanges(
+                &conn,
+                &config.primary_root,
+                &git::cochange::CoChangeConfig {
+                    commit_limit: config.git_depth,
+                    ..Default::default()
+                },
+            )?;
+            tracing::info!("Index complete for {} root(s)", config.project_roots.len());
+
             let project_name = config
                 .primary_root
                 .canonicalize()
@@ -80,6 +83,58 @@ async fn main() -> anyhow::Result<()> {
                 abs.display(),
                 modularity.unwrap_or(0.0),
             );
+        } else {
+            // MCP-server path: spawn indexing on a dedicated connection so
+            // `server.serve()` below can answer `initialize`/`list_tools`
+            // immediately. Tool calls issued before the background task
+            // finishes see whatever the DB carried over from the previous
+            // run (empty on first-ever start).
+            let db_path = config.db_path.clone();
+            let project_roots = config.project_roots.clone();
+            let primary_root = config.primary_root.clone();
+            let reindex = config.reindex;
+            let git_depth = config.git_depth;
+            tokio::task::spawn_blocking(move || {
+                let conn = match storage::open_db(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("background indexer: open_db failed: {e}");
+                        return;
+                    }
+                };
+                for root in &project_roots {
+                    tracing::info!("Indexing root: {}", root.display());
+                    if let Err(e) = index::full_index(&conn, root, reindex) {
+                        tracing::error!(
+                            "background indexer: full_index failed for {}: {e}",
+                            root.display()
+                        );
+                        return;
+                    }
+                }
+                if let Err(e) = graph::pagerank::compute_pagerank(&conn, &Default::default()) {
+                    tracing::error!("background indexer: pagerank failed: {e}");
+                }
+                if let Err(e) =
+                    graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())
+                {
+                    tracing::error!("background indexer: symbol_pagerank failed: {e}");
+                }
+                if let Err(e) = git::cochange::analyze_cochanges(
+                    &conn,
+                    &primary_root,
+                    &git::cochange::CoChangeConfig {
+                        commit_limit: git_depth,
+                        ..Default::default()
+                    },
+                ) {
+                    tracing::error!("background indexer: cochange failed: {e}");
+                }
+                tracing::info!(
+                    "Background index complete for {} root(s)",
+                    project_roots.len()
+                );
+            });
         }
     } else {
         tracing::info!("No project detected, starting MCP server with empty index");
