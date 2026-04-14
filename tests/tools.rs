@@ -1,0 +1,1527 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use rusqlite::Connection;
+use tempfile::TempDir;
+
+use qartez_mcp::graph::{blast, pagerank};
+use qartez_mcp::index;
+use qartez_mcp::storage::{models::SymbolInsert, read, schema, write};
+use qartez_mcp::toolchain;
+
+fn setup() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    schema::create_schema(&conn).unwrap();
+    conn
+}
+
+fn insert_file(conn: &Connection, path: &str) -> i64 {
+    write::upsert_file(conn, path, 1000, 100, "rust", 10).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: Rust
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_rust_file() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn hello() -> &'static str { \"world\" }\n\
+         pub struct Config { pub name: String }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    assert_eq!(files.len(), 1);
+
+    let symbols = read::get_symbols_for_file(&conn, files[0].id).unwrap();
+    assert!(
+        symbols.len() >= 2,
+        "expected >=2 symbols, got {}",
+        symbols.len()
+    );
+
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"hello"), "missing symbol 'hello'");
+    assert!(names.contains(&"Config"), "missing symbol 'Config'");
+
+    let hello = symbols.iter().find(|s| s.name == "hello").unwrap();
+    assert!(hello.is_exported, "pub fn should be exported");
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: TypeScript
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_typescript_file_with_imports_exports() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("utils.ts"),
+        "export function add(a: number, b: number): number { return a + b; }\n\
+         export const PI = 3.14;\n",
+    )
+    .unwrap();
+
+    fs::write(
+        src.join("app.ts"),
+        "import { add } from './utils';\n\
+         export class App {\n\
+             run() { console.log(add(1, 2)); }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let file_count = read::get_file_count(&conn).unwrap();
+    assert_eq!(file_count, 2);
+
+    let sym_count = read::get_symbol_count(&conn).unwrap();
+    assert!(
+        sym_count >= 3,
+        "expected >=3 symbols (add, PI, App), got {sym_count}"
+    );
+
+    let edges = read::get_all_edges(&conn).unwrap();
+    assert!(
+        !edges.is_empty(),
+        "TS import should create at least one edge"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: Python
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_python_file() {
+    let dir = TempDir::new().unwrap();
+    let pkg = dir.path().join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+
+    fs::write(
+        pkg.join("models.py"),
+        "class User:\n    def __init__(self, name: str):\n        self.name = name\n\n\
+         def greet(user: User) -> str:\n    return f'Hello, {user.name}'\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].language, "python");
+
+    let symbols = read::get_symbols_for_file(&conn, files[0].id).unwrap();
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"User"), "missing class 'User'");
+    assert!(names.contains(&"greet"), "missing function 'greet'");
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: Go
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_go_file() {
+    let dir = TempDir::new().unwrap();
+    let pkg = dir.path().join("cmd");
+    fs::create_dir_all(&pkg).unwrap();
+
+    fs::write(
+        pkg.join("main.go"),
+        "package main\n\n\
+         type Config struct {\n    Name string\n}\n\n\
+         func NewConfig(name string) *Config {\n    return &Config{Name: name}\n}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].language, "go");
+
+    let symbols = read::get_symbols_for_file(&conn, files[0].id).unwrap();
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"Config"), "missing struct 'Config'");
+    assert!(names.contains(&"NewConfig"), "missing function 'NewConfig'");
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: C
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_c_file() {
+    let dir = TempDir::new().unwrap();
+
+    fs::write(
+        dir.path().join("main.c"),
+        "#include <stdio.h>\n\n\
+         struct Point {\n    int x;\n    int y;\n};\n\n\
+         int add(int a, int b) {\n    return a + b;\n}\n\n\
+         int main() {\n    printf(\"%d\\n\", add(1, 2));\n    return 0;\n}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].language, "c");
+
+    let symbols = read::get_symbols_for_file(&conn, files[0].id).unwrap();
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"add"), "missing function 'add'");
+    assert!(names.contains(&"main"), "missing function 'main'");
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: Java
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_java_file() {
+    let dir = TempDir::new().unwrap();
+
+    fs::write(
+        dir.path().join("App.java"),
+        "public class App {\n\
+             public static void main(String[] args) {\n\
+                 System.out.println(\"Hello\");\n\
+             }\n\
+             \n\
+             public int add(int a, int b) {\n\
+                 return a + b;\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].language, "java");
+
+    let symbols = read::get_symbols_for_file(&conn, files[0].id).unwrap();
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"App"), "missing class 'App'");
+}
+
+// ---------------------------------------------------------------------------
+// 1. End-to-end indexing: Multi-file project with cross-file imports
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_multi_file_project_creates_edges() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("utils.ts"),
+        "export function helper() { return 42; }\n",
+    )
+    .unwrap();
+
+    fs::write(
+        src.join("service.ts"),
+        "import { helper } from './utils';\n\
+         export function run() { return helper(); }\n",
+    )
+    .unwrap();
+
+    fs::write(src.join("index.ts"), "export { run } from './service';\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    assert_eq!(read::get_file_count(&conn).unwrap(), 3);
+
+    let edges = read::get_all_edges(&conn).unwrap();
+    assert!(
+        edges.len() >= 2,
+        "expected >=2 import edges, got {}",
+        edges.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. Incremental indexing: skip unchanged
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_incremental_skip_unchanged() {
+    let dir = TempDir::new().unwrap();
+
+    fs::write(dir.path().join("main.ts"), "export function main() {}\n").unwrap();
+    fs::write(
+        dir.path().join("helper.ts"),
+        "export function helper() {}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+    assert_eq!(read::get_file_count(&conn).unwrap(), 2);
+
+    let first_indexed_at: i64 = conn
+        .query_row(
+            "SELECT indexed_at FROM files WHERE path LIKE '%main.ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    fs::write(
+        dir.path().join("helper.ts"),
+        "export function helper() { return 1; }\n",
+    )
+    .unwrap();
+
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let reindexed_at: i64 = conn
+        .query_row(
+            "SELECT indexed_at FROM files WHERE path LIKE '%main.ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first_indexed_at, reindexed_at,
+        "unchanged file should retain its indexed_at timestamp"
+    );
+
+    assert_eq!(read::get_file_count(&conn).unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Incremental indexing: detect deleted files
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_incremental_detect_deleted() {
+    let dir = TempDir::new().unwrap();
+
+    fs::write(dir.path().join("a.ts"), "export const A = 1;\n").unwrap();
+    fs::write(dir.path().join("b.ts"), "export const B = 2;\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+    assert_eq!(read::get_file_count(&conn).unwrap(), 2);
+
+    fs::remove_file(dir.path().join("b.ts")).unwrap();
+
+    index::full_index(&conn, dir.path(), true).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.iter().any(|p| p.contains("a.ts")));
+}
+
+// ---------------------------------------------------------------------------
+// 3. PageRank computation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pagerank_highly_imported_file_ranks_higher() {
+    let conn = setup();
+    let core = insert_file(&conn, "src/core.rs");
+    let a = insert_file(&conn, "src/a.rs");
+    let b = insert_file(&conn, "src/b.rs");
+    let c = insert_file(&conn, "src/c.rs");
+    let leaf = insert_file(&conn, "src/leaf.rs");
+
+    write::insert_edge(&conn, a, core, "import", None).unwrap();
+    write::insert_edge(&conn, b, core, "import", None).unwrap();
+    write::insert_edge(&conn, c, core, "import", None).unwrap();
+    write::insert_edge(&conn, leaf, a, "import", None).unwrap();
+
+    pagerank::compute_pagerank(&conn, &pagerank::PageRankConfig::default()).unwrap();
+
+    let ranked = read::get_files_ranked(&conn, 10).unwrap();
+    assert_eq!(ranked[0].path, "src/core.rs", "core.rs should rank first");
+    assert!(
+        ranked[0].pagerank > ranked.last().unwrap().pagerank,
+        "top file should have higher rank than the last"
+    );
+}
+
+#[test]
+fn test_pagerank_ranks_sum_to_one() {
+    let conn = setup();
+    let a = insert_file(&conn, "a.rs");
+    let b = insert_file(&conn, "b.rs");
+    let c = insert_file(&conn, "c.rs");
+    write::insert_edge(&conn, a, b, "import", None).unwrap();
+    write::insert_edge(&conn, b, c, "import", None).unwrap();
+    write::insert_edge(&conn, c, a, "import", None).unwrap();
+
+    pagerank::compute_pagerank(&conn, &pagerank::PageRankConfig::default()).unwrap();
+
+    let files = read::get_all_files(&conn).unwrap();
+    let total: f64 = files.iter().map(|f| f.pagerank).sum();
+    assert!(
+        (total - 1.0).abs() < 0.01,
+        "ranks should sum to ~1.0, got {total}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Blast radius
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_blast_radius_transitive() {
+    let conn = setup();
+    let a = insert_file(&conn, "src/a.rs");
+    let b = insert_file(&conn, "src/b.rs");
+    let c = insert_file(&conn, "src/c.rs");
+
+    write::insert_edge(&conn, a, b, "import", None).unwrap();
+    write::insert_edge(&conn, b, c, "import", None).unwrap();
+
+    let result = blast::blast_radius_for_file(&conn, c).unwrap();
+    assert!(result.direct_importers.contains(&b));
+    assert_eq!(
+        result.transitive_count, 2,
+        "C should be depended on by A and B"
+    );
+    assert!(result.transitive_importers.contains(&a));
+    assert!(result.transitive_importers.contains(&b));
+}
+
+#[test]
+fn test_blast_radius_no_importers() {
+    let conn = setup();
+    let a = insert_file(&conn, "src/a.rs");
+    let b = insert_file(&conn, "src/b.rs");
+
+    write::insert_edge(&conn, a, b, "import", None).unwrap();
+
+    let result = blast::blast_radius_for_file(&conn, a).unwrap();
+    assert!(result.direct_importers.is_empty());
+    assert_eq!(result.transitive_count, 0);
+}
+
+#[test]
+fn test_blast_radius_diamond() {
+    let conn = setup();
+    let a = insert_file(&conn, "a.rs");
+    let b = insert_file(&conn, "b.rs");
+    let c = insert_file(&conn, "c.rs");
+    let d = insert_file(&conn, "d.rs");
+
+    write::insert_edge(&conn, a, b, "import", None).unwrap();
+    write::insert_edge(&conn, a, c, "import", None).unwrap();
+    write::insert_edge(&conn, b, d, "import", None).unwrap();
+    write::insert_edge(&conn, c, d, "import", None).unwrap();
+
+    let result = blast::blast_radius_for_file(&conn, d).unwrap();
+    assert_eq!(
+        result.transitive_count, 3,
+        "D should be depended on by A, B, C"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Symbol reference tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_symbol_references() {
+    // Rewritten for the symbol-level refs implementation: the importer
+    // side now needs a concrete referring symbol + an entry in the
+    // `symbol_refs` table. A bare file-level import edge no longer
+    // produces a reference, which is intentional — it was the proxy
+    // behaviour the rewrite set out to kill.
+    let conn = setup();
+    let lib = insert_file(&conn, "src/lib.rs");
+    let consumer = insert_file(&conn, "src/consumer.rs");
+
+    let config_ids = write::insert_symbols(
+        &conn,
+        lib,
+        &[SymbolInsert {
+            name: "Config".to_string(),
+            kind: "struct".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: Some("pub struct Config".to_string()),
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    let caller_ids = write::insert_symbols(
+        &conn,
+        consumer,
+        &[SymbolInsert {
+            name: "use_config".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 3,
+            signature: Some("fn use_config() -> Config".to_string()),
+            is_exported: false,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    write::insert_symbol_refs(&conn, &[(caller_ids[0], config_ids[0], "type")]).unwrap();
+
+    let refs = read::get_symbol_references(&conn, "Config").unwrap();
+    assert_eq!(refs.len(), 1);
+
+    let (sym, def_file, importers) = &refs[0];
+    assert_eq!(sym.name, "Config");
+    assert_eq!(def_file.path, "src/lib.rs");
+    assert_eq!(importers.len(), 1);
+    assert_eq!(importers[0].1.path, "src/consumer.rs");
+    // Synthetic edge kind set by the new read::get_symbol_references path.
+    assert_eq!(importers[0].0.kind, "symbol_ref");
+}
+
+#[test]
+fn test_get_symbol_references_no_match() {
+    let conn = setup();
+    let refs = read::get_symbol_references(&conn, "NonExistent").unwrap();
+    assert!(refs.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Toolchain detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_detect_rust_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "rust");
+    assert_eq!(tc.build_tool, "cargo");
+    assert_eq!(tc.test_cmd, vec!["cargo", "test"]);
+    assert!(tc.lint_cmd.is_some());
+}
+
+#[test]
+fn test_detect_go_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "go");
+    assert_eq!(tc.build_tool, "go");
+}
+
+#[test]
+fn test_detect_node_npm_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"test":"jest","build":"tsc"}}"#,
+    )
+    .unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "node");
+    assert_eq!(tc.build_tool, "npm");
+}
+
+#[test]
+fn test_detect_node_bun_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("package.json"), "{}").unwrap();
+    fs::write(dir.path().join("bun.lockb"), "").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "node");
+    assert_eq!(tc.build_tool, "bun");
+}
+
+#[test]
+fn test_detect_node_yarn_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("package.json"), "{}").unwrap();
+    fs::write(dir.path().join("yarn.lock"), "").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "node");
+    assert_eq!(tc.build_tool, "yarn");
+}
+
+#[test]
+fn test_detect_python_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("pyproject.toml"), "[project]").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "python");
+    assert_eq!(tc.build_tool, "pip");
+}
+
+#[test]
+fn test_detect_ruby_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("Gemfile"), "source 'https://rubygems.org'").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "ruby");
+    assert_eq!(tc.build_tool, "bundle");
+}
+
+#[test]
+fn test_detect_make_toolchain() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("Makefile"), "build:\n\techo build").unwrap();
+
+    let tc = toolchain::detect_toolchain(dir.path()).unwrap();
+    assert_eq!(tc.name, "make");
+    assert_eq!(tc.build_tool, "make");
+}
+
+#[test]
+fn test_detect_no_toolchain() {
+    let dir = TempDir::new().unwrap();
+    let tc = toolchain::detect_toolchain(dir.path());
+    assert!(tc.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 6. FTS search tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fts_search_across_languages() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("config.rs"),
+        "pub struct AppConfig {\n    pub debug: bool,\n}\n",
+    )
+    .unwrap();
+
+    fs::write(
+        src.join("config.ts"),
+        "export interface AppConfig {\n    debug: boolean;\n}\n",
+    )
+    .unwrap();
+
+    fs::write(
+        src.join("config.py"),
+        "class AppConfig:\n    def __init__(self):\n        self.debug = False\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let results = read::search_symbols_fts(&conn, "AppConfig", 20).unwrap();
+    assert!(
+        results.len() >= 3,
+        "expected FTS hits in at least 3 languages, got {}",
+        results.len()
+    );
+
+    let file_paths: HashSet<&str> = results.iter().map(|(_, p)| p.as_str()).collect();
+    assert!(file_paths.iter().any(|p| p.contains("config.rs")));
+    assert!(file_paths.iter().any(|p| p.contains("config.ts")));
+    assert!(file_paths.iter().any(|p| p.contains("config.py")));
+}
+
+#[test]
+fn test_fts_prefix_search() {
+    let conn = setup();
+    let f = insert_file(&conn, "src/db.rs");
+    write::insert_symbols(
+        &conn,
+        f,
+        &[
+            SymbolInsert {
+                name: "DatabasePool".to_string(),
+                kind: "struct".to_string(),
+                line_start: 1,
+                line_end: 5,
+                signature: None,
+                is_exported: true,
+                shape_hash: None,
+                parent_idx: None,
+                unused_excluded: false,
+                complexity: None,
+            },
+            SymbolInsert {
+                name: "DatabaseConfig".to_string(),
+                kind: "struct".to_string(),
+                line_start: 7,
+                line_end: 10,
+                signature: None,
+                is_exported: true,
+                shape_hash: None,
+                parent_idx: None,
+                unused_excluded: false,
+                complexity: None,
+            },
+        ],
+    )
+    .unwrap();
+    write::sync_fts(&conn).unwrap();
+
+    let results = read::search_symbols_fts(&conn, "Database*", 10).unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
+fn test_fts_no_results() {
+    let conn = setup();
+    let f = insert_file(&conn, "src/lib.rs");
+    write::insert_symbols(
+        &conn,
+        f,
+        &[SymbolInsert {
+            name: "hello".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 3,
+            signature: None,
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    write::sync_fts(&conn).unwrap();
+
+    let results = read::search_symbols_fts(&conn, "zzz_no_match", 10).unwrap();
+    assert!(results.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 7. Co-change analysis tests (with git)
+// ---------------------------------------------------------------------------
+
+fn init_git_repo(dir: &Path) -> git2::Repository {
+    git2::Repository::init(dir).unwrap()
+}
+
+fn make_commit(repo: &git2::Repository, dir: &Path, files: &[&str], message: &str) {
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let mut index = repo.index().unwrap();
+
+    for file in files {
+        let file_path = dir.join(file);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let existing = fs::read_to_string(&file_path).unwrap_or_default();
+        fs::write(&file_path, format!("{}\n// edit", existing)).unwrap();
+        index.add_path(Path::new(file)).unwrap();
+    }
+
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+
+    let parent = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target().and_then(|oid| repo.find_commit(oid).ok()));
+
+    match parent {
+        Some(p) => {
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&p])
+                .unwrap();
+        }
+        None => {
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_cochange_with_git_history() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let repo = init_git_repo(root);
+    let conn = setup();
+
+    make_commit(&repo, root, &["src/a.rs", "src/b.rs"], "commit 1");
+    make_commit(&repo, root, &["src/a.rs", "src/b.rs"], "commit 2");
+    make_commit(&repo, root, &["src/a.rs", "src/c.rs"], "commit 3");
+
+    write::upsert_file(&conn, "src/a.rs", 1000, 100, "rust", 10).unwrap();
+    write::upsert_file(&conn, "src/b.rs", 1000, 100, "rust", 10).unwrap();
+    write::upsert_file(&conn, "src/c.rs", 1000, 100, "rust", 10).unwrap();
+
+    use qartez_mcp::git::cochange::{CoChangeConfig, analyze_cochanges};
+    analyze_cochanges(&conn, root, &CoChangeConfig::default()).unwrap();
+
+    let file_a = read::get_file_by_path(&conn, "src/a.rs").unwrap().unwrap();
+    let cochanges = read::get_cochanges(&conn, file_a.id, 10).unwrap();
+    assert!(!cochanges.is_empty(), "should have co-change partners");
+
+    let partner_paths: Vec<&str> = cochanges.iter().map(|(_, f)| f.path.as_str()).collect();
+    assert!(
+        partner_paths.contains(&"src/b.rs"),
+        "a.rs should co-change with b.rs"
+    );
+}
+
+#[test]
+fn test_cochange_non_git_dir_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    use qartez_mcp::git::cochange::{CoChangeConfig, analyze_cochanges};
+    let result = analyze_cochanges(&conn, dir.path(), &CoChangeConfig::default());
+    assert!(result.is_ok(), "non-git dir should not fail");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Unused exports detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unused_exported_symbols() {
+    let conn = setup();
+    let lib = insert_file(&conn, "src/lib.rs");
+    let consumer = insert_file(&conn, "src/consumer.rs");
+    let orphan = insert_file(&conn, "src/orphan.rs");
+
+    write::insert_symbols(
+        &conn,
+        lib,
+        &[SymbolInsert {
+            name: "used_fn".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: None,
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    write::insert_symbols(
+        &conn,
+        orphan,
+        &[SymbolInsert {
+            name: "orphan_fn".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: None,
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+
+    write::insert_edge(&conn, consumer, lib, "import", None).unwrap();
+
+    let unused = read::get_unused_exports_page(&conn, i64::MAX, 0).unwrap();
+    let unused_names: Vec<&str> = unused.iter().map(|(s, _)| s.name.as_str()).collect();
+    assert!(
+        unused_names.contains(&"orphan_fn"),
+        "orphan_fn should be unused"
+    );
+    assert!(
+        !unused_names.contains(&"used_fn"),
+        "used_fn should NOT be unused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Edge and file CRUD tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_upsert_file_updates_existing() {
+    let conn = setup();
+    let id1 = write::upsert_file(&conn, "src/a.rs", 1000, 100, "rust", 10).unwrap();
+    let id2 = write::upsert_file(&conn, "src/a.rs", 2000, 200, "rust", 20).unwrap();
+    assert_eq!(id1, id2, "upsert should return same ID");
+
+    let file = read::get_file_by_id(&conn, id1).unwrap().unwrap();
+    assert_eq!(file.size_bytes, 200);
+    assert_eq!(file.line_count, 20);
+}
+
+#[test]
+fn test_delete_file_cascades_symbols_and_edges() {
+    let conn = setup();
+    let f1 = insert_file(&conn, "src/a.rs");
+    let f2 = insert_file(&conn, "src/b.rs");
+
+    write::insert_symbols(
+        &conn,
+        f1,
+        &[SymbolInsert {
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: None,
+            is_exported: false,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    write::insert_edge(&conn, f1, f2, "import", None).unwrap();
+
+    write::delete_file_data(&conn, f1).unwrap();
+
+    assert_eq!(read::get_symbol_count(&conn).unwrap(), 0);
+    assert!(read::get_all_edges(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn test_duplicate_edge_is_ignored() {
+    let conn = setup();
+    let a = insert_file(&conn, "a.rs");
+    let b = insert_file(&conn, "b.rs");
+
+    write::insert_edge(&conn, a, b, "import", Some("crate::b")).unwrap();
+    write::insert_edge(&conn, a, b, "import", Some("crate::b")).unwrap();
+
+    let edges = read::get_all_edges(&conn).unwrap();
+    assert_eq!(edges.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Meta key/value storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_meta_set_and_get() {
+    let conn = setup();
+    write::set_meta(&conn, "version", "1").unwrap();
+    assert_eq!(
+        read::get_meta(&conn, "version").unwrap(),
+        Some("1".to_string())
+    );
+
+    write::set_meta(&conn, "version", "2").unwrap();
+    assert_eq!(
+        read::get_meta(&conn, "version").unwrap(),
+        Some("2".to_string())
+    );
+}
+
+#[test]
+fn test_meta_missing_key() {
+    let conn = setup();
+    assert!(read::get_meta(&conn, "nonexistent").unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 11. Full index sets last_index meta
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_full_index_sets_last_index_meta() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.ts"), "export function main() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let last = read::get_meta(&conn, "last_index").unwrap();
+    assert!(
+        last.is_some(),
+        "last_index meta should be set after indexing"
+    );
+    let ts: u64 = last.unwrap().parse().unwrap();
+    assert!(ts > 0, "timestamp should be positive");
+}
+
+// ---------------------------------------------------------------------------
+// 12. FTS sync after indexing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fts_synced_after_full_index() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("lib.rs"), "pub fn unique_symbol_xyz() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let results = read::search_symbols_fts(&conn, "unique_symbol_xyz", 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.name, "unique_symbol_xyz");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Find symbol by name
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_find_symbol_by_name_across_files() {
+    let conn = setup();
+    let f1 = insert_file(&conn, "src/a.rs");
+    let f2 = insert_file(&conn, "src/b.rs");
+
+    write::insert_symbols(
+        &conn,
+        f1,
+        &[SymbolInsert {
+            name: "process".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: Some("pub fn process()".to_string()),
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+    write::insert_symbols(
+        &conn,
+        f2,
+        &[SymbolInsert {
+            name: "process".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 3,
+            signature: Some("fn process()".to_string()),
+            is_exported: false,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+
+    let results = read::find_symbol_by_name(&conn, "process").unwrap();
+    assert_eq!(results.len(), 2);
+
+    let paths: HashSet<&str> = results.iter().map(|(_, f)| f.path.as_str()).collect();
+    assert!(paths.contains("src/a.rs"));
+    assert!(paths.contains("src/b.rs"));
+}
+
+// ---------------------------------------------------------------------------
+// 14. Stale files detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stale_files() {
+    let conn = setup();
+    let indexed = insert_file(&conn, "src/indexed.rs");
+    insert_file(&conn, "src/stale.rs");
+
+    write::insert_symbols(
+        &conn,
+        indexed,
+        &[SymbolInsert {
+            name: "main".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: None,
+            is_exported: false,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+        }],
+    )
+    .unwrap();
+
+    let stale = read::get_stale_files(&conn).unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].path, "src/stale.rs");
+}
+
+// ---------------------------------------------------------------------------
+// 15. get_or_create_file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_or_create_file() {
+    let conn = setup();
+
+    let id1 = write::get_or_create_file(&conn, "src/new.rs").unwrap();
+    assert!(id1 > 0);
+
+    let id2 = write::get_or_create_file(&conn, "src/new.rs").unwrap();
+    assert_eq!(id1, id2, "should return existing file id");
+
+    let file = read::get_file_by_path(&conn, "src/new.rs")
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.language, "rust");
+}
+
+// ---------------------------------------------------------------------------
+// 16. Cochange upsert counting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cochange_increments_count() {
+    let conn = setup();
+    let a = insert_file(&conn, "a.rs");
+    let b = insert_file(&conn, "b.rs");
+
+    write::upsert_cochange(&conn, a, b).unwrap();
+    write::upsert_cochange(&conn, a, b).unwrap();
+    write::upsert_cochange(&conn, a, b).unwrap();
+
+    let cochanges = read::get_cochanges(&conn, a, 10).unwrap();
+    assert_eq!(cochanges.len(), 1);
+    assert_eq!(cochanges[0].0.count, 3);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Schema idempotent creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_idempotent() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    schema::create_schema(&conn).unwrap();
+    schema::create_schema(&conn).unwrap();
+
+    let count = read::get_file_count(&conn).unwrap();
+    assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 18. Edge queries: from and to
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_edges_to_and_from() {
+    let conn = setup();
+    let a = insert_file(&conn, "a.rs");
+    let b = insert_file(&conn, "b.rs");
+    let c = insert_file(&conn, "c.rs");
+
+    write::insert_edge(&conn, a, c, "import", Some("crate::c")).unwrap();
+    write::insert_edge(&conn, b, c, "import", Some("crate::c")).unwrap();
+
+    let to_c = read::get_edges_to(&conn, c).unwrap();
+    assert_eq!(to_c.len(), 2);
+
+    let from_a = read::get_edges_from(&conn, a).unwrap();
+    assert_eq!(from_a.len(), 1);
+    assert_eq!(from_a[0].to_file, c);
+}
+
+// ---------------------------------------------------------------------------
+// 19. Run command
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_run_command_success() {
+    let dir = TempDir::new().unwrap();
+    let cmd = vec!["echo".to_string(), "hello world".to_string()];
+    let (code, output) = toolchain::run_command(dir.path(), &cmd, None, 10).unwrap();
+    assert_eq!(code, 0);
+    assert!(output.contains("hello world"));
+}
+
+#[test]
+fn test_run_command_with_filter() {
+    let dir = TempDir::new().unwrap();
+    let cmd = vec!["echo".to_string()];
+    let (code, output) = toolchain::run_command(dir.path(), &cmd, Some("filtered"), 10).unwrap();
+    assert_eq!(code, 0);
+    assert!(output.contains("filtered"));
+}
+
+#[test]
+fn test_run_command_nonexistent_fails() {
+    let dir = TempDir::new().unwrap();
+    let cmd = vec!["nonexistent_binary_xyz".to_string()];
+    let result = toolchain::run_command(dir.path(), &cmd, None, 10);
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 20. End-to-end: index + pagerank + blast radius
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_end_to_end_index_pagerank_blast() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("core.ts"),
+        "export function coreUtil() { return 42; }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("service.ts"),
+        "import { coreUtil } from './core';\n\
+         export function serve() { return coreUtil(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("handler.ts"),
+        "import { serve } from './service';\n\
+         export function handle() { serve(); }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    assert_eq!(read::get_file_count(&conn).unwrap(), 3);
+    assert!(read::get_all_edges(&conn).unwrap().len() >= 2);
+
+    pagerank::compute_pagerank(&conn, &pagerank::PageRankConfig::default()).unwrap();
+
+    let ranked = read::get_files_ranked(&conn, 10).unwrap();
+    assert!(ranked[0].pagerank > 0.0);
+
+    let core_file = read::get_file_by_path(&conn, "src/core.ts")
+        .unwrap()
+        .unwrap();
+    let result = blast::blast_radius_for_file(&conn, core_file.id).unwrap();
+    assert!(
+        result.transitive_count >= 2,
+        "core.ts should be depended on by service and handler"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_call_tool_by_name_dispatches_to_qartez_stats() {
+    use serde_json::json;
+    use qartez_mcp::server::QartezServer;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn hi() -> i32 { 1 }\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name("qartez_stats", json!({}))
+        .expect("qartez_stats dispatch");
+    assert!(
+        result.contains("files="),
+        "expected stats header, got: {result}"
+    );
+
+    let find = server
+        .call_tool_by_name("qartez_find", json!({ "name": "hi" }))
+        .expect("qartez_find dispatch");
+    assert!(find.contains("hi"), "expected 'hi' in result, got: {find}");
+
+    let err = server
+        .call_tool_by_name("nonexistent_tool", json!({}))
+        .unwrap_err();
+    assert!(
+        err.contains("unknown tool"),
+        "expected unknown-tool error, got: {err}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_qartez_read_file_path_alone_reads_whole_file() {
+    use serde_json::json;
+    use qartez_mcp::server::QartezServer;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let lib_contents =
+        "// header comment\nuse std::io;\n\npub fn one() -> i32 { 1 }\npub fn two() -> i32 { 2 }\n";
+    fs::write(src.join("lib.rs"), lib_contents).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    // file_path alone returns the whole file.
+    let whole = server
+        .call_tool_by_name("qartez_read", json!({ "file_path": "src/lib.rs" }))
+        .expect("qartez_read file_path alone should succeed");
+    assert!(
+        whole.contains("header comment"),
+        "whole-file read should include the header comment, got: {whole}"
+    );
+    assert!(
+        whole.contains("pub fn one"),
+        "whole-file read should include first symbol, got: {whole}"
+    );
+    assert!(
+        whole.contains("pub fn two"),
+        "whole-file read should include second symbol, got: {whole}"
+    );
+    assert!(
+        whole.starts_with("src/lib.rs L1-5"),
+        "expected header 'src/lib.rs L1-5', got: {whole}"
+    );
+
+    // start_line + limit still pages correctly.
+    let sliced = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "file_path": "src/lib.rs", "start_line": 2, "limit": 2 }),
+        )
+        .expect("qartez_read with limit should succeed");
+    assert!(
+        sliced.contains("use std::io"),
+        "slice starting at line 2 should include `use std::io`, got: {sliced}"
+    );
+    assert!(
+        !sliced.contains("pub fn two"),
+        "2-line slice from line 2 must not contain line 5, got: {sliced}"
+    );
+
+    // max_bytes cap yields a truncation marker rather than unbounded output.
+    let truncated = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "file_path": "src/lib.rs", "max_bytes": 40 }),
+        )
+        .expect("qartez_read with tiny cap should succeed");
+    assert!(
+        truncated.contains("truncated"),
+        "tiny max_bytes should trigger truncation marker, got: {truncated}"
+    );
+
+    // start_line beyond EOF is a clear error, not silent empty output.
+    let oob = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "file_path": "src/lib.rs", "start_line": 999 }),
+        )
+        .unwrap_err();
+    assert!(
+        oob.contains("exceeds file length"),
+        "out-of-range start_line should error, got: {oob}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// qartez-guard PreToolUse hook — end-to-end
+// ---------------------------------------------------------------------------
+
+mod guard_binary {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    use rusqlite::Connection;
+    use qartez_mcp::graph::pagerank;
+    use qartez_mcp::guard;
+    use qartez_mcp::index;
+    use qartez_mcp::storage;
+    use tempfile::TempDir;
+
+    /// Build a tiny indexed project: `hub.rs` imported twice so it has a
+    /// non-zero blast radius. Returns (project_dir, db_path, rel_hub_path).
+    fn indexed_project() -> (TempDir, std::path::PathBuf, String) {
+        let dir = TempDir::new().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::write(
+            src.join("hub.rs"),
+            "pub fn shared() -> u32 { 42 }\n",
+        )
+        .expect("write hub");
+        std::fs::write(
+            src.join("a.rs"),
+            "use crate::hub::shared;\npub fn a() -> u32 { shared() }\n",
+        )
+        .expect("write a");
+        std::fs::write(
+            src.join("b.rs"),
+            "use crate::hub::shared;\npub fn b() -> u32 { shared() + 1 }\n",
+        )
+        .expect("write b");
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod a;\npub mod b;\npub mod hub;\n",
+        )
+        .expect("write lib");
+        // Cargo.toml so detect_project_root can find it if the guard walks
+        // upward from the file_path.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"fx\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        let db_path = dir.path().join(".qartez").join("index.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("mkdir .qartez");
+        let conn: Connection = storage::open_db(&db_path).expect("open db");
+        index::full_index(&conn, dir.path(), false).expect("index");
+        pagerank::compute_pagerank(&conn, &Default::default()).expect("pagerank");
+        drop(conn);
+
+        (dir, db_path, "src/hub.rs".to_string())
+    }
+
+    fn run_guard(project_dir: &std::path::Path, payload: &str, extra_args: &[&str]) -> String {
+        let exe = env!("CARGO_BIN_EXE_qartez-guard");
+        let mut cmd = Command::new(exe);
+        cmd.arg("--project-root")
+            .arg(project_dir)
+            .args(extra_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove("QARTEZ_GUARD_DISABLE")
+            .env_remove("QARTEZ_GUARD_PAGERANK_MIN")
+            .env_remove("QARTEZ_GUARD_BLAST_MIN")
+            .env_remove("QARTEZ_GUARD_ACK_TTL_SECS");
+        let mut child = cmd.spawn().expect("spawn qartez-guard");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait guard");
+        assert!(
+            out.status.success(),
+            "qartez-guard must exit 0 (fail-open): status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf8 stdout")
+    }
+
+    #[test]
+    fn denies_hot_file_without_ack() {
+        let (dir, _db, hub) = indexed_project();
+        let abs = dir.path().join(&hub);
+        let payload = format!(
+            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
+            abs.display(),
+            dir.path().display()
+        );
+        // Thresholds set low so a 2-importer fixture trips the guard
+        // deterministically, independent of actual PageRank values.
+        let out = run_guard(
+            dir.path(),
+            &payload,
+            &["--pagerank-min", "0", "--blast-min", "1"],
+        );
+        assert!(
+            out.contains("permissionDecision"),
+            "expected deny JSON, got: {out}"
+        );
+        assert!(out.contains("deny"));
+        assert!(out.contains("qartez_impact"));
+        assert!(out.contains(&hub));
+    }
+
+    #[test]
+    fn allows_hot_file_after_ack() {
+        let (dir, _db, hub) = indexed_project();
+        guard::touch_ack(dir.path(), &hub);
+
+        let abs = dir.path().join(&hub);
+        let payload = format!(
+            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
+            abs.display(),
+            dir.path().display()
+        );
+        let out = run_guard(
+            dir.path(),
+            &payload,
+            &["--pagerank-min", "0", "--blast-min", "1"],
+        );
+        assert!(
+            out.trim().is_empty(),
+            "expected empty (allow) stdout after ack, got: {out}"
+        );
+    }
+
+    #[test]
+    fn allows_non_edit_tools() {
+        let (dir, _db, hub) = indexed_project();
+        let abs = dir.path().join(&hub);
+        let payload = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"ls {}"}},"cwd":"{}"}}"#,
+            abs.display(),
+            dir.path().display()
+        );
+        let out = run_guard(
+            dir.path(),
+            &payload,
+            &["--pagerank-min", "0", "--blast-min", "1"],
+        );
+        assert!(out.trim().is_empty(), "Bash tool must not be guarded");
+    }
+
+    #[test]
+    fn allows_unindexed_file() {
+        let (dir, _db, _hub) = indexed_project();
+        let abs = dir.path().join("src/new_file.rs");
+        let payload = format!(
+            r#"{{"tool_name":"Write","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
+            abs.display(),
+            dir.path().display()
+        );
+        let out = run_guard(
+            dir.path(),
+            &payload,
+            &["--pagerank-min", "0", "--blast-min", "1"],
+        );
+        assert!(
+            out.trim().is_empty(),
+            "creating a new file (not in index) must not be blocked"
+        );
+    }
+}

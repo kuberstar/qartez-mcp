@@ -1,0 +1,42 @@
+<!-- qartez-mcp-instructions -->
+## Qartez MCP — MANDATORY Tool Priority
+
+When the `qartez` MCP server is available, you MUST use its tools INSTEAD OF built-in `Glob`, `Grep`, and `Read` for codebase exploration. This is enforced by a PreToolUse hook — `Glob` and `Grep` will be DENIED when `.qartez/` exists.
+
+**Tool mapping (MUST follow):**
+
+| Instead of | MUST use | When |
+|---|---|---|
+| `Glob` | `qartez_map` | Understanding project structure, finding files |
+| `Grep` | `qartez_grep` | Searching for symbols, functions, types |
+| `Grep` | `qartez_find` | Looking up specific symbol definitions |
+| `Read` | `qartez_read` | Reading symbol source code with context |
+| — | `qartez_impact` | BEFORE modifying any heavily-imported file |
+| — | `qartez_cochange` | Understanding which files change together |
+| — | `qartez_unused` | Finding dead/unused code |
+| — | `qartez_refs` | Finding all references to a symbol |
+| — | `qartez_project` | Getting full project statistics |
+| — | `qartez_move` | Moving a symbol between files |
+| — | `qartez_rename` | Renaming a symbol across the codebase |
+| — | `qartez_rename_file` | Renaming a file and updating all imports |
+
+**Workflow:**
+1. `qartez_map` — understand project structure first
+2. `qartez_find` / `qartez_grep` — locate symbols
+3. `qartez_read` — read code with semantic context
+4. `qartez_impact` — check before modifying exports
+
+**Modification guard (ENFORCED):** A PreToolUse hook (`qartez-guard`) blocks `Edit`/`Write`/`MultiEdit` on load-bearing files — those with PageRank ≥ 0.05 OR transitive blast radius ≥ 10. When blocked, the error tells you exactly which thresholds fired and which file to pass to `qartez_impact`. Calling `qartez_impact file_path=<the file>` acts as an acknowledgment: subsequent edits on that file are allowed for 10 minutes (one conversation turn). Override per-project with env vars `QARTEZ_GUARD_PAGERANK_MIN`, `QARTEZ_GUARD_BLAST_MIN`, `QARTEZ_GUARD_ACK_TTL_SECS`, or disable with `QARTEZ_GUARD_DISABLE=1`.
+
+**Canned workflow prompts (MCP slash commands):**
+
+Qartez ships five prompt templates that orchestrate the tools above. Invoke them as slash commands when the task matches:
+
+- `/qartez_review <file>` — code review: blast radius + outline + references + co-change
+- `/qartez_architecture [top_n]` — one-minute architecture overview grounded in PageRank
+- `/qartez_debug <symbol>` — find + read + call hierarchy + references in one shot
+- `/qartez_onboard [area]` — five-file onboarding reading list, optionally focused on an area
+- `/qartez_pre_merge <files>` — pre-merge safety check across the changed files
+
+**Fallback:** Use `Glob`/`Grep`/`Read` ONLY for non-code content (config files, text search, file patterns that qartez cannot handle).
+<!-- /qartez-mcp-instructions -->

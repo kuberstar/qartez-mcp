@@ -1,0 +1,43 @@
+Qartez MCP - Dual License
+
+Copyright (c) 2026 Kuberstar
+
+This software is available under two licenses:
+
+1. FREE FOR INDIVIDUALS (Qartez Individual License)
+
+   Permission is hereby granted, free of charge, to any individual person
+   obtaining a copy of this software and associated documentation files
+   (the "Software"), to use, copy, modify, and distribute the Software for
+   personal, educational, open-source, or non-commercial purposes, subject
+   to the following conditions:
+
+   - The above copyright notice and this permission notice shall be included
+     in all copies or substantial portions of the Software.
+   - The Software shall not be used as part of a product or service offered
+     by a business, company, or organization without a Commercial License.
+
+2. COMMERCIAL LICENSE (Required for Business Use)
+
+   Any use of the Software by or on behalf of a company, corporation,
+   partnership, or other business entity - including but not limited to
+   internal tooling, commercial products, SaaS offerings, or consulting
+   services - requires a separate Commercial License.
+
+   For licensing inquiries, contact: hello@qartez.dev
+
+   "Business use" includes:
+   - Use by employees or contractors on behalf of a for-profit entity
+   - Integration into commercial products or services
+   - Use in revenue-generating activities
+   - Use by organizations with more than one person
+
+DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

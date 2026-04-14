@@ -1,0 +1,2816 @@
+{
+  "generated_at_unix": 1776064403,
+  "git_sha": "b5c4406",
+  "tokenizer": "cl100k_base",
+  "language": "rust",
+  "scenarios": [
+    {
+      "tool": "qartez_map",
+      "scenario_id": "qartez_map_top5_concise",
+      "description": "Rank the top 5 files by PageRank (concise format).",
+      "mcp": {
+        "response_bytes": 251,
+        "response_preview": "101 files, 2119 symbols (rank path PR exp →blast)\n1 src/index/symbols.rs 0.084 18 →18\n2 src/error.rs 0.073 2 →28\n3 src/benchmark/targets.rs 0.059 18 →10\n4 src/benchmark/profiles/mod.rs 0.059 10 →10\n5 src/index/languages/mod.rs 0.0…",
+        "tokens": 92,
+        "naive_tokens": 62,
+        "latency": {
+          "mean_us": 91.8,
+          "stdev_us": 1.16619037896906,
+          "p50_us": 92.0,
+          "p95_us": 93.0,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "format": "concise",
+          "top_n": 5
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 5,
+          "verified_claims": 5,
+          "file_claims": 5,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 5,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 4568,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 1475,
+        "response_preview": "tests/tools.rs\nsrc/benchmark/targets.rs\nsrc/benchmark/set_compare.rs\nsrc/benchmark/scenarios.rs\nsrc/benchmark/report.rs\nsrc/benchmark/tokenize.rs\nsrc/benchmark/mod.rs\nsrc/benchmark/sim_runner.rs\nsrc/benchmark/grounding.rs\nsrc/benchmark/judg…",
+        "tokens": 405,
+        "naive_tokens": 368,
+        "latency": {
+          "mean_us": 374.0,
+          "stdev_us": 8.532291603080617,
+          "p50_us": 373.0,
+          "p95_us": 385.4,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Glob **/*.rs"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 63,
+          "verified_claims": 63,
+          "file_claims": 63,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 63,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 689,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 77.28395061728395,
+        "bytes_pct": 82.98305084745763,
+        "latency_ratio": 4.074074074074074,
+        "effective_savings_pct": 77.28395061728395
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "PageRank-based importance ranking",
+          "Blast radius column in one call",
+          "Elided source previews of exports",
+          "Token-budgeted output",
+          "`all_files: true` (or `top_n: 0`) returns every file PageRank-sorted"
+        ],
+        "cons": [
+          "Cannot return raw file contents",
+          "Requires .qartez/ to be built"
+        ],
+        "summary": "MCP wins overwhelmingly: non-MCP path produces only a flat file list and still requires reading every file to approximate ranking."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 7
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 10,
+          "usability": 3,
+          "groundedness": 10,
+          "conciseness": 5
+        },
+        "verdict": "MCP ranks 5 files by PageRank with scores+blast; non-MCP is a flat unranked file list with no PR data",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_find",
+      "scenario_id": "qartez_find_struct_qartezserver",
+      "description": "Locate the QartezServer struct definition.",
+      "mcp": {
+        "response_bytes": 166,
+        "response_preview": "Found 1 match(es) for 'QartezServer':\n\n  QartezServer (struct)\n  File: src/server/mod.rs [L117-L123] →1\n  Signature: pub struct QartezServer\n  Status: exported\n\n",
+        "tokens": 50,
+        "naive_tokens": 41,
+        "latency": {
+          "mean_us": 9.2,
+          "stdev_us": 0.4,
+          "p50_us": 9.0,
+          "p95_us": 9.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "name": "QartezServer"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 2,
+          "verified_claims": 2,
+          "file_claims": 0,
+          "line_claims": 1,
+          "symbol_claims": 1,
+          "verified_files": 0,
+          "verified_lines": 1,
+          "verified_symbols": 1,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 235,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 5630,
+        "response_preview": "src/benchmark/set_compare.rs:425:                    + QartezServer  struct  src/server/mod.rs  L22-L35  pub struct QartezServer\\n\\\nsrc/benchmark/set_compare.rs:434:        let non_mcp = \"src/server/mod.rs:22:pub struct QartezServer {\\n\\…",
+        "tokens": 1648,
+        "naive_tokens": 1407,
+        "latency": {
+          "mean_us": 1847.4,
+          "stdev_us": 39.5302415879286,
+          "p50_us": 1823.0,
+          "p95_us": 1905.3999999999999,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /struct\\s+QartezServer/ (*.rs)",
+          "Read src/server/mod.rs lines 1-120"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 19,
+          "verified_claims": 15,
+          "file_claims": 1,
+          "line_claims": 4,
+          "symbol_claims": 14,
+          "verified_files": 1,
+          "verified_lines": 4,
+          "verified_symbols": 10,
+          "unverified": [
+            "u32",
+            "Arc",
+            "bool",
+            "schemars"
+          ],
+          "score": 0.7894736842105263,
+          "elapsed_us": 231,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 96.96601941747572,
+        "bytes_pct": 97.05150976909414,
+        "latency_ratio": 200.804347826087
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Pre-indexed exact line range (no brace counting)",
+          "Signature pre-extracted",
+          "Kind filter, export-status flag",
+          "`regex: true` walks the indexed symbol table for pattern matches"
+        ],
+        "cons": [
+          "Only the definition site, not usages",
+          "Misses macro-synthesized symbols — tree-sitter opaque-tokens the macro body, so `lazy_static! { pub static ref FOO }` doesn't surface `FOO` in the index"
+        ],
+        "summary": "MCP wins on precision and compactness, but the non-MCP path is viable for unique symbol names."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 0,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 5,
+          "groundedness": 5,
+          "conciseness": 3
+        },
+        "verdict": "MCP pinpoints struct at L117 with signature+export status; non-MCP finds it but adds file dump and test-string noise",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 1,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "mcp_only": [],
+        "non_mcp_only": [
+          "QartezServer"
+        ]
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_read",
+      "scenario_id": "qartez_read_truncate_path",
+      "description": "Read the body of the `truncate_path` helper.",
+      "mcp": {
+        "response_bytes": 189,
+        "response_preview": "// - truncate_path function @ src/server/mod.rs:L575-581 →1\n 575 |                 out.push('\\n');\n 576 |             }\n 577 |         }\n 578 | \n 579 |         out\n 580 |     }\n 581 | }\n\n",
+        "tokens": 55,
+        "naive_tokens": 47,
+        "latency": {
+          "mean_us": 74.0,
+          "stdev_us": 4.1952353926806065,
+          "p50_us": 75.0,
+          "p95_us": 78.6,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "symbol_name": "truncate_path"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 1,
+          "verified_claims": 1,
+          "file_claims": 0,
+          "line_claims": 1,
+          "symbol_claims": 0,
+          "verified_files": 0,
+          "verified_lines": 1,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 31,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 1656,
+        "response_preview": "src/server/mod.rs:659:fn truncate_path(path: &str, max_len: usize) -> String {\n   260\t    /// Returns `None` when the file cannot be parsed (unsupported\n   261\t    /// language or read error). Callers must fall back to a word-boundary\n   26…",
+        "tokens": 445,
+        "naive_tokens": 414,
+        "latency": {
+          "mean_us": 1931.4,
+          "stdev_us": 82.52902519719957,
+          "p50_us": 1908.0,
+          "p95_us": 2050.8,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /fn truncate_path/ (*.rs)",
+          "Read src/server/mod.rs lines 260-290"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 6,
+          "verified_claims": 5,
+          "file_claims": 0,
+          "line_claims": 1,
+          "symbol_claims": 5,
+          "verified_files": 0,
+          "verified_lines": 1,
+          "verified_symbols": 4,
+          "unverified": [
+            "None"
+          ],
+          "score": 0.8333333333333334,
+          "elapsed_us": 108,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 87.64044943820225,
+        "bytes_pct": 88.58695652173914,
+        "latency_ratio": 26.1
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Jumps directly to the symbol by indexed line range",
+          "No brace counting or over-reading",
+          "Numbered output matches Read semantics",
+          "`start_line` / `end_line` support raw line-range reads for non-symbol code (imports, file headers)",
+          "`context_lines` opt-in surrounding lines (default 0)"
+        ],
+        "cons": [
+          "Line-range mode requires knowing the target file up-front"
+        ],
+        "summary": "MCP wins decisively — a non-MCP agent must over-read to guarantee body coverage."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 0,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP returns wrong code (stale index, L575 no longer truncate_path); non-MCP greps correct L659 but reads wrong offset",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 1,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "mcp_only": [],
+        "non_mcp_only": [
+          "truncate_path"
+        ]
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_grep",
+      "scenario_id": "qartez_grep_find_symbol_prefix",
+      "description": "FTS5 prefix search for symbols starting with `find_symbol`.",
+      "mcp": {
+        "response_bytes": 372,
+        "response_preview": "Found 4 result(s) for 'find_symbol*':\n\n + find_symbol_by_name            function     src/storage/read.rs  [L148-L193]\n   test_find_symbol_by_name       function     src/storage/read.rs  [L807-L831]\n   qartez_grep_finds_symbols        functio…",
+        "tokens": 98,
+        "naive_tokens": 93,
+        "latency": {
+          "mean_us": 31.8,
+          "stdev_us": 2.7856776554368237,
+          "p50_us": 32.0,
+          "p95_us": 34.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "query": "find_symbol*"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 8,
+          "verified_claims": 8,
+          "file_claims": 0,
+          "line_claims": 4,
+          "symbol_claims": 4,
+          "verified_files": 0,
+          "verified_lines": 4,
+          "verified_symbols": 4,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 113,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 2704,
+        "response_preview": "tests/tools.rs:995:fn test_find_symbol_by_name_across_files() {\ntests/tools.rs:1033:    let results = read::find_symbol_by_name(&conn, \"process\").unwrap();\nsrc/benchmark/scenarios.rs:606:        id: \"qartez_grep_find_symbol_prefix\",\nsrc/bench…",
+        "tokens": 706,
+        "naive_tokens": 676,
+        "latency": {
+          "mean_us": 1845.4,
+          "stdev_us": 18.227451824103117,
+          "p50_us": 1844.0,
+          "p95_us": 1867.3999999999999,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /find_symbol/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 35,
+          "verified_claims": 33,
+          "file_claims": 1,
+          "line_claims": 28,
+          "symbol_claims": 6,
+          "verified_files": 1,
+          "verified_lines": 28,
+          "verified_symbols": 4,
+          "unverified": [
+            "function",
+            "find_symbol"
+          ],
+          "score": 0.9428571428571428,
+          "elapsed_us": 113,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 86.11898016997166,
+        "bytes_pct": 86.24260355029585,
+        "latency_ratio": 58.0314465408805,
+        "effective_savings_pct": 14.353163361661943
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Searches indexed symbols only — no comment/string noise",
+          "Prefix matching via FTS5",
+          "Returns kind + line range per hit",
+          "`regex: true` falls back to in-memory regex over indexed symbol names",
+          "`search_bodies: true` hits a pre-indexed FTS5 body table for text inside function bodies"
+        ],
+        "cons": [
+          "Only indexed languages",
+          "Body FTS storage grows ~1-2× the codebase when `search_bodies` is used"
+        ],
+        "summary": "MCP wins on signal-to-noise; grep still wins when you need to find text inside bodies."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP gives 4 clean semantic symbol matches; non-MCP returns 25+ text hits including comments and string literals",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 5,
+        "non_mcp_items": 18,
+        "intersection": 3,
+        "precision": 0.6,
+        "recall": 0.16666666666666666,
+        "mcp_only": [
+          "Found",
+          "qartez_grep_finds_symbols"
+        ],
+        "non_mcp_only": [
+          "description",
+          "existence",
+          "expected",
+          "grep_prefix",
+          "id"
+        ]
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_outline",
+      "scenario_id": "qartez_outline_server_mod",
+      "description": "Outline all symbols in src/server/mod.rs grouped by kind.",
+      "mcp": {
+        "response_bytes": 12679,
+        "response_preview": "# Outline: src/server/mod.rs (175 symbols)\n\nConsts:\n  - KB [L588-L588] — const KB: f64 = 1024.0;\n  - MB [L589-L589] — const MB: f64 = KB * 1024.0;\n  - GB [L590-L590] — const GB: f64 = MB * 1024.0;\n  - IDENTIFIER_NODE_KINDS [L692-L700]…",
+        "tokens": 3582,
+        "naive_tokens": 3169,
+        "latency": {
+          "mean_us": 182.4,
+          "stdev_us": 21.2,
+          "p50_us": 171.0,
+          "p95_us": 213.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "src/server/mod.rs"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 115,
+          "verified_claims": 113,
+          "file_claims": 1,
+          "line_claims": 0,
+          "symbol_claims": 114,
+          "verified_files": 1,
+          "verified_lines": 0,
+          "verified_symbols": 112,
+          "unverified": [
+            "std",
+            "all_fi"
+          ],
+          "score": 0.9826086956521739,
+          "elapsed_us": 604,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 202070,
+        "response_preview": "     1\tuse std::collections::{BTreeSet, HashMap, HashSet, VecDeque};\n     2\tuse std::path::PathBuf;\n     3\tuse std::sync::{Arc, Mutex};\n     4\t\n     5\tuse rmcp::handler::server::router::tool::ToolRouter;\n     6\tuse rmcp::handler::server::wr…",
+        "tokens": 54414,
+        "naive_tokens": 50517,
+        "latency": {
+          "mean_us": 526.2,
+          "stdev_us": 15.065191668213185,
+          "p50_us": 531.0,
+          "p95_us": 540.8,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Read src/server/mod.rs"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 145,
+          "verified_claims": 108,
+          "file_claims": 12,
+          "line_claims": 0,
+          "symbol_claims": 133,
+          "verified_files": 4,
+          "verified_lines": 0,
+          "verified_symbols": 104,
+          "unverified": [
+            "so",
+            "u32",
+            "Arc",
+            "get",
+            "bar"
+          ],
+          "score": 0.7448275862068966,
+          "elapsed_us": 3342,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 93.41713529606352,
+        "bytes_pct": 93.72544167862623,
+        "latency_ratio": 2.884868421052632,
+        "effective_savings_pct": 93.41713529606352
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Symbols pre-grouped by kind",
+          "Signatures pre-parsed",
+          "Token-budgeted — no full-file read",
+          "Struct fields are emitted as child rows nested under their parent"
+        ],
+        "cons": [
+          "Token budget truncates very large files",
+          "Tuple-struct members are skipped — nothing meaningful to name"
+        ],
+        "summary": "MCP wins by ~20x on a 2300-line file; non-MCP path reads the entire file."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 3,
+          "groundedness": 5,
+          "conciseness": 3
+        },
+        "verdict": "MCP outlines 175 symbols grouped by kind with signatures; non-MCP dumps 200K raw source with no symbol extraction",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 143,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 0.0,
+        "recall": 1.0,
+        "mcp_only": [
+          "BoolOrStr",
+          "CALLEE_FIELD_NAMES",
+          "CALL_NODE_KINDS",
+          "CallDirection",
+          "Format"
+        ],
+        "non_mcp_only": []
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_deps",
+      "scenario_id": "qartez_deps_server_mod",
+      "description": "Show incoming/outgoing file-level dependencies for src/server/mod.rs.",
+      "mcp": {
+        "response_bytes": 304,
+        "response_preview": "# Dependencies: src/server/mod.rs (blast →1)\n\nImports from (4):\n  -> src/graph/mod.rs (import: crate::graph)\n  -> src/lib.rs (import: crate)\n  -> src/index/mod.rs (import: crate::index)\n  -> src/storage/mod.rs (import: crate::storage)\n\nIm…",
+        "tokens": 85,
+        "naive_tokens": 76,
+        "latency": {
+          "mean_us": 31.8,
+          "stdev_us": 4.261455150532504,
+          "p50_us": 32.0,
+          "p95_us": 36.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "src/server/mod.rs"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 6,
+          "verified_claims": 6,
+          "file_claims": 6,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 6,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 32,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 4474,
+        "response_preview": "src/benchmark/targets.rs:16:use crate::storage::read::{\nsrc/benchmark/mod.rs:23:use crate::server::QartezServer;\nsrc/benchmark/grounding.rs:35:use crate::storage::read;\nsrc/config.rs:3:use crate::cli::Cli;\nsrc/config.rs:4:use crate::error:…",
+        "tokens": 1255,
+        "naive_tokens": 1118,
+        "latency": {
+          "mean_us": 3809.4,
+          "stdev_us": 56.873895593672856,
+          "p50_us": 3773.0,
+          "p95_us": 3897.2000000000003,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /^use crate::/ (*.rs)",
+          "Grep /use crate::server/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 65,
+          "verified_claims": 64,
+          "file_claims": 1,
+          "line_claims": 64,
+          "symbol_claims": 0,
+          "verified_files": 1,
+          "verified_lines": 63,
+          "verified_symbols": 0,
+          "unverified": [
+            "src/index/languages/rust_lang.rs:840"
+          ],
+          "score": 0.9846153846153847,
+          "elapsed_us": 141,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 93.22709163346613,
+        "bytes_pct": 93.20518551631649,
+        "latency_ratio": 119.79245283018868,
+        "effective_savings_pct": 93.22709163346613
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Edges pre-resolved at index time",
+          "Bidirectional (imports + importers) in one call"
+        ],
+        "cons": [
+          "Flattens to file-level — loses per-symbol specifier",
+          "Doesn't show which items are imported"
+        ],
+        "summary": "MCP wins on accuracy (resolved paths) and compactness."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 7,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 3,
+          "groundedness": 10,
+          "conciseness": 3
+        },
+        "verdict": "MCP shows structured deps but may miss importers (benchmark/mod.rs); non-MCP is raw grep of all use statements",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_refs",
+      "scenario_id": "qartez_refs_find_symbol_by_name",
+      "description": "List references to find_symbol_by_name.",
+      "mcp": {
+        "response_bytes": 372,
+        "response_preview": "# Symbol: find_symbol_by_name (function)\n  Defined in: src/storage/read.rs [L148-L193]\n\n  No direct references found.\n\n  Direct call sites (10 — AST-resolved):\n    src/benchmark/grounding.rs [L959]\n    src/server/mod.rs [L1461]\n        L1…",
+        "tokens": 110,
+        "naive_tokens": 93,
+        "latency": {
+          "mean_us": 95.2,
+          "stdev_us": 4.707440918375927,
+          "p50_us": 96.0,
+          "p95_us": 100.6,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "symbol": "find_symbol_by_name"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 11,
+          "verified_claims": 5,
+          "file_claims": 4,
+          "line_claims": 1,
+          "symbol_claims": 6,
+          "verified_files": 4,
+          "verified_lines": 1,
+          "verified_symbols": 0,
+          "unverified": [
+            "L973",
+            "L1654",
+            "L2654",
+            "L3429",
+            "L3559"
+          ],
+          "score": 0.45454545454545453,
+          "elapsed_us": 74,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 2432,
+        "response_preview": "tests/tools.rs:995:fn test_find_symbol_by_name_across_files() {\ntests/tools.rs:1033:    let results = read::find_symbol_by_name(&conn, \"process\").unwrap();\nsrc/benchmark/scenarios.rs:668:        id: \"qartez_refs_find_symbol_by_name\",\nsrc/benc…",
+        "tokens": 636,
+        "naive_tokens": 608,
+        "latency": {
+          "mean_us": 1768.6,
+          "stdev_us": 47.8020920044301,
+          "p50_us": 1777.0,
+          "p95_us": 1822.1999999999998,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /find_symbol_by_name/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 31,
+          "verified_claims": 30,
+          "file_claims": 1,
+          "line_claims": 25,
+          "symbol_claims": 5,
+          "verified_files": 1,
+          "verified_lines": 25,
+          "verified_symbols": 4,
+          "unverified": [
+            "function"
+          ],
+          "score": 0.967741935483871,
+          "elapsed_us": 81,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 82.70440251572327,
+        "bytes_pct": 84.70394736842105,
+        "latency_ratio": 18.577731092436974
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Specifier-aware filtering (vs raw text)",
+          "Optional transitive BFS",
+          "Def + uses in one response",
+          "AST-resolved call sites now listed alongside file-edge importers"
+        ],
+        "cons": [
+          "Misses dynamic dispatch: trait-object calls resolve at runtime and leave no static edge or call-site name the tree-sitter walker can anchor to",
+          "Transitive BFS can balloon on hub symbols — a symbol whose file is imported by 50 crates yields 50 * avg-fanout rows"
+        ],
+        "summary": "MCP now surfaces both file-level edges and AST call sites, closing the gap with grep while keeping the tree-sitter precision that skips strings and comments."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 10,
+          "groundedness": 3,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 10,
+          "conciseness": 3
+        },
+        "verdict": "MCP gives 10 AST-resolved call sites grouped by file; non-MCP returns 25+ text mentions including docs and strings",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 24,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "mcp_only": [],
+        "non_mcp_only": [
+          "src/benchmark/grounding.rs:1063",
+          "src/benchmark/grounding.rs:1075",
+          "src/benchmark/grounding.rs:1077",
+          "src/benchmark/grounding.rs:185",
+          "src/benchmark/grounding.rs:6"
+        ]
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_impact",
+      "scenario_id": "qartez_impact_storage_read",
+      "description": "Blast radius and co-change partners for src/storage/read.rs.",
+      "mcp": {
+        "response_bytes": 1150,
+        "response_preview": "# Impact analysis: src/storage/read.rs\n\nDirect importers (4): src/benchmark/targets.rs, src/graph/leiden.rs, src/graph/wiki.rs, src/storage/write.rs\nTransitive blast radius: 14 file(s)\n  - src/benchmark/profiles/java.rs\n  - src/storage/writ…",
+        "tokens": 308,
+        "naive_tokens": 287,
+        "latency": {
+          "mean_us": 174.2,
+          "stdev_us": 19.43604898121015,
+          "p50_us": 166.0,
+          "p95_us": 204.0,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "src/storage/read.rs",
+          "include_tests": false
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 21,
+          "verified_claims": 19,
+          "file_claims": 21,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 19,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "reports/baseline.js",
+            "reports/benchmark.js"
+          ],
+          "score": 0.9047619047619048,
+          "elapsed_us": 76,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 16673,
+        "response_preview": "src/server/mod.rs:24:use crate::storage::read;\nsrc/server/mod.rs:2332:        // `use crate::storage::read;` followed by `read::symbol(...)`, or\nsrc/graph/leiden.rs:22:use crate::storage::read::{get_all_edges, get_all_files};\nsrc/benchmark/…",
+        "tokens": 5418,
+        "naive_tokens": 4168,
+        "latency": {
+          "mean_us": 21278.6,
+          "stdev_us": 356.521303711293,
+          "p50_us": 21096.0,
+          "p95_us": 21750.2,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "BFS grep from 'storage::read' (depth 2)",
+          "git log -n100 --name-only + pair counts for src/storage/read.rs (top 10)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 153,
+          "verified_claims": 133,
+          "file_claims": 106,
+          "line_claims": 47,
+          "symbol_claims": 0,
+          "verified_files": 86,
+          "verified_lines": 47,
+          "verified_symbols": 0,
+          "unverified": [
+            "scripts/CLAUDE.md",
+            "reports/baseline.js",
+            "reports/benchmark.js",
+            "reports/baseline-go.js",
+            "reports/benchmark-v2.js"
+          ],
+          "score": 0.869281045751634,
+          "elapsed_us": 5665,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 94.31524547803618,
+        "bytes_pct": 93.10262100401847,
+        "latency_ratio": 122.150401836969,
+        "effective_savings_pct": 94.31524547803618
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Combines static blast radius + git co-change in one call",
+          "Transitive BFS pre-computed",
+          "`include_tests: false` by default excludes test modules from the blast radius"
+        ],
+        "cons": [
+          "Co-change is statistical, not causal"
+        ],
+        "summary": "MCP wins on correctness and output size: the non-MCP equivalent is a 2-level import BFS plus a full git-log mine with in-process pair counting — reproducible now that the sim matches what a real agent would actually have to do."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 7,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 10,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP computes blast radius (14 files) + co-change (10 partners); non-MCP is raw grep+git with no analysis",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_cochange",
+      "scenario_id": "qartez_cochange_server_mod",
+      "description": "Top 5 co-change partners for src/server/mod.rs.",
+      "mcp": {
+        "response_bytes": 385,
+        "response_preview": "# Co-changes for: src/server/mod.rs (max_commit_size=30)\n\n # | File                                | Count\n---+-------------------------------------+------\n 1 | src/server/quality_tests.rs         | 15\n 2 | reports/benchmark.json           …",
+        "tokens": 92,
+        "naive_tokens": 96,
+        "latency": {
+          "mean_us": 6500.0,
+          "stdev_us": 64.36458653638661,
+          "p50_us": 6496.0,
+          "p95_us": 6570.2,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "src/server/mod.rs",
+          "limit": 5,
+          "max_commit_size": 30
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 6,
+          "verified_claims": 4,
+          "file_claims": 6,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 4,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "reports/baseline.js",
+            "reports/benchmark.js"
+          ],
+          "score": 0.6666666666666666,
+          "elapsed_us": 30,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 12898,
+        "response_preview": "b5c440650459baf908d5301fde5b22858d094908\nsrc/benchmark/judge.rs\nsrc/benchmark/mod.rs\nsrc/benchmark/report.rs\nsrc/benchmark/scenarios.rs\nsrc/benchmark/set_compare.rs\nsrc/bin/benchmark.rs\n\n4107ced7118f3c622c62a66c92ae39d2281ec49f\nsrc/server/m…",
+        "tokens": 4361,
+        "naive_tokens": 3224,
+        "latency": {
+          "mean_us": 18624.0,
+          "stdev_us": 441.24822945820415,
+          "p50_us": 18537.0,
+          "p95_us": 19152.2,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "git log -n200 --name-only + pair counts for src/server/mod.rs (top 5)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 106,
+          "verified_claims": 86,
+          "file_claims": 106,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 86,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "scripts/CLAUDE.md",
+            "reports/baseline.js",
+            "reports/benchmark.js",
+            "reports/baseline-go.js",
+            "reports/benchmark-v2.js"
+          ],
+          "score": 0.8113207547169812,
+          "elapsed_us": 674,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 97.89039211190094,
+        "bytes_pct": 97.01504109164212,
+        "latency_ratio": 2.8652307692307692
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Pre-computed pair counts",
+          "Instant response",
+          "`max_commit_size` arg skips huge refactor commits (default 30) when recomputing from git"
+        ],
+        "cons": [
+          "Depends on git-history granularity"
+        ],
+        "summary": "MCP wins on tokens and latency: the non-MCP sim now faithfully reproduces the full git log mine + in-process pair counting that an agent would have to run by hand."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 5,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP returns counted ranked table of 5 partners; non-MCP dumps raw git log requiring manual co-occurrence counting",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_unused",
+      "scenario_id": "qartez_unused_whole_repo",
+      "description": "Find all unused exported symbols across the repo.",
+      "mcp": {
+        "response_bytes": 1193,
+        "response_preview": "158 unused export(s); showing 50 from offset 0 (next: offset=50).\nscripts/setup-benchmark-fixtures.sh\n  f info L37\n  f warn L38\n  f note L39\n  f error L40\n  f check_deps L42\n  f toml_field L52\n  f toml_sections L69\n  f is_up_to_date L80\n  f…",
+        "tokens": 408,
+        "naive_tokens": 298,
+        "latency": {
+          "mean_us": 98.6,
+          "stdev_us": 6.529931086925803,
+          "p50_us": 96.0,
+          "p95_us": 108.6,
+          "samples": 5
+        },
+        "error": null,
+        "args": {},
+        "reused": false,
+        "grounding": {
+          "total_claims": 5,
+          "verified_claims": 5,
+          "file_claims": 5,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 5,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 57,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 16513,
+        "response_preview": "src/benchmark/targets.rs:81:pub struct ResolvedTargets {\nsrc/benchmark/targets.rs:132:pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedTargets> {\nsrc/benchmark/set_compare.rs:12:pub struct SetComparisonScores {…",
+        "tokens": 4621,
+        "naive_tokens": 4128,
+        "latency": {
+          "mean_us": 1963.0,
+          "stdev_us": 49.93595898748716,
+          "p50_us": 1948.0,
+          "p95_us": 2024.0,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /^pub (fn|struct|enum|trait|const)/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 426,
+          "verified_claims": 392,
+          "file_claims": 0,
+          "line_claims": 223,
+          "symbol_claims": 203,
+          "verified_files": 0,
+          "verified_lines": 214,
+          "verified_symbols": 178,
+          "unverified": [
+            "Foo",
+            "compare",
+            "Wrapper",
+            "AppConfig",
+            "create_app"
+          ],
+          "score": 0.92018779342723,
+          "elapsed_us": 942,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 91.17074226357931,
+        "bytes_pct": 92.77538908738569,
+        "latency_ratio": 19.90872210953347
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Pre-materialized at index time — query is a single indexed SELECT",
+          "`limit` / `offset` pagination (default 50) keeps default output small",
+          "Trait-impl methods are excluded at parse time via the `unused_excluded` flag"
+        ],
+        "cons": [
+          "Requires human filtering before action — dynamic dispatch callers don't register as static importers",
+          "Pre-materialization is invalidated wholesale on re-index; a stale index may miss recently-added imports"
+        ],
+        "summary": "MCP wins massively: the non-MCP step captured here is only the candidate list — a real agent would need hundreds more greps."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 0,
+          "usability": 7,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP identifies 158 unused exports with pagination; non-MCP just lists all pub declarations with no usage analysis",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 215,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "mcp_only": [],
+        "non_mcp_only": [
+          "AXIS_NAMES_TEN",
+          "AgreementStats",
+          "AppConfig",
+          "BashSupport",
+          "BenchmarkReport"
+        ]
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_stats",
+      "scenario_id": "qartez_stats_basic",
+      "description": "Overall codebase statistics and language breakdown.",
+      "mcp": {
+        "response_bytes": 273,
+        "response_preview": "files=101 (src=98/test=3) loc=30077/4498 syms=2119 edges=103 indexed=69/101\nlangs: rust=62f/2707121L/95.0M/1945s bash=10f/36528L/1.0M/174s\ntop: src/index/symbols.rs×18 src/index/languages/mod.rs×16 src/error.rs×12 src/storage/mod.rs×12 …",
+        "tokens": 107,
+        "naive_tokens": 68,
+        "latency": {
+          "mean_us": 362.8,
+          "stdev_us": 9.453041838477178,
+          "p50_us": 362.0,
+          "p95_us": 374.4,
+          "samples": 5
+        },
+        "error": null,
+        "args": {},
+        "reused": false,
+        "grounding": {
+          "total_claims": 5,
+          "verified_claims": 5,
+          "file_claims": 5,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 5,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 25,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 2461,
+        "response_preview": "Cargo.toml\nMakefile\nREADME_RU.md\ntests/tools.rs\nCargo.lock\ndocs/benchmark/judge-core.md\ndocs/benchmark/verifiable-grounding.md\ndocs/benchmark/research.md\ndocs/benchmark/PLAN.md\ndocs/benchmark/ensemble-and-agreement.md\nREADME.md\nbenchmarks/f…",
+        "tokens": 650,
+        "naive_tokens": 615,
+        "latency": {
+          "mean_us": 397.2,
+          "stdev_us": 22.727956353354784,
+          "p50_us": 405.0,
+          "p95_us": 426.0,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Glob **/*"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 97,
+          "verified_claims": 86,
+          "file_claims": 97,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 86,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "scripts/CLAUDE.md",
+            "reports/baseline.js",
+            "reports/benchmark.js",
+            "reports/baseline-go.js",
+            "reports/benchmark-go.js"
+          ],
+          "score": 0.8865979381443299,
+          "elapsed_us": 160,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 83.53846153846153,
+        "bytes_pct": 88.90694839496139,
+        "latency_ratio": 1.0948180815876516
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Single-call summary",
+          "Most-connected-files list included",
+          "Optional `file_path` arg drills into per-file LOC / symbol / importer counts",
+          "Aggregate output splits src and test files/LOC"
+        ],
+        "cons": [
+          "Test/src split is filename-based (`tests/`, `_test.rs`, `benches/`) — not build-graph-aware, so integration tests wired via Cargo `test` target live in `src/` look like production code",
+          "Language buckets count files-only; weighted metrics (bytes, symbols per language) aren't broken out"
+        ],
+        "summary": "MCP wins — non-MCP glob dump requires external aggregation just to count files."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP gives computed stats (101 files, 2119 syms, lang breakdown); non-MCP is just a file listing with no metrics",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_calls",
+      "scenario_id": "qartez_calls_build_overview",
+      "description": "Call hierarchy for build_overview (default depth=1).",
+      "mcp": {
+        "response_bytes": 1881,
+        "response_preview": "build_overview (method) @ src/server/mod.rs:L327-496\ncallers: 17\n  build_overview @ src/server/mod.rs:L356\n  qartez_read @ src/server/mod.rs:L1415\n  (top) @ src/server/mod.rs:L4244\n  overview_budget_respected @ src/server/quality_tests.rs:L65…",
+        "tokens": 516,
+        "naive_tokens": 470,
+        "latency": {
+          "mean_us": 730.0,
+          "stdev_us": 32.89376840679705,
+          "p50_us": 741.0,
+          "p95_us": 762.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "name": "build_overview"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 33,
+          "verified_claims": 25,
+          "file_claims": 6,
+          "line_claims": 1,
+          "symbol_claims": 26,
+          "verified_files": 6,
+          "verified_lines": 1,
+          "verified_symbols": 18,
+          "unverified": [
+            "is_some",
+            "sort_by",
+            "push_str",
+            "is_empty",
+            "unwrap_or"
+          ],
+          "score": 0.7575757575757576,
+          "elapsed_us": 155,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 9292,
+        "response_preview": "src/benchmark/scenarios.rs:764:        id: \"qartez_calls_build_overview\",\nsrc/benchmark/scenarios.rs:765:        description: \"Call hierarchy for build_overview (default depth=1).\",\nsrc/benchmark/report.rs:1695:            \"`qartez_calls_build_…",
+        "tokens": 2626,
+        "naive_tokens": 2323,
+        "latency": {
+          "mean_us": 1923.0,
+          "stdev_us": 68.07348970047003,
+          "p50_us": 1901.0,
+          "p95_us": 2010.8,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /build_overview/ (*.rs)",
+          "Read src/server/mod.rs lines 46-180"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 51,
+          "verified_claims": 41,
+          "file_claims": 4,
+          "line_claims": 26,
+          "symbol_claims": 21,
+          "verified_files": 1,
+          "verified_lines": 25,
+          "verified_symbols": 15,
+          "unverified": [
+            "Arc",
+            "None",
+            "bodies",
+            "mod.rs",
+            "Response"
+          ],
+          "score": 0.803921568627451,
+          "elapsed_us": 214,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 80.35034272658035,
+        "bytes_pct": 79.75678002582866,
+        "latency_ratio": 2.6342465753424658
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Tree-sitter AST distinguishes calls from references",
+          "Callees resolved to definition file:line",
+          "Transitive depth available (default 1, opt-in depth=2)",
+          "Per-session parse cache — repeat invocations are in-memory"
+        ],
+        "cons": [
+          "Misses dynamic dispatch — trait-object `Box<dyn Foo>` calls leave no static call-site name",
+          "Depth=2 output can still balloon on hub functions; the grouping elision helps but the graph is inherently O(N^depth)"
+        ],
+        "summary": "MCP wins on correctness (tree-sitter distinguishes call sites from type-position references) and tokens. A per-invocation parse cache and a textual pre-filter keep the AST walk from re-visiting files that cannot possibly contain the callee, so the cold-parse cost stays in the low milliseconds."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 5,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP shows 17 callers + 28 callees via AST; non-MCP is grep of text mentions + unrelated source dump",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_context",
+      "scenario_id": "qartez_context_server_mod",
+      "description": "Top 5 related files for src/server/mod.rs.",
+      "mcp": {
+        "response_bytes": 350,
+        "response_preview": "# Context for: src/server/mod.rs\n5 related file(s) found:\n\n 1. src/server/quality_tests.rs (score: 22.0) — importer, cochange, transitive\n 2. reports/benchmark.md (score: 15.0) — cochange\n 3. reports/benchmark.json (score: 15.0) — coc…",
+        "tokens": 118,
+        "naive_tokens": 87,
+        "latency": {
+          "mean_us": 69.2,
+          "stdev_us": 2.5612496949731396,
+          "p50_us": 69.0,
+          "p95_us": 72.6,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "files": [
+            "src/server/mod.rs"
+          ],
+          "limit": 5
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 6,
+          "verified_claims": 4,
+          "file_claims": 6,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 4,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "reports/baseline.js",
+            "reports/benchmark.js"
+          ],
+          "score": 0.6666666666666666,
+          "elapsed_us": 29,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 10221,
+        "response_preview": "tests/tools.rs:1372:            \"use crate::hub::shared;\\npub fn a() -> u32 { shared() }\\n\",\ntests/tools.rs:1377:            \"use crate::hub::shared;\\npub fn b() -> u32 { shared() + 1 }\\n\",\nsrc/benchmark/targets.rs:16:use crate::storage::re…",
+        "tokens": 2848,
+        "naive_tokens": 2555,
+        "latency": {
+          "mean_us": 21804.4,
+          "stdev_us": 138.88498838967442,
+          "p50_us": 21763.0,
+          "p95_us": 21994.4,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /use crate::/ (*.rs)",
+          "Grep /use crate::server/ (*.rs)",
+          "git log -n50 -- src/server/mod.rs"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 127,
+          "verified_claims": 119,
+          "file_claims": 5,
+          "line_claims": 115,
+          "symbol_claims": 7,
+          "verified_files": 4,
+          "verified_lines": 109,
+          "verified_symbols": 6,
+          "unverified": [
+            "func_",
+            "a/mod.rs",
+            "src/index/mod.rs:1187",
+            "src/benchmark/scenarios.rs:853",
+            "src/index/languages/rust_lang.rs:790"
+          ],
+          "score": 0.937007874015748,
+          "elapsed_us": 361,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 95.85674157303372,
+        "bytes_pct": 96.5756775266608,
+        "latency_ratio": 315.09248554913296
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Multi-signal scoring: deps + cochange + PageRank + task FTS",
+          "Reason tags explain every row"
+        ],
+        "cons": [
+          "Opaque composite score",
+          "Cannot answer 'why was X excluded'"
+        ],
+        "summary": "MCP wins — no single Grep/Read chain can approximate the composite ranking."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 5,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP ranks 5 related files with multi-signal scores; non-MCP greps import patterns with no relationship scoring",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_rename",
+      "scenario_id": "qartez_rename_truncate_path_preview",
+      "description": "Preview rename of truncate_path → trunc_path (no apply).",
+      "mcp": {
+        "response_bytes": 538,
+        "response_preview": "truncate_path → trunc_path: 10 occ in 2 file(s)\nsrc/server/mod.rs\n  L396: trunc_path(&sym.name, 30),\n  L397: trunc_path(&sym.kind, 10),\n  L398: trunc_path(&file.path, 34),\n  L527: trunc_path(&file.path, 35),\n  L659: fn trunc_path(path: &s…",
+        "tokens": 180,
+        "naive_tokens": 134,
+        "latency": {
+          "mean_us": 132.4,
+          "stdev_us": 7.144228439796701,
+          "p50_us": 131.0,
+          "p95_us": 141.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "apply": false,
+          "new_name": "trunc_path",
+          "old_name": "truncate_path"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 5,
+          "verified_claims": 4,
+          "file_claims": 3,
+          "line_claims": 0,
+          "symbol_claims": 2,
+          "verified_files": 3,
+          "verified_lines": 0,
+          "verified_symbols": 1,
+          "unverified": [
+            "trunc_path"
+          ],
+          "score": 0.8,
+          "elapsed_us": 30,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 1270,
+        "response_preview": "src/benchmark/targets.rs:5://! `QartezServer`, `truncate_path`, etc. directly in `scenarios.rs`; now\nsrc/benchmark/targets.rs:123:    /// historic `truncate_path → trunc_path` pair byte-for-byte.\nsrc/benchmark/scenarios.rs:588:        de…",
+        "tokens": 327,
+        "naive_tokens": 317,
+        "latency": {
+          "mean_us": 2128.2,
+          "stdev_us": 25.63123094976127,
+          "p50_us": 2132.0,
+          "p95_us": 2159.6,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /\\btruncate_path\\b/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 19,
+          "verified_claims": 18,
+          "file_claims": 2,
+          "line_claims": 15,
+          "symbol_claims": 2,
+          "verified_files": 2,
+          "verified_lines": 14,
+          "verified_symbols": 2,
+          "unverified": [
+            "src/benchmark/scenarios.rs:805"
+          ],
+          "score": 0.9473684210526315,
+          "elapsed_us": 103,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 44.95412844036697,
+        "bytes_pct": 57.637795275590555,
+        "latency_ratio": 16.074018126888216
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Tree-sitter identifier matching skips strings/comments",
+          "Atomic apply with word-boundary fallback",
+          "Preview + apply in one API",
+          "Correctly handles aliased imports (`use foo::bar as baz`) — enshrined by a unit test"
+        ],
+        "cons": [
+          "Only indexed languages"
+        ],
+        "summary": "MCP wins on tokens and safety. The AST-based identifier match on a 2300-line file runs in the low single-digit milliseconds — slower than a raw grep but the cost buys correct skipping of strings, comments, and same-spelled but unrelated identifiers."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 7,
+          "conciseness": 5
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 7,
+          "usability": 5,
+          "groundedness": 7,
+          "conciseness": 5
+        },
+        "verdict": "MCP previews 10 occurrences across 2 files with new names; non-MCP just greps text including benchmark refs",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_move",
+      "scenario_id": "qartez_move_capitalize_kind_preview",
+      "description": "Preview moving the `capitalize_kind` helper to a new file.",
+      "mcp": {
+        "response_bytes": 583,
+        "response_preview": "Preview: move 'capitalize_kind' (function) from src/server/mod.rs to src/server/helpers.rs\n\nCode to extract (L3789-L3800, 12 lines):\n```\n                    breakdown.explain(),\n                )\n            } else {\n                format!…",
+        "tokens": 117,
+        "naive_tokens": 145,
+        "latency": {
+          "mean_us": 70.0,
+          "stdev_us": 6.0,
+          "p50_us": 67.0,
+          "p95_us": 78.2,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "apply": false,
+          "symbol": "capitalize_kind",
+          "to_file": "src/server/helpers.rs"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 2,
+          "verified_claims": 1,
+          "file_claims": 2,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 1,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "src/server/helpers.rs"
+          ],
+          "score": 0.5,
+          "elapsed_us": 25,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 2784,
+        "response_preview": "src/server/mod.rs:3969:fn capitalize_kind(kind: &str) -> String {\n  2180\t            } else {\n  2181\t                out.push_str(&format!(\"  Direct references ({}):\\n\", importers.len()));\n  2182\t                for (edge, importer_file) in…",
+        "tokens": 676,
+        "naive_tokens": 696,
+        "latency": {
+          "mean_us": 4042.0,
+          "stdev_us": 75.02266324251626,
+          "p50_us": 4066.0,
+          "p95_us": 4122.4,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /fn capitalize_kind/ (*.rs)",
+          "Read src/server/mod.rs lines 2180-2225",
+          "Grep /\\bcapitalize_kind\\b/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 6,
+          "verified_claims": 5,
+          "file_claims": 1,
+          "line_claims": 4,
+          "symbol_claims": 1,
+          "verified_files": 1,
+          "verified_lines": 3,
+          "verified_symbols": 1,
+          "unverified": [
+            "src/benchmark/scenarios.rs:823"
+          ],
+          "score": 0.8333333333333334,
+          "elapsed_us": 58,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 82.6923076923077,
+        "bytes_pct": 79.05890804597702,
+        "latency_ratio": 57.74285714285714
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Atomic extraction + insertion + importer rewriting",
+          "Refuses on ambiguous symbols",
+          "Refuses when destination already defines a same-kind same-name symbol",
+          "Importer rewriting uses regex word boundaries (no substring over-match)"
+        ],
+        "cons": [
+          "Does not rewrite doc-comment references like `[`foo::bar`]` — the rewriter targets `use` paths and qualified call sites only",
+          "Ambiguity check is by symbol name, not by fully-qualified path — a free function `foo` and a method `foo` on a struct both count as ambiguous even when only one matches the move target kind"
+        ],
+        "summary": "MCP wins — non-MCP path is a 3-step sequence with several edit-time pitfalls."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 3,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 5,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 7,
+          "usability": 5,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP extracts wrong code block despite correct line range; non-MCP locates definition and callers via grep",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_rename_file",
+      "scenario_id": "qartez_rename_file_server_mod_preview",
+      "description": "Preview renaming src/server/mod.rs → src/server/server.rs.",
+      "mcp": {
+        "response_bytes": 87,
+        "response_preview": "src/server/mod.rs → src/server/server.rs: 1 importer(s): src/server/quality_tests.rs\n",
+        "tokens": 22,
+        "naive_tokens": 21,
+        "latency": {
+          "mean_us": 10.4,
+          "stdev_us": 0.7999999999999999,
+          "p50_us": 11.0,
+          "p95_us": 11.0,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "apply": false,
+          "from": "src/server/mod.rs",
+          "to": "src/server/server.rs"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 3,
+          "verified_claims": 2,
+          "file_claims": 3,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 2,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "src/server/server.rs"
+          ],
+          "score": 0.6666666666666666,
+          "elapsed_us": 16,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 622,
+        "response_preview": "src/benchmark/scenarios.rs:275:            regex: r\"use crate::server\".to_string(),\nsrc/benchmark/scenarios.rs:383:            regex: r\"use crate::server\".to_string(),\nsrc/benchmark/scenarios.rs:443:        regex: r\"crate::server\".to_string…",
+        "tokens": 168,
+        "naive_tokens": 155,
+        "latency": {
+          "mean_us": 1915.6,
+          "stdev_us": 72.48061809890972,
+          "p50_us": 1970.0,
+          "p95_us": 1980.0,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /crate::server/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 8,
+          "verified_claims": 8,
+          "file_claims": 0,
+          "line_claims": 7,
+          "symbol_claims": 1,
+          "verified_files": 0,
+          "verified_lines": 7,
+          "verified_symbols": 1,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 54,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 86.90476190476191,
+        "bytes_pct": 86.0128617363344,
+        "latency_ratio": 184.19230769230768
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Atomic mv + import path rewriting",
+          "Handles mod.rs → named-module transform",
+          "Regex word-boundary matching prevents over-match on import stems"
+        ],
+        "cons": [
+          "`mod.rs → named.rs` edge case: the parent module's `mod foo;` declaration is *not* rewritten because the rename tool only touches files that import via `use crate::foo::…`, not files that declare the module",
+          "Doc links (`[`crate::foo`]` in `///` comments) aren't rewritten — the rewriter is limited to `use`-path tokens"
+        ],
+        "summary": "MCP wins for single-shot refactors; non-MCP path produces correct results only with careful scoping."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 5,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 7,
+          "usability": 3,
+          "groundedness": 10,
+          "conciseness": 3
+        },
+        "verdict": "MCP gives concise rename preview with 1 importer; non-MCP greps crate::server mentions including comments",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_project",
+      "scenario_id": "qartez_project_info",
+      "description": "Detect the toolchain and report its commands.",
+      "mcp": {
+        "response_bytes": 141,
+        "response_preview": "# Project toolchain: rust\n\nBuild tool: cargo\nTest:       cargo test\nBuild:      cargo build\nLint:       cargo clippy\nTypecheck:  cargo check\n",
+        "tokens": 38,
+        "naive_tokens": 35,
+        "latency": {
+          "mean_us": 1.0,
+          "stdev_us": 0.0,
+          "p50_us": 1.0,
+          "p95_us": 1.0,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "action": "info"
+        },
+        "reused": false
+      },
+      "non_mcp": {
+        "response_bytes": 2315,
+        "response_preview": "     1\t[package]\n     2\tname = \"qartez-mcp\"\n     3\tversion = \"0.1.0\"\n     4\tedition = \"2024\"\n     5\tdescription = \"MCP server for codebase intelligence — tree-sitter indexing, PageRank, blast radius\"\n     6\tlicense = \"MIT\"\n     7\tkeyword…",
+        "tokens": 916,
+        "naive_tokens": 578,
+        "latency": {
+          "mean_us": 12.8,
+          "stdev_us": 1.9390719429665315,
+          "p50_us": 12.0,
+          "p95_us": 15.6,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Read Cargo.toml"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 3,
+          "verified_claims": 3,
+          "file_claims": 3,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 3,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 45,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 95.85152838427948,
+        "bytes_pct": 93.90928725701943,
+        "latency_ratio": 12.8
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Auto-detection across 5+ ecosystems (Cargo, npm/bun, Go, Python, Make)",
+          "Consistent output format",
+          "`run` action resolves a subcommand to its shell form without executing"
+        ],
+        "cons": [
+          "Detects toolchain by file presence only — `Cargo.toml` / `package.json` / `go.mod` existing is enough, the tool never runs a probe command to confirm the toolchain actually works",
+          "No polyglot support — a Rust + Node monorepo resolves to the first detected toolchain (Cargo wins, Node is silent), so callers need to scope to a sub-directory to see the other"
+        ],
+        "summary": "Near-tie: reading Cargo.toml is already cheap; MCP wins only on portability across ecosystems."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 7,
+          "usability": 10,
+          "groundedness": 7,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 7,
+          "usability": 5,
+          "groundedness": 10,
+          "conciseness": 3
+        },
+        "verdict": "MCP auto-detects Rust toolchain with build/test/lint commands; non-MCP shows raw Cargo.toml needing interpretation",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "tier": 1
+    },
+    {
+      "tool": "qartez_find",
+      "scenario_id": "qartez_find_nonexistent",
+      "description": "Search for a symbol that does not exist. Validates empty-result handling.",
+      "mcp": {
+        "response_bytes": 55,
+        "response_preview": "No symbol found with name 'ThisSymbolDoesNotExist__xyz'",
+        "tokens": 13,
+        "naive_tokens": 13,
+        "latency": {
+          "mean_us": 0.2,
+          "stdev_us": 0.4,
+          "p50_us": 0.0,
+          "p95_us": 0.7999999999999998,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "name": "ThisSymbolDoesNotExist__xyz"
+        },
+        "reused": false
+      },
+      "non_mcp": {
+        "response_bytes": 173,
+        "response_preview": "src/benchmark/scenarios.rs:463:    json!({ \"name\": \"ThisSymbolDoesNotExist__xyz\" })\nsrc/benchmark/scenarios.rs:467:        regex: \"ThisSymbolDoesNotExist__xyz\".to_string(),\n",
+        "tokens": 48,
+        "naive_tokens": 43,
+        "latency": {
+          "mean_us": 1901.2,
+          "stdev_us": 57.83217097775251,
+          "p50_us": 1890.0,
+          "p95_us": 1965.6,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /ThisSymbolDoesNotExist__xyz/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 2,
+          "verified_claims": 2,
+          "file_claims": 0,
+          "line_claims": 2,
+          "symbol_claims": 0,
+          "verified_files": 0,
+          "verified_lines": 2,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 17,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 72.91666666666666,
+        "bytes_pct": 68.20809248554913,
+        "latency_ratio": 9506.0,
+        "effective_savings_pct": 72.91666666666666
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Graceful empty result"
+        ],
+        "cons": [
+          "No faster than grep for zero matches"
+        ],
+        "summary": "Validates error/empty path — both sides should return empty or a clear 'not found' message."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 7,
+          "conciseness": 7
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 10,
+          "usability": 5,
+          "groundedness": 10,
+          "conciseness": 5
+        },
+        "verdict": "MCP correctly reports no symbol found; non-MCP false-positives on benchmark scenario defs containing the string",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 2
+    },
+    {
+      "tool": "qartez_grep",
+      "scenario_id": "qartez_grep_regex",
+      "description": "Regex search for `^handle_.*request$`. Tests regex mode correctness.",
+      "mcp": {
+        "response_bytes": 40,
+        "response_preview": "No symbols matching '^handle_.*request$'",
+        "tokens": 10,
+        "naive_tokens": 10,
+        "latency": {
+          "mean_us": 1148.2,
+          "stdev_us": 46.15365640986638,
+          "p50_us": 1159.0,
+          "p95_us": 1197.8,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "query": "^handle_.*request$",
+          "regex": true
+        },
+        "reused": false
+      },
+      "non_mcp": {
+        "response_bytes": 0,
+        "response_preview": "",
+        "tokens": 0,
+        "naive_tokens": 0,
+        "latency": {
+          "mean_us": 1888.8,
+          "stdev_us": 30.66855066676611,
+          "p50_us": 1879.0,
+          "p95_us": 1935.2,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /^handle_.*request$/ (*.rs)"
+        ],
+        "reused": false
+      },
+      "savings": {
+        "tokens_pct": 0.0,
+        "bytes_pct": 0.0,
+        "latency_ratio": 1.6450095802125064,
+        "effective_savings_pct": 0.0
+      },
+      "verdict": {
+        "winner": "tie",
+        "pros": [
+          "Regex support against indexed symbol names"
+        ],
+        "cons": [
+          "Regex anchors match symbol names, not full lines"
+        ],
+        "summary": "Tests regex handling — MCP searches indexed symbols while non-MCP greps raw lines."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 7,
+          "conciseness": 7
+        },
+        "non_mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 5,
+          "groundedness": 7,
+          "conciseness": 7
+        },
+        "verdict": "Both correctly find no matches; MCP states it explicitly, non-MCP returns silent empty output",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 1,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 0.0,
+        "recall": 1.0,
+        "mcp_only": [
+          "No"
+        ],
+        "non_mcp_only": []
+      },
+      "tier": 2
+    },
+    {
+      "tool": "qartez_read",
+      "scenario_id": "qartez_read_whole_file",
+      "description": "Read a small file via file_path only (no symbol). Tests file-level read mode.",
+      "mcp": {
+        "response_bytes": 2332,
+        "response_preview": "Cargo.toml L1-70\n   1 | [package]\n   2 | name = \"qartez-mcp\"\n   3 | version = \"0.1.0\"\n   4 | edition = \"2024\"\n   5 | description = \"MCP server for codebase intelligence — tree-sitter indexing, PageRank, blast radius\"\n   6 | license = \"MI…",
+        "tokens": 964,
+        "naive_tokens": 583,
+        "latency": {
+          "mean_us": 12.4,
+          "stdev_us": 0.48989794855663565,
+          "p50_us": 12.0,
+          "p95_us": 13.0,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "Cargo.toml"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 4,
+          "verified_claims": 3,
+          "file_claims": 3,
+          "line_claims": 0,
+          "symbol_claims": 1,
+          "verified_files": 3,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [
+            "serde_json"
+          ],
+          "score": 0.75,
+          "elapsed_us": 101,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 2315,
+        "response_preview": "     1\t[package]\n     2\tname = \"qartez-mcp\"\n     3\tversion = \"0.1.0\"\n     4\tedition = \"2024\"\n     5\tdescription = \"MCP server for codebase intelligence — tree-sitter indexing, PageRank, blast radius\"\n     6\tlicense = \"MIT\"\n     7\tkeyword…",
+        "tokens": 916,
+        "naive_tokens": 578,
+        "latency": {
+          "mean_us": 14.6,
+          "stdev_us": 0.8,
+          "p50_us": 14.0,
+          "p95_us": 15.8,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Read Cargo.toml"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 3,
+          "verified_claims": 3,
+          "file_claims": 3,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 3,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 44,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": -5.240174672489083,
+        "bytes_pct": -0.734341252699784,
+        "latency_ratio": 1.1774193548387095,
+        "effective_savings_pct": -5.240174672489083
+      },
+      "verdict": {
+        "winner": "non_mcp",
+        "pros": [
+          "Direct file read with no symbol resolution overhead"
+        ],
+        "cons": [
+          "No advantage over plain Read for whole-file reads"
+        ],
+        "summary": "Near-tie: file-level reads are equivalent; MCP adds no semantic value."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 5,
+          "conciseness": 3
+        },
+        "non_mcp": {
+          "correctness": 10,
+          "completeness": 10,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 7
+        },
+        "verdict": "Identical output — both return complete Cargo.toml with line numbers, no difference",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 2
+    },
+    {
+      "tool": "qartez_outline",
+      "scenario_id": "qartez_outline_small_file",
+      "description": "Outline a small file (~50 lines) instead of a 2300-line module. Tests proportional output.",
+      "mcp": {
+        "response_bytes": 5362,
+        "response_preview": "# Outline: src/storage/read.rs (54 symbols)\n\nFunctions:\n  - row_to_file [L10-L21] — fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<FileRow>\n  - row_to_symbol [L23-L37] — fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result…",
+        "tokens": 1581,
+        "naive_tokens": 1340,
+        "latency": {
+          "mean_us": 59.0,
+          "stdev_us": 3.03315017762062,
+          "p50_us": 58.0,
+          "p95_us": 62.800000000000004,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "file_path": "src/storage/read.rs"
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 54,
+          "verified_claims": 54,
+          "file_claims": 1,
+          "line_claims": 0,
+          "symbol_claims": 53,
+          "verified_files": 1,
+          "verified_lines": 0,
+          "verified_symbols": 53,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 200,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 48541,
+        "response_preview": "     1\tuse rusqlite::{Connection, OptionalExtension};\n     2\t\n     3\tuse crate::error::Result;\n     4\tuse crate::storage::models::{CoChangeRow, EdgeRow, FileRow, SymbolRow};\n     5\t\n     6\t/// One symbol resolution: the symbol itself, the f…",
+        "tokens": 14020,
+        "naive_tokens": 12135,
+        "latency": {
+          "mean_us": 138.4,
+          "stdev_us": 6.343500610861482,
+          "p50_us": 136.0,
+          "p95_us": 148.0,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Read src/storage/read.rs"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 87,
+          "verified_claims": 67,
+          "file_claims": 10,
+          "line_claims": 0,
+          "symbol_claims": 77,
+          "verified_files": 3,
+          "verified_lines": 0,
+          "verified_symbols": 64,
+          "unverified": [
+            "is",
+            "term",
+            "edges",
+            "tests",
+            "mod.rs"
+          ],
+          "score": 0.7701149425287356,
+          "elapsed_us": 710,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 88.72325249643367,
+        "bytes_pct": 88.95366803320904,
+        "latency_ratio": 2.3457627118644067,
+        "effective_savings_pct": 88.72325249643367
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Still structured even for small files"
+        ],
+        "cons": [
+          "Marginal benefit when the whole file fits in context"
+        ],
+        "summary": "MCP advantage shrinks for small files — the outline is nearly as large as reading the file."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 7,
+          "completeness": 10,
+          "usability": 7,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 3,
+          "groundedness": 5,
+          "conciseness": 3
+        },
+        "verdict": "MCP outlines 54 symbols grouped by kind (truncated); non-MCP dumps 44K raw source with no symbol extraction",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 54,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 0.0,
+        "recall": 1.0,
+        "mcp_only": [
+          "LanguageStat",
+          "SymbolWithImporters",
+          "byte_count",
+          "count_unused_exports",
+          "file_count"
+        ],
+        "non_mcp_only": []
+      },
+      "tier": 2
+    },
+    {
+      "tool": "qartez_unused",
+      "scenario_id": "qartez_unused_with_limit",
+      "description": "List unused symbols with limit=5. Tests pagination.",
+      "mcp": {
+        "response_bytes": 172,
+        "response_preview": "158 unused export(s); showing 5 from offset 0 (next: offset=5).\nscripts/setup-benchmark-fixtures.sh\n  f info L37\n  f warn L38\n  f note L39\n  f error L40\n  f check_deps L42\n",
+        "tokens": 58,
+        "naive_tokens": 43,
+        "latency": {
+          "mean_us": 40.8,
+          "stdev_us": 3.54400902933387,
+          "p50_us": 39.0,
+          "p95_us": 45.599999999999994,
+          "samples": 5
+        },
+        "error": null,
+        "args": {
+          "limit": 5
+        },
+        "reused": false,
+        "grounding": {
+          "total_claims": 1,
+          "verified_claims": 1,
+          "file_claims": 1,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 1,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 6,
+          "degraded": false
+        }
+      },
+      "non_mcp": {
+        "response_bytes": 16513,
+        "response_preview": "src/benchmark/targets.rs:81:pub struct ResolvedTargets {\nsrc/benchmark/targets.rs:132:pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedTargets> {\nsrc/benchmark/set_compare.rs:12:pub struct SetComparisonScores {…",
+        "tokens": 4621,
+        "naive_tokens": 4128,
+        "latency": {
+          "mean_us": 1909.0,
+          "stdev_us": 30.9127805284481,
+          "p50_us": 1893.0,
+          "p95_us": 1956.6,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep /^pub (fn|struct|enum|trait|const)/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 426,
+          "verified_claims": 392,
+          "file_claims": 0,
+          "line_claims": 223,
+          "symbol_claims": 203,
+          "verified_files": 0,
+          "verified_lines": 214,
+          "verified_symbols": 178,
+          "unverified": [
+            "Foo",
+            "compare",
+            "Wrapper",
+            "AppConfig",
+            "create_app"
+          ],
+          "score": 0.92018779342723,
+          "elapsed_us": 515,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 98.74486041982254,
+        "bytes_pct": 98.95839641494581,
+        "latency_ratio": 46.78921568627451
+      },
+      "verdict": {
+        "winner": "mcp",
+        "pros": [
+          "Pagination limits output size"
+        ],
+        "cons": [
+          "Non-MCP has no equivalent pagination"
+        ],
+        "summary": "MCP wins — limit parameter keeps output bounded while non-MCP emits all matches."
+      },
+      "non_mcp_is_complete": false,
+      "quality": {
+        "mcp": {
+          "correctness": 10,
+          "completeness": 0,
+          "usability": 10,
+          "groundedness": 10,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 3,
+          "completeness": 0,
+          "usability": 3,
+          "groundedness": 7,
+          "conciseness": 3
+        },
+        "verdict": "MCP returns exactly 5 unused exports with pagination metadata; non-MCP dumps all pub declarations unfiltered",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 215,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "mcp_only": [],
+        "non_mcp_only": [
+          "AXIS_NAMES_TEN",
+          "AgreementStats",
+          "AppConfig",
+          "BashSupport",
+          "BenchmarkReport"
+        ]
+      },
+      "tier": 2
+    },
+    {
+      "tool": "qartez_impact",
+      "scenario_id": "qartez_impact_nonexistent",
+      "description": "Impact analysis on a file that does not exist. Tests error handling.",
+      "mcp": {
+        "response_bytes": 0,
+        "response_preview": "",
+        "tokens": 0,
+        "naive_tokens": 0,
+        "latency": {
+          "mean_us": 2.0,
+          "stdev_us": 0.0,
+          "p50_us": 2.0,
+          "p95_us": 2.0,
+          "samples": 5
+        },
+        "error": "File 'src/this_file_does_not_exist.rs' not found in index",
+        "args": {
+          "file_path": "src/this_file_does_not_exist.rs"
+        },
+        "reused": false
+      },
+      "non_mcp": {
+        "response_bytes": 54,
+        "response_preview": "src/benchmark/scenarios.rs\nsrc/benchmark/grounding.rs\n",
+        "tokens": 15,
+        "naive_tokens": 13,
+        "latency": {
+          "mean_us": 967.0,
+          "stdev_us": 32.56992477731565,
+          "p50_us": 979.0,
+          "p95_us": 1001.0,
+          "samples": 5
+        },
+        "error": null,
+        "steps": [
+          "Grep --files-with-matches /this_file_does_not_exist/ (*.rs)"
+        ],
+        "reused": false,
+        "grounding": {
+          "total_claims": 2,
+          "verified_claims": 2,
+          "file_claims": 2,
+          "line_claims": 0,
+          "symbol_claims": 0,
+          "verified_files": 2,
+          "verified_lines": 0,
+          "verified_symbols": 0,
+          "unverified": [],
+          "score": 1.0,
+          "elapsed_us": 10,
+          "degraded": false
+        }
+      },
+      "savings": {
+        "tokens_pct": 100.0,
+        "bytes_pct": 100.0,
+        "latency_ratio": 483.5,
+        "effective_savings_pct": 100.0
+      },
+      "verdict": {
+        "winner": "non_mcp",
+        "pros": [
+          "Clear error message for missing files"
+        ],
+        "cons": [
+          "Error path, not a real use case"
+        ],
+        "summary": "Validates error handling — both sides should report 'file not found' gracefully."
+      },
+      "non_mcp_is_complete": true,
+      "quality": {
+        "mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 5,
+          "groundedness": 7,
+          "conciseness": 10
+        },
+        "non_mcp": {
+          "correctness": 5,
+          "completeness": 10,
+          "usability": 5,
+          "groundedness": 10,
+          "conciseness": 3
+        },
+        "verdict": "skipped (error or empty)",
+        "model": "claude-opus-4-6",
+        "runs": [],
+        "flags": [
+          "batch-skipped"
+        ],
+        "reference_answer_used": false
+      },
+      "set_comparison": {
+        "mcp_items": 0,
+        "non_mcp_items": 0,
+        "intersection": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "mcp_only": [],
+        "non_mcp_only": []
+      },
+      "tier": 2
+    }
+  ]
+}
