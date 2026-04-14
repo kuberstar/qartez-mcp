@@ -21,6 +21,7 @@ use dialoguer::MultiSelect;
 const GUARD_HOOK_SH: &str = include_str!("../../scripts/qartez-guard.sh");
 const SESSION_START_SH: &str = include_str!("../../scripts/qartez-session-start.sh");
 const CLAUDE_MD_SNIPPET: &str = include_str!("../../scripts/CLAUDE.md.snippet");
+const GEMINI_MD_SNIPPET: &str = include_str!("../../scripts/GEMINI.md.snippet");
 
 // -- CLI ---------------------------------------------------------------------
 
@@ -48,6 +49,7 @@ struct Cli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Ide {
     ClaudeCode,
+    Gemini,
     Cursor,
     Windsurf,
     Zed,
@@ -59,6 +61,7 @@ enum Ide {
 impl Ide {
     const ALL: &'static [Ide] = &[
         Ide::ClaudeCode,
+        Ide::Gemini,
         Ide::Cursor,
         Ide::Windsurf,
         Ide::Zed,
@@ -70,6 +73,7 @@ impl Ide {
     fn slug(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude",
+            Self::Gemini => "gemini",
             Self::Cursor => "cursor",
             Self::Windsurf => "windsurf",
             Self::Zed => "zed",
@@ -82,6 +86,7 @@ impl Ide {
     fn from_slug(s: &str) -> Option<Self> {
         match s {
             "claude" | "claude-code" | "claudecode" => Some(Self::ClaudeCode),
+            "gemini" | "gemini-cli" | "geminicli" => Some(Self::Gemini),
             "cursor" => Some(Self::Cursor),
             "windsurf" => Some(Self::Windsurf),
             "zed" => Some(Self::Zed),
@@ -96,6 +101,7 @@ impl Ide {
         let home = home_dir();
         match self {
             Self::ClaudeCode => home.join(".claude"),
+            Self::Gemini => home.join(".gemini"),
             Self::Cursor => home.join(".cursor"),
             Self::Windsurf => home.join(".codeium").join("windsurf"),
             Self::Zed => home.join(".config").join("zed"),
@@ -109,6 +115,7 @@ impl Ide {
         let home = home_dir();
         match self {
             Self::ClaudeCode => home.join(".claude").join("settings.json"),
+            Self::Gemini => home.join(".gemini").join("settings.json"),
             Self::Cursor => home.join(".cursor").join("mcp.json"),
             Self::Windsurf => home
                 .join(".codeium")
@@ -124,6 +131,7 @@ impl Ide {
     fn is_detected(self) -> bool {
         match self {
             Self::ClaudeCode => !discover_claude_dirs().is_empty(),
+            Self::Gemini => !discover_gemini_dirs().is_empty(),
             _ => self.detection_dir().is_dir(),
         }
     }
@@ -133,6 +141,7 @@ impl fmt::Display for Ide {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ClaudeCode => write!(f, "Claude Code"),
+            Self::Gemini => write!(f, "Gemini CLI"),
             Self::Cursor => write!(f, "Cursor"),
             Self::Windsurf => write!(f, "Windsurf"),
             Self::Zed => write!(f, "Zed"),
@@ -156,18 +165,21 @@ fn dirs_replacement() -> PathBuf {
         .expect("$HOME is not set")
 }
 
-/// Returns every Claude Code configuration directory found under `$HOME`:
-/// the primary `~/.claude` plus any `~/.claude-<variant>` siblings
-/// (e.g., `~/.claude-louis`, `~/.claude-thomas`).
-///
-/// Results are sorted for deterministic output, and dirs whose names look
-/// like backup or temp artifacts (`.bak`, `.tmp`, `.backup`) are filtered
-/// out so we never touch restore points.
 fn discover_claude_dirs() -> Vec<PathBuf> {
+    discover_prefixed_dirs(".claude")
+}
+
+fn discover_gemini_dirs() -> Vec<PathBuf> {
+    discover_prefixed_dirs(".gemini")
+}
+
+/// Generic directory discovery for tools that support multiple configuration
+/// directories via dotfile prefixes (e.g., `~/.claude`, `~/.claude-foo`).
+fn discover_prefixed_dirs(prefix: &str) -> Vec<PathBuf> {
     let home = home_dir();
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    let primary = home.join(".claude");
+    let primary = home.join(prefix);
     if primary.is_dir() {
         dirs.push(primary);
     }
@@ -176,12 +188,13 @@ fn discover_claude_dirs() -> Vec<PathBuf> {
         return dirs;
     };
 
+    let variant_prefix = format!("{}-", prefix);
     let mut variants: Vec<PathBuf> = entries
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            if !name.starts_with(".claude-") {
+            if !name.starts_with(&variant_prefix) {
                 return None;
             }
             if name.contains(".bak") || name.contains(".tmp") || name.contains(".backup") {
@@ -343,6 +356,7 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 fn install_ide(ide: Ide, bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
     match ide {
         Ide::ClaudeCode => install_claude(bin, guard_bin),
+        Ide::Gemini => install_gemini(bin, guard_bin),
         Ide::Cursor => install_json_mcp_servers(ide, bin),
         Ide::Windsurf => install_json_mcp_servers(ide, bin),
         Ide::Zed => install_zed(bin),
@@ -355,6 +369,7 @@ fn install_ide(ide: Ide, bin: &str, guard_bin: Option<&str>) -> anyhow::Result<(
 fn uninstall_ide(ide: Ide) -> anyhow::Result<()> {
     match ide {
         Ide::ClaudeCode => uninstall_claude(),
+        Ide::Gemini => uninstall_gemini(),
         Ide::Cursor | Ide::Windsurf => uninstall_json_mcp_servers(ide),
         Ide::Zed => uninstall_zed(),
         Ide::Continue => uninstall_continue(),
@@ -624,9 +639,234 @@ fn install_claude_md_snippet(target: &Path) -> anyhow::Result<()> {
 }
 
 fn remove_claude_md_snippet(target: &Path) -> anyhow::Result<()> {
-    let begin = "<!-- qartez-mcp-instructions -->";
-    let end = "<!-- /qartez-mcp-instructions -->";
+    remove_snippet(target, "<!-- qartez-mcp-instructions -->", "<!-- /qartez-mcp-instructions -->")
+}
 
+// -- Gemini CLI --------------------------------------------------------------
+
+fn install_gemini(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
+    let dirs = discover_gemini_dirs();
+    if dirs.is_empty() {
+        let fallback = home_dir().join(".gemini");
+        return install_gemini_one(&fallback, bin, guard_bin);
+    }
+
+    info(&format!(
+        "Gemini CLI: deploying to {} directory/directories",
+        dirs.len()
+    ));
+    for dir in &dirs {
+        install_gemini_one(dir, bin, guard_bin)?;
+    }
+    Ok(())
+}
+
+fn install_gemini_one(
+    gemini_dir: &Path,
+    bin: &str,
+    guard_bin: Option<&str>,
+) -> anyhow::Result<()> {
+    let hooks_dir = gemini_dir.join("hooks");
+    let settings_path = gemini_dir.join("settings.json");
+
+    info(&format!("» {}", gemini_dir.display()));
+
+    // 1. Install hook scripts
+    fs::create_dir_all(&hooks_dir)?;
+    let guard_sh = hooks_dir.join("qartez-guard.sh");
+    fs::write(&guard_sh, GUARD_HOOK_SH)?;
+    make_executable(&guard_sh)?;
+    info(&format!("Hook installed: {}", guard_sh.display()));
+
+    let session_sh = hooks_dir.join("qartez-session-start.sh");
+    fs::write(&session_sh, SESSION_START_SH)?;
+    make_executable(&session_sh)?;
+    info(&format!("Hook installed: {}", session_sh.display()));
+
+    // 2. Configure settings.json
+    ensure_parent(&settings_path)?;
+    let mut settings = read_json(&settings_path)?;
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = serde_json::json!({});
+    }
+
+    let guard_cmd = format!("bash {}", guard_sh.display());
+    let session_cmd = format!("bash {}", session_sh.display());
+
+    // BeforeTool: glob|grep_search guard
+    ensure_hook_entry(
+        &mut settings,
+        "BeforeTool",
+        "glob|grep_search",
+        "qartez-guard",
+        &guard_cmd,
+        3000,
+    );
+
+    // BeforeTool: replace|write_file modification guard
+    if let Some(guard) = guard_bin {
+        ensure_hook_entry(
+            &mut settings,
+            "BeforeTool",
+            "replace|write_file",
+            "qartez-guard",
+            guard,
+            3000,
+        );
+    }
+
+    // SessionStart: auto-indexing
+    ensure_hook_entry_no_matcher(
+        &mut settings,
+        "SessionStart",
+        "qartez-session-start",
+        &session_cmd,
+        5000,
+    );
+
+    // MCP server entry
+    if settings.get("mcpServers").is_none() {
+        settings["mcpServers"] = serde_json::json!({});
+    }
+    settings["mcpServers"]["qartez"] = serde_json::json!({
+        "command": bin,
+        "args": []
+    });
+
+    backup_file(&settings_path)?;
+    write_json(&settings_path, &settings)?;
+    info(&format!("Settings updated: {}", settings_path.display()));
+
+    // 3. Install GEMINI.md snippet
+    install_gemini_md_snippet(&gemini_dir.join("GEMINI.md"))?;
+
+    Ok(())
+}
+
+fn uninstall_gemini() -> anyhow::Result<()> {
+    let dirs = discover_gemini_dirs();
+    if dirs.is_empty() {
+        return uninstall_gemini_one(&home_dir().join(".gemini"));
+    }
+
+    for dir in &dirs {
+        uninstall_gemini_one(dir)?;
+    }
+    info("Uninstall complete");
+    Ok(())
+}
+
+fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
+    let hooks_dir = gemini_dir.join("hooks");
+    let settings_path = gemini_dir.join("settings.json");
+
+    info(&format!("» {}", gemini_dir.display()));
+
+    for name in ["qartez-guard.sh", "qartez-session-start.sh"] {
+        let path = hooks_dir.join(name);
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            info(&format!("Hook removed: {}", path.display()));
+        }
+    }
+
+    if settings_path.is_file() {
+        backup_file(&settings_path)?;
+        let mut settings = read_json(&settings_path)?;
+
+        remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
+        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+
+        if let Some(hooks) = settings.get("hooks")
+            && hooks.as_object().is_some_and(|o| o.is_empty())
+        {
+            settings.as_object_mut().map(|o| o.remove("hooks"));
+        }
+
+        if let Some(servers) = settings.get_mut("mcpServers")
+            && let Some(obj) = servers.as_object_mut()
+        {
+            obj.remove("qartez");
+            if obj.is_empty() {
+                settings.as_object_mut().map(|o| o.remove("mcpServers"));
+            }
+        }
+
+        write_json(&settings_path, &settings)?;
+        info(&format!("Settings cleaned up: {}", settings_path.display()));
+    }
+
+    remove_gemini_md_snippet(&gemini_dir.join("GEMINI.md"))?;
+    Ok(())
+}
+
+fn install_gemini_md_snippet(target: &Path) -> anyhow::Result<()> {
+    install_snippet(target, GEMINI_MD_SNIPPET, "<!-- qartez-mcp-instructions -->", "<!-- /qartez-mcp-instructions -->")
+}
+
+fn remove_gemini_md_snippet(target: &Path) -> anyhow::Result<()> {
+    remove_snippet(target, "<!-- qartez-mcp-instructions -->", "<!-- /qartez-mcp-instructions -->")
+}
+
+// -- Shared snippet helpers --------------------------------------------------
+
+fn install_snippet(target: &Path, snippet: &str, begin: &str, end: &str) -> anyhow::Result<()> {
+    ensure_parent(target)?;
+
+    if !target.is_file() {
+        fs::write(target, snippet)?;
+        info(&format!("Created {} with qartez snippet", target.display()));
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(target)?;
+    if !content.contains(begin) {
+        let mut out = content;
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(snippet);
+        fs::write(target, out)?;
+        info(&format!("Appended qartez snippet to {}", target.display()));
+        return Ok(());
+    }
+
+    let mut result = String::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        if line == begin {
+            skipping = true;
+            result.push_str(snippet);
+            if !snippet.ends_with('\n') {
+                result.push('\n');
+            }
+            continue;
+        }
+        if line == end && skipping {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    if result.trim() == content.trim() {
+        info(&format!(
+            "Qartez snippet already up to date in {}",
+            target.display()
+        ));
+    } else {
+        fs::write(target, result)?;
+        info(&format!("Qartez snippet updated in {}", target.display()));
+    }
+    Ok(())
+}
+
+fn remove_snippet(target: &Path, begin: &str, end: &str) -> anyhow::Result<()> {
     if !target.is_file() {
         return Ok(());
     }
@@ -1483,6 +1723,19 @@ fn select_ides(cli: &Cli) -> anyhow::Result<Vec<Ide>> {
                 let detail = match ide {
                     Ide::ClaudeCode => {
                         let dirs = discover_claude_dirs();
+                        match dirs.len() {
+                            0 | 1 => ide.detection_dir().display().to_string(),
+                            n => format!(
+                                "{n} dirs: {}",
+                                dirs.iter()
+                                    .map(|d| d.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        }
+                    }
+                    Ide::Gemini => {
+                        let dirs = discover_gemini_dirs();
                         match dirs.len() {
                             0 | 1 => ide.detection_dir().display().to_string(),
                             n => format!(

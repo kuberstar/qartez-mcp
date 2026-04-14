@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2] — 2026-04-14
+
+### Added
+- **Gemini CLI support** — automated MCP configuration, `BeforeTool` / `SessionStart` hooks, and `GEMINI.md` instructions
+- **Interactive IDE setup wizard** — added Gemini CLI auto-detection alongside other MCP-compatible editors
+
 ## [0.1.1] — 2026-04-14
 
 ### Added
