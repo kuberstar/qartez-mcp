@@ -327,6 +327,7 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -348,6 +349,7 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -373,6 +375,7 @@ fn record_reference(
                     line,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -451,6 +454,7 @@ fn record_return_type(
                 line: ret.start_position().row as u32 + 1,
                 from_symbol_idx: enclosing,
                 kind: ReferenceKind::TypeRef,
+                receiver_type_hint: None,
             });
         }
     }

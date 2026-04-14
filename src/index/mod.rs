@@ -217,10 +217,11 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
 /// Ambiguous names that match many symbols and no import are dropped to
 /// keep the edge count manageable on large codebases.
 /// Candidate entry in the resolver's name index: symbol id, its file id,
-/// and its declared symbol kind. Kind is stored so the resolver can filter
-/// candidates by reference kind — a Call cannot target a variable or
-/// field; a TypeRef cannot target a method.
-type Candidate = (i64, i64, String);
+/// its declared symbol kind, and its parent symbol id (when the symbol is
+/// nested, e.g. a method inside a class). Kind lets the resolver filter
+/// candidates by reference kind. `parent_id` lets the receiver-type
+/// heuristic narrow a method call to the class it was declared in.
+type Candidate = (i64, i64, String, Option<i64>);
 
 /// Returns true if a symbol of `sym_kind` is a plausible target for a
 /// reference of `ref_kind`. Unknown kinds fall through conservatively
@@ -259,15 +260,26 @@ fn resolve_symbol_references(
     indexed: &[IndexedFile],
     imports_by_file: &HashMap<i64, HashSet<i64>>,
 ) -> Result<()> {
-    // (name -> [(symbol_id, file_id, kind)]) built once for the whole project.
+    // (name -> [(symbol_id, file_id, kind, parent_id)]) built once for the
+    // whole project. `type_by_name` is a parallel index restricted to
+    // type-like symbols; the receiver-type heuristic walks it to resolve a
+    // hint like `Foo` to the set of symbol ids declaring a class/struct/
+    // enum/interface/trait/type named `Foo`.
     let all_syms = read::get_all_symbols_with_path(conn)?;
     let mut name_index: HashMap<String, Vec<Candidate>> =
         HashMap::with_capacity(all_syms.len());
+    let mut type_by_name: HashMap<String, HashSet<i64>> = HashMap::new();
     for (sym, _path) in &all_syms {
         name_index
             .entry(sym.name.clone())
             .or_default()
-            .push((sym.id, sym.file_id, sym.kind.clone()));
+            .push((sym.id, sym.file_id, sym.kind.clone(), sym.parent_id));
+        if matches!(
+            sym.kind.as_str(),
+            "class" | "struct" | "enum" | "interface" | "trait" | "type"
+        ) {
+            type_by_name.entry(sym.name.clone()).or_default().insert(sym.id);
+        }
     }
 
     let mut batch: Vec<(i64, i64, &'static str)> = Vec::new();
@@ -276,6 +288,7 @@ fn resolve_symbol_references(
     let mut dropped_no_candidate = 0usize;
     let mut dropped_ambiguous = 0usize;
     let mut resolved_by_kind_filter = 0usize;
+    let mut resolved_by_receiver_type = 0usize;
 
     for entry in indexed {
         let empty_imports = HashSet::new();
@@ -312,7 +325,7 @@ fn resolve_symbol_references(
             // plausible target given the call-vs-type context.
             let filtered: Vec<&Candidate> = raw_candidates
                 .iter()
-                .filter(|(_, _, k)| kind_is_compatible(reference.kind, k))
+                .filter(|(_, _, k, _)| kind_is_compatible(reference.kind, k))
                 .collect();
             let narrowed_by_kind =
                 !filtered.is_empty() && filtered.len() < raw_candidates.len();
@@ -325,23 +338,51 @@ fn resolve_symbol_references(
                 filtered
             };
 
-            // Priority 1: target lives in the same file as the caller.
-            let mut picked: Vec<i64> = candidates
-                .iter()
-                .filter(|(sid, fid, _)| *fid == entry.file_id && *sid != from_id)
-                .map(|(sid, _, _)| *sid)
-                .collect();
+            // Priority 1 (receiver type): if the extractor attached a
+            // receiver-type hint (e.g. Dart's `Foo foo; foo.method()`),
+            // narrow to candidates whose `parent_id` points at a symbol
+            // named by the hint. This runs before the same-file/import
+            // cascade because a typed receiver is stronger evidence than
+            // any proximity heuristic: even if another class with the
+            // same method name lives in the same file, the hint tells us
+            // which one the programmer meant. Falls through when zero or
+            // multiple candidates match (v1 stays conservative).
+            let mut picked: Vec<i64> = Vec::new();
+            let mut via_receiver = false;
+            if let Some(type_name) = reference.receiver_type_hint.as_deref()
+                && let Some(type_ids) = type_by_name.get(type_name)
+            {
+                let hit: Vec<i64> = candidates
+                    .iter()
+                    .filter_map(|(sid, _, _, pid)| {
+                        pid.filter(|p| type_ids.contains(p)).map(|_| *sid)
+                    })
+                    .collect();
+                if hit.len() == 1 {
+                    picked = hit;
+                    via_receiver = true;
+                }
+            }
 
-            // Priority 2: target lives in a file this caller imports from.
+            // Priority 2: target lives in the same file as the caller.
             if picked.is_empty() {
                 picked = candidates
                     .iter()
-                    .filter(|(_, fid, _)| imported.contains(fid))
-                    .map(|(sid, _, _)| *sid)
+                    .filter(|(sid, fid, _, _)| *fid == entry.file_id && *sid != from_id)
+                    .map(|(sid, _, _, _)| *sid)
                     .collect();
             }
 
-            // Priority 3: unique global match. Ambiguous global names are
+            // Priority 3: target lives in a file this caller imports from.
+            if picked.is_empty() {
+                picked = candidates
+                    .iter()
+                    .filter(|(_, fid, _, _)| imported.contains(fid))
+                    .map(|(sid, _, _, _)| *sid)
+                    .collect();
+            }
+
+            // Priority 4: unique global match. Ambiguous global names are
             // dropped — with no import evidence and multiple candidates
             // there is no principled way to pick, and keeping them all
             // would bury the signal under noise on large projects.
@@ -354,6 +395,9 @@ fn resolve_symbol_references(
                 }
             }
 
+            if via_receiver {
+                resolved_by_receiver_type += 1;
+            }
             if narrowed_by_kind {
                 resolved_by_kind_filter += 1;
             }
@@ -368,9 +412,10 @@ fn resolve_symbol_references(
     write::insert_symbol_refs(conn, &batch)?;
 
     tracing::info!(
-        "symbol references: {} resolved ({} via kind filter), {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
+        "symbol references: {} resolved ({} via kind filter, {} via receiver type), {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
         resolved,
         resolved_by_kind_filter,
+        resolved_by_receiver_type,
         dropped_no_enclosing,
         dropped_no_candidate,
         dropped_ambiguous,

@@ -160,6 +160,12 @@ pub struct ExtractedReference {
     /// via the insert-order id map that `insert_symbols` already produces.
     pub from_symbol_idx: Option<usize>,
     pub kind: ReferenceKind,
+    /// Syntactic type annotation of a call's receiver, if the extractor
+    /// resolved it from a typed local, parameter, field, or getter return.
+    /// `Some("Foo")` means the call was `receiver.name(...)` where `receiver`
+    /// was declared as `Foo`. The resolver uses this to narrow candidates to
+    /// methods whose parent class matches.
+    pub receiver_type_hint: Option<String>,
 }
 
 #[derive(Debug, Default)]
