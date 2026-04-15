@@ -38,6 +38,7 @@ impl LanguageSupport for RubySupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -167,6 +168,8 @@ fn record_reference(
             line: node.start_position().row as u32 + 1,
             from_symbol_idx: enclosing,
             kind: ReferenceKind::Call,
+            qualifier: None,
+            receiver_type_hint: None,
         });
     }
 }
@@ -244,6 +247,7 @@ fn extract_method(node: Node, source: &[u8], depth: usize) -> Option<ExtractedSy
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -272,6 +276,7 @@ fn extract_singleton_method(node: Node, source: &[u8], depth: usize) -> Option<E
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -296,6 +301,7 @@ fn extract_class_or_module(
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -318,6 +324,7 @@ fn extract_constant_assignment(node: Node, source: &[u8], depth: usize) -> Optio
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

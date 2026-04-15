@@ -11,7 +11,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-deploy: ## Full deploy: install deps, build, test, install, configure IDEs
+deploy: ## Full deploy: install deps, build, install, configure IDEs
 	@./install.sh
 
 test: ## Run all tests

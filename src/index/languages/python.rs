@@ -2,7 +2,8 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
-    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+    ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
+    ReferenceKind, RelationKind, SymbolKind,
 };
 
 pub struct PythonSupport;
@@ -34,16 +35,63 @@ impl LanguageSupport for PythonSupport {
             &mut imports,
             &mut references,
         );
+        let type_relations = extract_type_relations(root, source);
         ParseResult {
             symbols,
             imports,
             references,
+            type_relations,
         }
     }
 }
 
 fn children(node: Node) -> impl Iterator<Item = Node> {
     (0..node.child_count() as u32).filter_map(move |i| node.child(i))
+}
+
+fn extract_type_relations(node: Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    let mut relations = Vec::new();
+    collect_type_relations(node, source, &mut relations);
+    relations
+}
+
+fn collect_type_relations(node: Node, source: &[u8], out: &mut Vec<ExtractedRelation>) {
+    if node.kind() == "class_definition" {
+        let class_name = node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source))
+            .unwrap_or_default();
+        if !class_name.is_empty()
+            && let Some(bases) = node.child_by_field_name("superclasses")
+        {
+            let line = node.start_position().row as u32 + 1;
+            for child in children(bases) {
+                let name = match child.kind() {
+                    "identifier" => node_text(child, source),
+                    "attribute" => child
+                        .child_by_field_name("attribute")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or_default(),
+                    "call" => child
+                        .child_by_field_name("function")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !name.is_empty() && name != "object" {
+                    out.push(ExtractedRelation {
+                        sub_name: class_name.clone(),
+                        super_name: name,
+                        kind: RelationKind::Extends,
+                        line,
+                    });
+                }
+            }
+        }
+    }
+    for child in children(node) {
+        collect_type_relations(child, source, out);
+    }
 }
 
 fn is_exported(name: &str) -> bool {
@@ -147,6 +195,8 @@ fn record_reference(
                 line: node.start_position().row as u32 + 1,
                 from_symbol_idx: enclosing,
                 kind: ReferenceKind::Call,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }
@@ -260,6 +310,7 @@ fn extract_function(node: Node, source: &[u8], inside_class: bool) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -279,6 +330,7 @@ fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

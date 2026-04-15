@@ -1,0 +1,40 @@
+<!-- qartez-mcp-instructions -->
+## Qartez MCP -- Tool Priority
+
+When the `qartez` MCP server is available, you MUST use its tools INSTEAD OF built-in file tools for all code exploration tasks. Do NOT use Glob, Grep, Read, find, cat, or rg for source code files when qartez is available. The qartez index is pre-computed and uses 10-50x fewer tokens.
+
+**Tool mapping:**
+
+| Instead of | Use | When |
+|---|---|---|
+| Glob / find | `qartez_map` | Project structure, finding files |
+| Grep / rg | `qartez_grep` | Searching for symbols, types, functions |
+| Grep / rg | `qartez_find` | Looking up a specific symbol definition |
+| Read / cat | `qartez_read` | Reading symbol source code with context |
+| -- | `qartez_impact` | BEFORE modifying any heavily-imported file |
+| -- | `qartez_cochange` | Understanding which files change together |
+| -- | `qartez_unused` | Finding dead/unused code |
+| -- | `qartez_refs` | Finding all references to a symbol |
+| -- | `qartez_project` | Getting full project statistics |
+| -- | `qartez_move` | Moving a symbol between files |
+| -- | `qartez_rename` | Renaming a symbol across the codebase |
+| -- | `qartez_rename_file` | Renaming a file and updating all imports |
+| -- | `qartez_outline` | Getting symbol outline of a file (names, kinds, lines) |
+| -- | `qartez_deps` | Viewing file dependency edges (imports/exports) |
+| -- | `qartez_stats` | Language/LOC/symbol-count breakdown (project or per-file) |
+| -- | `qartez_calls` | Call hierarchy: who calls a function and what it calls |
+| -- | `qartez_context` | Finding related files for a set of files you plan to modify |
+| -- | `qartez_hotspots` | Finding high-risk code: complexity x coupling x churn |
+| -- | `qartez_clones` | Detecting duplicate code (same AST shape) for refactoring |
+| -- | `qartez_wiki` | Generating architecture wiki via community detection |
+| -- | `qartez_boundaries` | Checking architecture boundary rules (.qartez/boundaries.toml) |
+
+**Workflow:**
+1. `qartez_map` -- understand project structure first
+2. `qartez_find` / `qartez_grep` -- locate symbols
+3. `qartez_read` -- read code with semantic context
+4. `qartez_impact` -- check before modifying exports
+5. `qartez_context` -- before multi-file changes, surface files you might miss
+
+**Use built-in file tools ONLY for non-code content** (config files, text search, file patterns qartez cannot handle).
+<!-- /qartez-mcp-instructions -->

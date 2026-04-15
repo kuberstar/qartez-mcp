@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
-use crate::storage::models::{CoChangeRow, EdgeRow, FileRow, SymbolRow};
+use crate::storage::models::{self, CoChangeRow, EdgeRow, FileRow, SymbolRow};
 
 /// Sanitize user input for FTS5 MATCH queries. Plain alphanumeric tokens
 /// (with `_` and `*`) pass through; anything else is wrapped in a
@@ -56,8 +56,34 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<SymbolRow> {
         parent_id: row.get::<_, Option<i64>>("parent_id")?,
         pagerank: row.get::<_, f64>("pagerank").unwrap_or(0.0),
         complexity: row.get::<_, Option<u32>>("complexity").unwrap_or(None),
+        owner_type: row.get::<_, Option<String>>("owner_type").unwrap_or(None),
     })
 }
+
+/// Deserialize a `FileRow` from a JOINed query where file columns are aliased
+/// with the `f_` prefix to avoid collisions with symbol columns (e.g. `id`,
+/// `pagerank`). Pair with SQL: `f.id AS f_id, f.path AS f_path, ...`.
+fn row_to_file_joined(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
+    Ok(FileRow {
+        id: row.get("f_id")?,
+        path: row.get("f_path")?,
+        mtime_ns: row.get("f_mtime_ns")?,
+        size_bytes: row.get("f_size_bytes")?,
+        language: row.get("f_language")?,
+        line_count: row.get("f_line_count")?,
+        pagerank: row.get("f_pagerank")?,
+        indexed_at: row.get("f_indexed_at")?,
+        change_count: row.get::<_, i64>("f_change_count").unwrap_or(0),
+    })
+}
+
+const SYMBOL_FILE_JOIN_COLS: &str = "s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
+     s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
+     s.complexity, s.owner_type,
+     f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
+     f.size_bytes AS f_size_bytes, f.language AS f_language,
+     f.line_count AS f_line_count, f.pagerank AS f_pagerank,
+     f.indexed_at AS f_indexed_at, f.change_count AS f_change_count";
 
 pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<Option<FileRow>> {
     let result = conn
@@ -111,32 +137,15 @@ pub fn get_all_files_ranked(conn: &Connection) -> Result<Vec<FileRow>> {
 }
 
 pub fn get_all_symbols_with_path(conn: &Connection) -> Result<Vec<(SymbolRow, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank, f.path, s.complexity
+    let sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM symbols s
          JOIN files f ON s.file_id = f.id
-         ORDER BY f.path, s.line_start",
-    )?;
+         ORDER BY f.path, s.line_start"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(12)?,
-            },
-            row.get::<_, String>(11)?,
-        ))
+        Ok((row_to_symbol(row)?, row.get::<_, String>("f_path")?))
     })?;
     let mut results = Vec::new();
     for row in rows {
@@ -159,7 +168,7 @@ pub fn get_file_by_id(conn: &Connection, id: i64) -> Result<Option<FileRow>> {
 
 pub fn get_symbols_for_file(conn: &Connection, file_id: i64) -> Result<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, pagerank, complexity
+        "SELECT id, file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, pagerank, complexity, owner_type
          FROM symbols WHERE file_id = ?1 ORDER BY line_start",
     )?;
     let rows = stmt.query_map([file_id], row_to_symbol)?;
@@ -174,44 +183,15 @@ pub fn find_symbol_by_name(conn: &Connection, name: &str) -> Result<Vec<(SymbolR
     // Use the prepared-statement cache: this function is called in tight
     // loops by `qartez_calls` depth-2 resolution (~30 queries per invocation),
     // where re-compiling the SQL each time dominates the walk cost.
-    let mut stmt = conn.prepare_cached(
-        "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
-                f.id AS fid, f.path, f.mtime_ns, f.size_bytes, f.language,
-                f.line_count, f.pagerank, f.indexed_at, s.complexity, f.change_count
+    let sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM symbols s
          JOIN files f ON s.file_id = f.id
-         WHERE s.name = ?1",
-    )?;
+         WHERE s.name = ?1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([name], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(19)?,
-            },
-            FileRow {
-                id: row.get(11)?,
-                path: row.get(12)?,
-                mtime_ns: row.get(13)?,
-                size_bytes: row.get(14)?,
-                language: row.get(15)?,
-                line_count: row.get(16)?,
-                pagerank: row.get(17)?,
-                indexed_at: row.get(18)?,
-                change_count: row.get(20)?,
-            },
-        ))
+        Ok((row_to_symbol(row)?, row_to_file_joined(row)?))
     })?;
     let mut results = Vec::new();
     for row in rows {
@@ -227,7 +207,8 @@ pub fn search_symbols_fts(
 ) -> Result<Vec<(SymbolRow, String)>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank, fts.file_path, s.complexity
+                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
+                s.complexity, s.owner_type, fts.file_path
          FROM symbols_fts fts
          JOIN symbols s ON s.id = fts.rowid
          WHERE symbols_fts MATCH ?1
@@ -235,24 +216,7 @@ pub fn search_symbols_fts(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![query, limit], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(12)?,
-            },
-            row.get::<_, String>(11)?,
-        ))
+        Ok((row_to_symbol(row)?, row.get::<_, String>("file_path")?))
     })?;
     let mut results = Vec::new();
     for row in rows {
@@ -333,7 +297,7 @@ pub fn get_all_symbol_refs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
 /// `get_symbols_for_file` across every file with a single query instead of N.
 pub fn get_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, pagerank, complexity
+        "SELECT id, file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, pagerank, complexity, owner_type
          FROM symbols",
     )?;
     let rows = stmt.query_map([], row_to_symbol)?;
@@ -348,45 +312,16 @@ pub fn get_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>> {
 /// display in `qartez_map by=symbols` and benchmark targets. Returns at most
 /// `limit` rows ordered by descending rank.
 pub fn get_symbols_ranked(conn: &Connection, limit: i64) -> Result<Vec<(SymbolRow, FileRow)>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
-                f.id AS fid, f.path, f.mtime_ns, f.size_bytes, f.language,
-                f.line_count, f.pagerank, f.indexed_at, s.complexity, f.change_count
+    let sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM symbols s
          JOIN files f ON s.file_id = f.id
          ORDER BY s.pagerank DESC
-         LIMIT ?1",
-    )?;
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(19)?,
-            },
-            FileRow {
-                id: row.get(11)?,
-                path: row.get(12)?,
-                mtime_ns: row.get(13)?,
-                size_bytes: row.get(14)?,
-                language: row.get(15)?,
-                line_count: row.get(16)?,
-                pagerank: row.get(17)?,
-                indexed_at: row.get(18)?,
-                change_count: row.get(20)?,
-            },
-        ))
+        Ok((row_to_symbol(row)?, row_to_file_joined(row)?))
     })?;
     let mut results = Vec::new();
     for row in rows {
@@ -406,7 +341,7 @@ pub fn get_symbols_ranked_for_file(
 ) -> Result<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, file_id, name, kind, line_start, line_end,
-                signature, is_exported, shape_hash, parent_id, pagerank, complexity
+                signature, is_exported, shape_hash, parent_id, pagerank, complexity, owner_type
          FROM symbols
          WHERE file_id = ?1
          ORDER BY pagerank DESC
@@ -496,47 +431,17 @@ pub fn get_unused_exports_page(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<(SymbolRow, FileRow)>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
-                f.id AS fid, f.path, f.mtime_ns, f.size_bytes, f.language,
-                f.line_count, f.pagerank, f.indexed_at, s.complexity, f.change_count
+    let sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM unused_exports ue
          JOIN symbols s ON s.id = ue.symbol_id
          JOIN files f ON f.id = ue.file_id
          ORDER BY f.path, s.line_start
-         LIMIT ?1 OFFSET ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![limit, offset], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(19)?,
-            },
-            FileRow {
-                id: row.get(11)?,
-                path: row.get(12)?,
-                mtime_ns: row.get(13)?,
-                size_bytes: row.get(14)?,
-                language: row.get(15)?,
-                line_count: row.get(16)?,
-                pagerank: row.get(17)?,
-                indexed_at: row.get(18)?,
-                change_count: row.get(20)?,
-            },
-        ))
-    })?;
+         LIMIT ?1 OFFSET ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row_mapper = |row: &rusqlite::Row| Ok((row_to_symbol(row)?, row_to_file_joined(row)?));
+    let rows = stmt.query_map(rusqlite::params![limit, offset], row_mapper)?;
     let mut results: Vec<(SymbolRow, FileRow)> = Vec::new();
     for row in rows {
         results.push(row?);
@@ -547,11 +452,8 @@ pub fn get_unused_exports_page(
     // follow-up `populate_unused_exports`). Compute on the fly using the
     // `unused_excluded` column so callers still get correct results.
     if results.is_empty() && offset == 0 {
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                    s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
-                    f.id AS fid, f.path, f.mtime_ns, f.size_bytes, f.language,
-                    f.line_count, f.pagerank, f.indexed_at, s.complexity, f.change_count
+        let sql = format!(
+            "SELECT {SYMBOL_FILE_JOIN_COLS}
              FROM symbols s
              JOIN files f ON s.file_id = f.id
              WHERE s.is_exported = 1
@@ -559,38 +461,10 @@ pub fn get_unused_exports_page(
                AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_file = s.file_id)
                AND NOT EXISTS (SELECT 1 FROM symbol_refs sr WHERE sr.to_symbol_id = s.id)
              ORDER BY f.path, s.line_start
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![limit], |row| {
-            let is_exported_int: i32 = row.get(7)?;
-            Ok((
-                SymbolRow {
-                    id: row.get(0)?,
-                    file_id: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    line_start: row.get(4)?,
-                    line_end: row.get(5)?,
-                    signature: row.get(6)?,
-                    is_exported: is_exported_int != 0,
-                    shape_hash: row.get(8)?,
-                    parent_id: row.get(9)?,
-                    pagerank: row.get(10)?,
-                    complexity: row.get(19)?,
-                },
-                FileRow {
-                    id: row.get(11)?,
-                    path: row.get(12)?,
-                    mtime_ns: row.get(13)?,
-                    size_bytes: row.get(14)?,
-                    language: row.get(15)?,
-                    line_count: row.get(16)?,
-                    pagerank: row.get(17)?,
-                    indexed_at: row.get(18)?,
-                    change_count: row.get(20)?,
-                },
-            ))
-        })?;
+             LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![limit], row_mapper)?;
         for row in rows {
             results.push(row?);
         }
@@ -653,32 +527,20 @@ pub fn get_clone_groups(
         .filter_map(|r| r.ok())
         .collect();
 
-    let mut members_stmt = conn.prepare(
-        "SELECT s.*, f.id AS fid, f.path, f.mtime_ns, f.size_bytes,
-                f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count
+    let members_sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.shape_hash = ?1
-         ORDER BY f.path, s.line_start",
-    )?;
+         ORDER BY f.path, s.line_start"
+    );
+    let mut members_stmt = conn.prepare(&members_sql)?;
 
     let mut groups = Vec::with_capacity(hashes.len());
     for (hash, _cnt) in &hashes {
         let syms: Vec<(SymbolRow, FileRow)> = members_stmt
             .query_map([hash], |row| {
-                let sym = row_to_symbol(row)?;
-                let file = FileRow {
-                    id: row.get("fid")?,
-                    path: row.get("path")?,
-                    mtime_ns: row.get("mtime_ns")?,
-                    size_bytes: row.get("size_bytes")?,
-                    language: row.get("language")?,
-                    line_count: row.get("line_count")?,
-                    pagerank: row.get("pagerank")?,
-                    indexed_at: row.get("indexed_at")?,
-                    change_count: row.get::<_, i64>("change_count").unwrap_or(0),
-                };
-                Ok((sym, file))
+                Ok((row_to_symbol(row)?, row_to_file_joined(row)?))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -930,7 +792,8 @@ pub fn search_symbol_bodies_fts(
 ) -> Result<Vec<(SymbolRow, String)>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
-                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank, f.path, s.complexity
+                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
+                s.complexity, s.owner_type, f.path AS f_path
          FROM symbols_body_fts bfts
          JOIN symbols s ON s.id = bfts.rowid
          JOIN files f ON f.id = s.file_id
@@ -939,30 +802,83 @@ pub fn search_symbol_bodies_fts(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![query, limit], |row| {
-        let is_exported_int: i32 = row.get(7)?;
-        Ok((
-            SymbolRow {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                signature: row.get(6)?,
-                is_exported: is_exported_int != 0,
-                shape_hash: row.get(8)?,
-                parent_id: row.get(9)?,
-                pagerank: row.get(10)?,
-                complexity: row.get(12)?,
-            },
-            row.get::<_, String>(11)?,
-        ))
+        Ok((row_to_symbol(row)?, row.get::<_, String>("f_path")?))
     })?;
     let mut results = Vec::new();
     for row in rows {
         results.push(row?);
     }
     Ok(results)
+}
+
+/// Return all types that implement or extend the given supertype name.
+pub fn get_subtypes(
+    conn: &Connection,
+    super_name: &str,
+) -> Result<Vec<(models::TypeHierarchyRow, FileRow)>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.id, h.file_id, h.sub_name, h.super_name, h.kind, h.line,
+                f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
+                f.size_bytes AS f_size_bytes, f.language AS f_language,
+                f.line_count AS f_line_count, f.pagerank AS f_pagerank,
+                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count
+         FROM type_hierarchy h
+         JOIN files f ON f.id = h.file_id
+         WHERE h.super_name = ?1
+         ORDER BY h.sub_name",
+    )?;
+    let rows = stmt.query_map([super_name], |row| {
+        let h = models::TypeHierarchyRow {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            sub_name: row.get(2)?,
+            super_name: row.get(3)?,
+            kind: row.get(4)?,
+            line: row.get(5)?,
+        };
+        let f = row_to_file_joined(row)?;
+        Ok((h, f))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Return all supertypes (traits/interfaces/base classes) of a given type name.
+pub fn get_supertypes(
+    conn: &Connection,
+    sub_name: &str,
+) -> Result<Vec<(models::TypeHierarchyRow, FileRow)>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.id, h.file_id, h.sub_name, h.super_name, h.kind, h.line,
+                f.id AS f_id, f.path AS f_path, f.mtime_ns AS f_mtime_ns,
+                f.size_bytes AS f_size_bytes, f.language AS f_language,
+                f.line_count AS f_line_count, f.pagerank AS f_pagerank,
+                f.indexed_at AS f_indexed_at, f.change_count AS f_change_count
+         FROM type_hierarchy h
+         JOIN files f ON f.id = h.file_id
+         WHERE h.sub_name = ?1
+         ORDER BY h.super_name",
+    )?;
+    let rows = stmt.query_map([sub_name], |row| {
+        let h = models::TypeHierarchyRow {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            sub_name: row.get(2)?,
+            super_name: row.get(3)?,
+            kind: row.get(4)?,
+            line: row.get(5)?,
+        };
+        let f = row_to_file_joined(row)?;
+        Ok((h, f))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1050,6 +966,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
                 SymbolInsert {
                     name: "bar".to_string(),
@@ -1062,6 +979,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
             ],
         )
@@ -1091,6 +1009,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -1119,6 +1038,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -1193,6 +1113,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -1210,6 +1131,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -1254,6 +1176,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -1287,6 +1210,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
                 SymbolInsert {
                     name: "b".to_string(),
@@ -1299,6 +1223,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
             ],
         )

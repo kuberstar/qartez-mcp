@@ -29,6 +29,7 @@ impl LanguageSupport for LuaSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -140,6 +141,7 @@ fn extract_function_declaration(node: Node, source: &[u8]) -> Option<ExtractedSy
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -170,6 +172,7 @@ fn extract_variable_declaration(
                             parent_idx: None,
                             unused_excluded: false,
                             complexity: None,
+                            owner_type: None,
                         });
                     }
                 }
@@ -238,6 +241,7 @@ fn extract_local_assignment(
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         });
     }
 }
@@ -292,6 +296,7 @@ fn extract_top_level_assignment(
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         });
     }
 }

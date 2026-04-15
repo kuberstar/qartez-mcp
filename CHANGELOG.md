@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.3.0] — 2026-04-15
+
+### Added
+
+- **Dart/Flutter language support** — full resolver with barrel export resolution, receiver-type heuristics, and reference tracking
+- **Gemini CLI support** — automated setup with hooks for `gemini` alongside Claude Code
+- **`qartez_hierarchy` tool** — query type relationships (subtypes, supertypes) with transitive traversal
+- **`qartez_diff_impact` tool** — batch pre-merge blast radius analysis across multiple changed files
+- **`.qartezignore` support** — exclude paths from indexing beyond `.gitignore` rules
+- **OpenCode plugin** — edit guard and MCP instructions for OpenCode IDE
+- **MCP static resources** — `qartez://hotspots` and `qartez://stats` for precomputed data access
+- **IDE rules** — MCP instructions for Cursor, Codex, and OpenCode alongside Claude Code
+- **Background indexing on startup** — MCP tools load immediately while indexing runs in a background thread
+
+### Changed
+
+- **Server modularized** — split monolithic `mod.rs` into cohesive submodules for maintainability
+- **Storage layer deduplicated** — unified `SymbolRow`/`FileRow` deserialization in JOINed queries
+- **PageRank warm-start** — incremental re-index reuses prior iteration values for faster convergence
+- **DB mutex released earlier** — dropped before FS reads and tree-sitter parsing to reduce lock contention
+- **Resolver upgraded** — kind-filter and receiver-type heuristics for more accurate symbol resolution
+- **Type-aware resolution** — symbol lookup now considers type context for disambiguation
+- **README restructured** — corrected tool count (23), language count (34), and updated navigation
+
+### Fixed
+
+- **Path traversal protection** — `safe_resolve` rejects `../` escape attempts in user-supplied file paths
+- **Comma-separated `Vec<String>` params** — MCP tools now correctly parse `"a,b,c"` as a list
+- **SQL column aliases** — corrected hierarchy query column names and added integration tests
+- **CLAUDE.md snippet location** — writes only to `~/.claude`, skips variant directories
+- **Cochange phantom files** — filtered out files no longer in the repo from co-change results
+- **Cargo metadata** — removed redundant `license` field, kept `license-file` only
+
+### Contributors
+
+- **josh** ([@josh](https://github.com/josh)) — Dart/Flutter support, resolver improvements, background indexing
+- **Rudolf Troger** ([@DolphRoger](https://github.com/DolphRoger)) — Gemini CLI support
+
 ## [0.2.0] — 2026-04-15
 
 ### Added

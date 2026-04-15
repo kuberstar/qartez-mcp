@@ -113,6 +113,11 @@ pub struct ExtractedSymbol {
     /// Starts at 1 (one linear path) and increments for each branching
     /// point (if, match arm, loop, &&, ||, catch).
     pub complexity: Option<u32>,
+    /// The type this symbol belongs to, extracted from `impl Foo { fn bar() }`
+    /// blocks. `Some("Foo")` for methods defined inside `impl Foo`, `None`
+    /// for free functions and top-level items. Used by the reference resolver
+    /// to disambiguate methods with common names like `new`, `default`, `from`.
+    pub owner_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +165,56 @@ pub struct ExtractedReference {
     /// via the insert-order id map that `insert_symbols` already produces.
     pub from_symbol_idx: Option<usize>,
     pub kind: ReferenceKind,
+    /// Type qualifier for scoped calls and method calls. `Some("Foo")` when
+    /// the reference is `Foo::new()` (extracted from `scoped_identifier`) or
+    /// `x.method()` where `x: Foo` is known from a local binding. Used by the
+    /// resolver to prefer candidates whose `owner_type` matches.
+    pub qualifier: Option<String>,
+    /// Syntactic type annotation of a call's receiver, if the extractor
+    /// resolved it from a typed local, parameter, field, or getter return.
+    /// `Some("Foo")` means the call was `receiver.name(...)` where `receiver`
+    /// was declared as `Foo`. The resolver uses this to narrow candidates to
+    /// methods whose parent class matches.
+    pub receiver_type_hint: Option<String>,
+}
+
+/// A type hierarchy relationship extracted from source code.
+///
+/// Captures `impl Trait for Type` (Rust), `class Foo extends Bar` (TS/Java),
+/// `class Foo(Base)` (Python), and interface embedding (Go).
+#[derive(Debug, Clone)]
+pub struct ExtractedRelation {
+    /// The concrete type (subtype / implementor).
+    pub sub_name: String,
+    /// The trait, interface, or superclass (supertype).
+    pub super_name: String,
+    /// Relationship kind: "implements", "extends".
+    pub kind: RelationKind,
+    /// 1-based line where the relationship is declared.
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    /// Trait implementation (`impl Trait for Type`, Java `implements`, TS `implements`).
+    Implements,
+    /// Class or interface extension (`extends`, Python base class, Go embedding).
+    Extends,
+}
+
+impl RelationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Implements => "implements",
+            Self::Extends => "extends",
+        }
+    }
+}
+
+impl fmt::Display for RelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +222,7 @@ pub struct ParseResult {
     pub symbols: Vec<ExtractedSymbol>,
     pub imports: Vec<ExtractedImport>,
     pub references: Vec<ExtractedReference>,
+    pub type_relations: Vec<ExtractedRelation>,
 }
 
 /// Compute a structural fingerprint for a symbol's source code.

@@ -2,7 +2,8 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
-    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+    ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
+    ReferenceKind, RelationKind, SymbolKind,
 };
 
 pub struct JavaSupport;
@@ -33,16 +34,110 @@ impl LanguageSupport for JavaSupport {
             &mut imports,
             &mut references,
         );
+        let type_relations = extract_type_relations(root, source);
         ParseResult {
             symbols,
             imports,
             references,
+            type_relations,
         }
     }
 }
 
 fn children(node: Node) -> impl Iterator<Item = Node> {
     (0..node.child_count() as u32).filter_map(move |i| node.child(i))
+}
+
+fn extract_type_relations(node: Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    let mut relations = Vec::new();
+    collect_type_relations(node, source, &mut relations);
+    relations
+}
+
+fn collect_type_relations(node: Node, source: &[u8], out: &mut Vec<ExtractedRelation>) {
+    match node.kind() {
+        "class_declaration" | "interface_declaration" => {
+            let type_name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or_default();
+            if !type_name.is_empty() {
+                let line = node.start_position().row as u32 + 1;
+                if let Some(super_node) = node.child_by_field_name("superclass") {
+                    let name = extract_java_type_name(super_node, source);
+                    if !name.is_empty() {
+                        out.push(ExtractedRelation {
+                            sub_name: type_name.clone(),
+                            super_name: name,
+                            kind: RelationKind::Extends,
+                            line,
+                        });
+                    }
+                }
+                if let Some(ifaces) = node.child_by_field_name("interfaces") {
+                    collect_java_type_list(
+                        &type_name,
+                        ifaces,
+                        source,
+                        RelationKind::Implements,
+                        line,
+                        out,
+                    );
+                }
+                // interface extends
+                for child in children(node) {
+                    if child.kind() == "extends_interfaces" || child.kind() == "type_list" {
+                        let kind = if node.kind() == "interface_declaration" {
+                            RelationKind::Extends
+                        } else {
+                            RelationKind::Implements
+                        };
+                        collect_java_type_list(&type_name, child, source, kind, line, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in children(node) {
+        collect_type_relations(child, source, out);
+    }
+}
+
+fn collect_java_type_list(
+    type_name: &str,
+    list_node: Node,
+    source: &[u8],
+    kind: RelationKind,
+    line: u32,
+    out: &mut Vec<ExtractedRelation>,
+) {
+    for child in children(list_node) {
+        let name = extract_java_type_name(child, source);
+        if !name.is_empty() {
+            out.push(ExtractedRelation {
+                sub_name: type_name.to_string(),
+                super_name: name,
+                kind,
+                line,
+            });
+        }
+    }
+}
+
+fn extract_java_type_name(node: Node, source: &[u8]) -> String {
+    match node.kind() {
+        "type_identifier" | "identifier" => node_text(node, source),
+        "generic_type" => node
+            .child(0)
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        "scoped_type_identifier" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn has_modifier(node: Node, source: &[u8], modifier: &str) -> bool {
@@ -131,6 +226,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -151,6 +248,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -172,6 +271,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -275,6 +376,7 @@ fn extract_named_decl(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -368,6 +470,7 @@ fn extract_method(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -390,6 +493,7 @@ fn extract_constructor(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -416,6 +520,7 @@ fn extract_field(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }

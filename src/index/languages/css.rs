@@ -27,6 +27,7 @@ impl LanguageSupport for CssSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -114,6 +115,7 @@ fn extract_selectors(
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -130,6 +132,7 @@ fn extract_selectors(
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -173,6 +176,7 @@ fn extract_keyframes(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -200,6 +204,7 @@ fn extract_media(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -219,6 +224,7 @@ fn extract_custom_property(node: Node, source: &[u8]) -> Option<ExtractedSymbol>
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

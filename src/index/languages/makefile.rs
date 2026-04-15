@@ -55,6 +55,7 @@ impl LanguageSupport for MakefileSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -108,6 +109,7 @@ fn extract_rule(
                     parent_idx: None,
                     unused_excluded: is_phony,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -133,6 +135,7 @@ fn extract_variable(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         });
     }
 }

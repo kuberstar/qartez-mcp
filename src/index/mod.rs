@@ -14,7 +14,7 @@ use crate::storage::read;
 use crate::storage::write;
 
 use parser::ParserPool;
-use symbols::{ExtractedImport, ExtractedReference, compute_shape_hash};
+use symbols::{ExtractedImport, ExtractedReference, ReferenceKind, compute_shape_hash};
 
 struct IndexedFile {
     file_id: i64,
@@ -33,6 +33,7 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     let files = walker::walk_source_files(root);
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
+    let dart_packages = read_dart_packages(root);
 
     tracing::info!("found {} source files on disk", files.len());
 
@@ -112,10 +113,28 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
                 unused_excluded: s.unused_excluded,
                 parent_idx: s.parent_idx,
                 complexity: s.complexity,
+                owner_type: s.owner_type.clone(),
             })
             .collect();
 
         let symbol_ids = write::insert_symbols(&tx, file_id, &symbol_inserts)?;
+
+        if !parse_result.type_relations.is_empty() {
+            let tuples: Vec<_> = parse_result
+                .type_relations
+                .iter()
+                .map(|r| {
+                    (
+                        r.sub_name.clone(),
+                        r.super_name.clone(),
+                        r.kind.as_str().to_string(),
+                        r.line,
+                    )
+                })
+                .collect();
+            write::insert_type_relations(&tx, file_id, &tuples)?;
+        }
+
         known_paths.insert(rel_path.clone());
         updated += 1;
 
@@ -168,6 +187,7 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
                 root,
                 &known_paths,
                 go_module.as_deref(),
+                Some(&dart_packages),
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -214,26 +234,83 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
 /// using file-level import edges — which target is the most plausible.
 /// Ambiguous names that match many symbols and no import are dropped to
 /// keep the edge count manageable on large codebases.
+/// Candidate entry in the resolver's name index: symbol id, its file id,
+/// its declared symbol kind, and its parent symbol id (when the symbol is
+/// nested, e.g. a method inside a class). Kind lets the resolver filter
+/// candidates by reference kind. `parent_id` lets the receiver-type
+/// heuristic narrow a method call to the class it was declared in.
+type Candidate = (i64, i64, String, Option<i64>);
+
+/// Returns true if a symbol of `sym_kind` is a plausible target for a
+/// reference of `ref_kind`. Unknown kinds fall through conservatively
+/// (we would rather keep a questionable edge than drop a valid one when
+/// a language extractor emits a kind we have not mapped here yet).
+fn kind_is_compatible(ref_kind: ReferenceKind, sym_kind: &str) -> bool {
+    match ref_kind {
+        // Plain functions + methods are the obvious case. Classes/structs/
+        // enums/interfaces are included because languages like Dart, Java,
+        // and Kotlin write constructor calls as `Foo(x)` — syntactically a
+        // Call whose target is the type symbol. `type` covers typedefs
+        // used as constructor aliases.
+        ReferenceKind::Call => matches!(
+            sym_kind,
+            "function" | "method" | "class" | "struct" | "enum" | "interface" | "trait" | "type"
+        ),
+        // Type positions resolve only to type-like symbols.
+        ReferenceKind::TypeRef => matches!(
+            sym_kind,
+            "class" | "struct" | "enum" | "interface" | "trait" | "type"
+        ),
+        // Bare identifier use is too underspecified to filter safely.
+        ReferenceKind::Use => true,
+    }
+}
+
 fn resolve_symbol_references(
     conn: &Connection,
     indexed: &[IndexedFile],
     imports_by_file: &HashMap<i64, HashSet<i64>>,
 ) -> Result<()> {
-    // (name -> [(symbol_id, file_id)]) built once for the whole project.
+    // (name -> [(symbol_id, file_id, kind, parent_id)]) built once for the
+    // whole project. `type_by_name` is a parallel index restricted to
+    // type-like symbols; the receiver-type heuristic walks it to resolve a
+    // hint like `Foo` to the set of symbol ids declaring a class/struct/
+    // enum/interface/trait/type named `Foo`.
     let all_syms = read::get_all_symbols_with_path(conn)?;
-    let mut name_index: HashMap<String, Vec<(i64, i64)>> = HashMap::with_capacity(all_syms.len());
+    let mut name_index: HashMap<String, Vec<Candidate>> = HashMap::with_capacity(all_syms.len());
+    let mut type_by_name: HashMap<String, HashSet<i64>> = HashMap::new();
+    // Secondary index: symbol_id -> owner_type, for same-impl-block lookups.
+    let mut owner_by_id: HashMap<i64, String> = HashMap::new();
     for (sym, _path) in &all_syms {
-        name_index
-            .entry(sym.name.clone())
-            .or_default()
-            .push((sym.id, sym.file_id));
+        name_index.entry(sym.name.clone()).or_default().push((
+            sym.id,
+            sym.file_id,
+            sym.kind.clone(),
+            sym.parent_id,
+        ));
+        if matches!(
+            sym.kind.as_str(),
+            "class" | "struct" | "enum" | "interface" | "trait" | "type"
+        ) {
+            type_by_name
+                .entry(sym.name.clone())
+                .or_default()
+                .insert(sym.id);
+        }
+        if let Some(ref ot) = sym.owner_type {
+            owner_by_id.insert(sym.id, ot.clone());
+        }
     }
 
     let mut batch: Vec<(i64, i64, &'static str)> = Vec::new();
     let mut resolved = 0usize;
+    let mut resolved_by_qualifier = 0usize;
+    let mut resolved_by_impl_block = 0usize;
     let mut dropped_no_enclosing = 0usize;
     let mut dropped_no_candidate = 0usize;
     let mut dropped_ambiguous = 0usize;
+    let mut resolved_by_kind_filter = 0usize;
+    let mut resolved_by_receiver_type = 0usize;
 
     for entry in indexed {
         let empty_imports = HashSet::new();
@@ -255,32 +332,143 @@ fn resolve_symbol_references(
                 continue;
             };
 
-            let candidates = match name_index.get(&reference.name) {
-                Some(c) if !c.is_empty() => c,
+            let raw_candidates = match name_index.get(&reference.name) {
+                Some(c) if !c.is_empty() => c.as_slice(),
                 _ => {
                     dropped_no_candidate += 1;
                     continue;
                 }
             };
 
-            // Priority 1: target lives in the same file as the caller.
-            let mut picked: Vec<i64> = candidates
+            // Kind filter: restrict candidates to kinds that a reference
+            // of this kind could plausibly resolve to. Keeps an ambiguous
+            // name (e.g. a variable `length` and a method `length`) from
+            // being dropped at P3 when one of the candidates is the only
+            // plausible target given the call-vs-type context.
+            let filtered: Vec<&Candidate> = raw_candidates
                 .iter()
-                .filter(|(sid, fid)| *fid == entry.file_id && *sid != from_id)
-                .map(|(sid, _)| *sid)
+                .filter(|(_, _, k, _)| kind_is_compatible(reference.kind, k))
                 .collect();
+            let narrowed_by_kind = !filtered.is_empty() && filtered.len() < raw_candidates.len();
+            // Fall back to the raw list if kind-filtering erased every
+            // option -- avoids silently dropping edges when a language
+            // extractor emits a kind this resolver has not mapped.
+            let candidates: Vec<&Candidate> = if filtered.is_empty() {
+                raw_candidates.iter().collect()
+            } else {
+                filtered
+            };
 
-            // Priority 2: target lives in a file this caller imports from.
+            let mut picked: Vec<i64> = Vec::new();
+            let mut via_receiver = false;
+
+            // Heuristic 1: Qualifier-based matching (from scoped_identifier).
+            // When the reference has a qualifier (e.g. `Foo::new()`, qualifier = "Foo"),
+            // strongly prefer candidates whose owner_type matches the qualifier.
+            // This resolves the common case where multiple types define `new()`.
+            if let Some(ref qual) = reference.qualifier {
+                // First try: qualifier match in same file.
+                picked = candidates
+                    .iter()
+                    .filter(|(sid, fid, _, _)| {
+                        *fid == entry.file_id
+                            && *sid != from_id
+                            && owner_by_id.get(sid).map(|o| o.as_str()) == Some(qual)
+                    })
+                    .map(|(sid, _, _, _)| *sid)
+                    .collect();
+                // Second try: qualifier match in imported files.
+                if picked.is_empty() {
+                    picked = candidates
+                        .iter()
+                        .filter(|(sid, fid, _, _)| {
+                            imported.contains(fid)
+                                && owner_by_id.get(sid).map(|o| o.as_str()) == Some(qual)
+                        })
+                        .map(|(sid, _, _, _)| *sid)
+                        .collect();
+                }
+                // Third try: qualifier match anywhere (unique global).
+                if picked.is_empty() {
+                    let global: Vec<i64> = candidates
+                        .iter()
+                        .filter(|(sid, _, _, _)| {
+                            owner_by_id.get(sid).map(|o| o.as_str()) == Some(qual)
+                        })
+                        .map(|(sid, _, _, _)| *sid)
+                        .collect();
+                    if global.len() == 1 {
+                        picked = global;
+                    }
+                }
+                if !picked.is_empty() {
+                    resolved_by_qualifier += picked.len();
+                }
+            }
+
+            // Heuristic 2: Receiver-type hint (from typed locals/params/fields).
+            // If the extractor attached a receiver-type hint (e.g. Dart's
+            // `Foo foo; foo.method()`), narrow to candidates whose `parent_id`
+            // points at a symbol named by the hint. Falls through when zero or
+            // multiple candidates match (stays conservative).
+            if picked.is_empty()
+                && let Some(type_name) = reference.receiver_type_hint.as_deref()
+                && let Some(type_ids) = type_by_name.get(type_name)
+            {
+                let hit: Vec<i64> = candidates
+                    .iter()
+                    .filter_map(|(sid, _, _, pid)| {
+                        pid.filter(|p| type_ids.contains(p)).map(|_| *sid)
+                    })
+                    .collect();
+                if hit.len() == 1 {
+                    picked = hit;
+                    via_receiver = true;
+                }
+            }
+
+            // Heuristic 3: Same-impl-block priority.
+            // When the calling symbol has an owner_type (e.g. it's inside `impl Foo`),
+            // prefer targets that share the same owner_type. This handles `self.bar()`
+            // calling another method on the same type.
+            if picked.is_empty()
+                && let Some(from_owner) = owner_by_id.get(&from_id)
+            {
+                let impl_matches: Vec<i64> = candidates
+                    .iter()
+                    .filter(|(sid, fid, _, _)| {
+                        *fid == entry.file_id
+                            && *sid != from_id
+                            && owner_by_id.get(sid).map(|o| o.as_str()) == Some(from_owner)
+                    })
+                    .map(|(sid, _, _, _)| *sid)
+                    .collect();
+                if !impl_matches.is_empty() {
+                    picked = impl_matches;
+                    resolved_by_impl_block += picked.len();
+                }
+            }
+
+            // Priority 4: target lives in the same file as the caller.
             if picked.is_empty() {
                 picked = candidates
                     .iter()
-                    .filter(|(_, fid)| imported.contains(fid))
-                    .map(|(sid, _)| *sid)
+                    .filter(|(sid, fid, _, _)| *fid == entry.file_id && *sid != from_id)
+                    .map(|(sid, _, _, _)| *sid)
                     .collect();
             }
 
-            // Priority 3: unique global match. Ambiguous global names are
-            // dropped — with no import evidence and multiple candidates
+            // Priority 5: target lives in a file this caller imports from.
+            if picked.is_empty() {
+                picked = candidates
+                    .iter()
+                    .filter(|(_, fid, _, _)| imported.contains(fid))
+                    .map(|(sid, _, _, _)| *sid)
+                    .collect();
+            }
+
+            // Priority 6: unique global match. Ambiguous global names are
+            // dropped -- with no import evidence and multiple candidates
             // there is no principled way to pick, and keeping them all
             // would bury the signal under noise on large projects.
             if picked.is_empty() {
@@ -290,6 +478,13 @@ fn resolve_symbol_references(
                     dropped_ambiguous += 1;
                     continue;
                 }
+            }
+
+            if via_receiver {
+                resolved_by_receiver_type += 1;
+            }
+            if narrowed_by_kind {
+                resolved_by_kind_filter += 1;
             }
 
             for target in picked {
@@ -302,8 +497,13 @@ fn resolve_symbol_references(
     write::insert_symbol_refs(conn, &batch)?;
 
     tracing::info!(
-        "symbol references: {} resolved, {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
+        "symbol references: {} resolved ({} by qualifier, {} by impl-block, {} via kind filter, {} via receiver type), \
+         {} dropped (no enclosing), {} dropped (no candidate), {} dropped (ambiguous)",
         resolved,
+        resolved_by_qualifier,
+        resolved_by_impl_block,
+        resolved_by_kind_filter,
+        resolved_by_receiver_type,
         dropped_no_enclosing,
         dropped_no_candidate,
         dropped_ambiguous,
@@ -319,6 +519,7 @@ fn resolve_targets(
     root: &Path,
     known_files: &HashSet<String>,
     go_module: Option<&str>,
+    dart_packages: Option<&HashMap<String, String>>,
 ) -> Vec<String> {
     match language {
         "rust" => resolve_rust_import(rel_path, specifier, known_files)
@@ -328,6 +529,7 @@ fn resolve_targets(
             .into_iter()
             .collect(),
         "go" => resolve_go_import(specifier, known_files, go_module),
+        "dart" => resolve_dart_import(rel_path, specifier, root, known_files, dart_packages),
         _ => {
             let importing_file = root.join(rel_path);
             resolve_import(&importing_file, specifier, root, known_files)
@@ -600,6 +802,133 @@ fn read_go_module(root: &Path) -> Option<String> {
     })
 }
 
+// --- Dart ---
+
+/// Resolves a Dart `import`/`part` specifier to a file path relative to `root`.
+///
+/// Handles three specifier shapes:
+///   * `dart:io`, `dart:async` — SDK, not in the workspace, return empty.
+///   * `package:NAME/a/b.dart` — look up NAME in the workspace package map
+///     and rewrite to `<pkg-dir>/lib/a/b.dart`.
+///   * relative (`./x.dart`, `../x.dart`, `x.dart`) — including `part`
+///     directives, which always carry a relative URI — fall through to the
+///     generic relative resolver.
+///
+/// **Scope:** workspace-only. Only packages whose `pubspec.yaml` lives inside
+/// `root` are resolvable; path-/git-dependencies outside the workspace and
+/// pub-cache packages are intentionally ignored. We do not consult
+/// `.dart_tool/package_config.json` — it requires `pub get` to be fresh and
+/// would pull cache paths that are irrelevant for symbol indexing. A
+/// `package:` import whose package name is not in the workspace map returns
+/// no edge.
+fn resolve_dart_import(
+    rel_path: &str,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+    dart_packages: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    if specifier.starts_with("dart:") {
+        return vec![];
+    }
+
+    if let Some(rest) = specifier.strip_prefix("package:") {
+        let packages = match dart_packages {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let (name, tail) = match rest.split_once('/') {
+            Some(parts) => parts,
+            None => return vec![],
+        };
+        let pkg_dir = match packages.get(name) {
+            Some(d) => d,
+            None => return vec![],
+        };
+        let candidate = if pkg_dir.is_empty() {
+            format!("lib/{tail}")
+        } else {
+            format!("{pkg_dir}/lib/{tail}")
+        };
+        let normalized = normalize_path(Path::new(&candidate))
+            .to_string_lossy()
+            .to_string();
+        if known_files.contains(&normalized) {
+            return vec![normalized];
+        }
+        return vec![];
+    }
+
+    let importing_file = root.join(rel_path);
+    resolve_import(&importing_file, specifier, root, known_files)
+        .into_iter()
+        .collect()
+}
+
+/// Walks the workspace for `pubspec.yaml` files and returns a map from each
+/// declared package name to its directory (relative to `root`, forward-slash
+/// form, empty string for a pubspec at the root). Used by
+/// `resolve_dart_import` to translate `package:foo/…` imports to real files.
+fn read_dart_packages(root: &Path) -> HashMap<String, String> {
+    let mut packages = HashMap::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("pubspec.yaml") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let Some(name) = parse_pubspec_name(&content) else {
+            continue;
+        };
+
+        let rel_dir = match path.parent().and_then(|p| p.strip_prefix(root).ok()) {
+            Some(p) => p.to_string_lossy().replace('\\', "/"),
+            None => continue,
+        };
+
+        packages.insert(name, rel_dir);
+    }
+
+    packages
+}
+
+/// Extracts the top-level `name:` field from a `pubspec.yaml` body. Only
+/// unindented `name:` keys count — an indented `name:` under some other
+/// mapping must not hijack the package identity.
+fn parse_pubspec_name(pubspec: &str) -> Option<String> {
+    for raw in pubspec.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            let value = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 // --- Helpers ---
 
 fn normalize_path(path: &Path) -> std::path::PathBuf {
@@ -650,6 +979,7 @@ pub fn incremental_index(
 
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
+    let dart_packages = read_dart_packages(root);
 
     let tx = conn.unchecked_transaction()?;
 
@@ -732,10 +1062,28 @@ pub fn incremental_index(
                 unused_excluded: s.unused_excluded,
                 parent_idx: s.parent_idx,
                 complexity: s.complexity,
+                owner_type: s.owner_type.clone(),
             })
             .collect();
 
         let symbol_ids = write::insert_symbols(&tx, file_id, &symbol_inserts)?;
+
+        if !parse_result.type_relations.is_empty() {
+            let tuples: Vec<_> = parse_result
+                .type_relations
+                .iter()
+                .map(|r| {
+                    (
+                        r.sub_name.clone(),
+                        r.super_name.clone(),
+                        r.kind.as_str().to_string(),
+                        r.line,
+                    )
+                })
+                .collect();
+            write::insert_type_relations(&tx, file_id, &tuples)?;
+        }
+
         updated += 1;
 
         indexed.push(IndexedFile {
@@ -767,6 +1115,7 @@ pub fn incremental_index(
                 root,
                 &known_paths,
                 go_module.as_deref(),
+                Some(&dart_packages),
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -1054,6 +1403,197 @@ mod tests {
         let known = HashSet::new();
         let result = resolve_go_import("pkg/utils", &known, None);
         assert!(result.is_empty());
+    }
+
+    // --- Dart resolver ---
+
+    #[test]
+    fn test_parse_pubspec_name_simple() {
+        let yaml = "name: arrow_core\nversion: 0.1.0\n";
+        assert_eq!(parse_pubspec_name(yaml), Some("arrow_core".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_quoted() {
+        assert_eq!(
+            parse_pubspec_name("name: 'arrow_core'\n"),
+            Some("arrow_core".to_string())
+        );
+        assert_eq!(
+            parse_pubspec_name("name: \"arrow_core\"\n"),
+            Some("arrow_core".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_ignores_indented() {
+        let yaml = "dev_dependencies:\n  pkg:\n    name: nested\n";
+        assert_eq!(parse_pubspec_name(yaml), None);
+    }
+
+    #[test]
+    fn test_parse_pubspec_name_ignores_comments() {
+        let yaml = "# name: wrong\nname: right\n";
+        assert_eq!(parse_pubspec_name(yaml), Some("right".to_string()));
+    }
+
+    #[test]
+    fn test_read_dart_packages_monorepo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("options")).unwrap();
+        fs::create_dir_all(root.join("core")).unwrap();
+        fs::write(root.join("options/pubspec.yaml"), "name: arrow_options\n").unwrap();
+        fs::write(root.join("core/pubspec.yaml"), "name: arrow_core\n").unwrap();
+
+        let packages = read_dart_packages(root);
+        assert_eq!(packages.get("arrow_options"), Some(&"options".to_string()));
+        assert_eq!(packages.get("arrow_core"), Some(&"core".to_string()));
+    }
+
+    #[test]
+    fn test_read_dart_packages_root_pubspec() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("pubspec.yaml"), "name: arrow\n").unwrap();
+
+        let packages = read_dart_packages(root);
+        assert_eq!(packages.get("arrow"), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_dart_import_package() {
+        let mut pkgs = HashMap::new();
+        pkgs.insert("arrow_options".to_string(), "options".to_string());
+        let mut known = HashSet::new();
+        known.insert("options/lib/src/body.dart".to_string());
+        known.insert("options/lib/arrow_options.dart".to_string());
+
+        let result = resolve_dart_import(
+            "core/lib/src/chart.dart",
+            "package:arrow_options/src/body.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["options/lib/src/body.dart".to_string()]);
+
+        let result = resolve_dart_import(
+            "core/lib/src/chart.dart",
+            "package:arrow_options/arrow_options.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["options/lib/arrow_options.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_dart_import_package_at_root() {
+        let mut pkgs = HashMap::new();
+        pkgs.insert("arrow".to_string(), "".to_string());
+        let mut known = HashSet::new();
+        known.insert("lib/src/chart.dart".to_string());
+
+        let result = resolve_dart_import(
+            "lib/main.dart",
+            "package:arrow/src/chart.dart",
+            Path::new("/"),
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["lib/src/chart.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_dart_import_sdk_is_empty() {
+        let pkgs = HashMap::new();
+        let known = HashSet::new();
+        assert!(
+            resolve_dart_import(
+                "lib/main.dart",
+                "dart:async",
+                Path::new("/"),
+                &known,
+                Some(&pkgs)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_resolve_dart_import_unknown_package_is_empty() {
+        let pkgs = HashMap::new();
+        let known = HashSet::new();
+        assert!(
+            resolve_dart_import(
+                "lib/main.dart",
+                "package:flutter/material.dart",
+                Path::new("/"),
+                &known,
+                Some(&pkgs)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_resolve_dart_import_relative() {
+        let pkgs = HashMap::new();
+        let mut known = HashSet::new();
+        known.insert("lib/src/helper.dart".to_string());
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let result = resolve_dart_import(
+            "lib/src/main.dart",
+            "./helper.dart",
+            root,
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, vec!["lib/src/helper.dart".to_string()]);
+    }
+
+    #[test]
+    fn test_full_index_resolves_dart_package_imports() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("options/lib/src")).unwrap();
+        fs::create_dir_all(root.join("core/lib/src")).unwrap();
+        fs::write(root.join("options/pubspec.yaml"), "name: arrow_options\n").unwrap();
+        fs::write(root.join("core/pubspec.yaml"), "name: arrow_core\n").unwrap();
+        fs::write(
+            root.join("options/lib/src/body.dart"),
+            "enum Body { sun, moon }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("core/lib/src/chart.dart"),
+            "import 'package:arrow_options/src/body.dart';\n\
+             class Chart { Body? sun; }\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, true).unwrap();
+
+        let chart_id = read::get_file_by_path(&conn, "core/lib/src/chart.dart")
+            .unwrap()
+            .unwrap()
+            .id;
+        let body_id = read::get_file_by_path(&conn, "options/lib/src/body.dart")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let edges = read::get_all_edges(&conn).unwrap();
+        let has_edge = edges.iter().any(|e| e.0 == chart_id && e.1 == body_id);
+        assert!(
+            has_edge,
+            "expected chart.dart → body.dart import edge, got edges {edges:?}"
+        );
     }
 
     // --- Integration tests ---
@@ -1620,5 +2160,96 @@ mod tests {
         incremental_index(&conn, root, &[], &[]).unwrap();
         let count_after = read::get_file_count(&conn).unwrap();
         assert_eq!(count_before, count_after);
+    }
+
+    #[test]
+    fn test_qualifier_resolves_correct_impl() {
+        // Two types both define `new()`. A caller uses `Foo::new()`. The
+        // resolver should pick Foo's new, not Bar's, thanks to qualifier matching.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub struct Foo;\n\
+             pub struct Bar;\n\
+             impl Foo { pub fn new() -> Self { Foo } }\n\
+             impl Bar { pub fn new() -> Self { Bar } }\n\
+             pub fn caller() { let _x = Foo::new(); }\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, false).unwrap();
+
+        let refs = symbol_ref_names(&conn);
+        let caller_new: Vec<&(String, String)> = refs
+            .iter()
+            .filter(|(f, t)| f == "caller" && t == "new")
+            .collect();
+        assert_eq!(
+            caller_new.len(),
+            1,
+            "Foo::new() should resolve to exactly one target, got {:?}",
+            caller_new
+        );
+    }
+
+    #[test]
+    fn test_impl_block_self_reference() {
+        // A method inside `impl Foo` calls another method on the same type.
+        // The same-impl-block heuristic should resolve it correctly.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub struct Foo;\n\
+             impl Foo {\n\
+                 pub fn helper(&self) {}\n\
+                 pub fn run(&self) { self.helper(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, false).unwrap();
+
+        let refs = symbol_ref_names(&conn);
+        assert!(
+            refs.iter().any(|(f, t)| f == "run" && t == "helper"),
+            "self.helper() inside impl Foo should resolve run -> helper, got {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_owner_type_stored_in_db() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, false).unwrap();
+
+        let all = read::get_all_symbols_with_path(&conn).unwrap();
+        let render = all
+            .iter()
+            .find(|(s, _)| s.name == "render")
+            .expect("render method should exist");
+        assert_eq!(
+            render.0.owner_type.as_deref(),
+            Some("Widget"),
+            "owner_type should be persisted to DB"
+        );
     }
 }

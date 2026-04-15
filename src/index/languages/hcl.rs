@@ -34,6 +34,7 @@ impl LanguageSupport for HclSupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -88,6 +89,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -104,6 +106,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -119,6 +122,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -134,6 +138,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -149,6 +154,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -164,6 +170,7 @@ fn extract_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -193,6 +200,7 @@ fn extract_locals(block_node: Node, source: &[u8], symbols: &mut Vec<ExtractedSy
                                 parent_idx: None,
                                 unused_excluded: false,
                                 complexity: None,
+                                owner_type: None,
                             });
                         }
                     }
@@ -371,6 +379,8 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }
@@ -387,6 +397,8 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }
@@ -403,6 +415,8 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }
@@ -416,6 +430,8 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }
@@ -441,6 +457,8 @@ fn extract_refs_from_text(
                 line,
                 from_symbol_idx: enclosing_idx,
                 kind: ReferenceKind::Use,
+                qualifier: None,
+                receiver_type_hint: None,
             });
         }
     }

@@ -477,6 +477,7 @@ fn test_get_symbol_references() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -494,6 +495,7 @@ fn test_get_symbol_references() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -680,6 +682,7 @@ fn test_fts_prefix_search() {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             },
             SymbolInsert {
                 name: "DatabaseConfig".to_string(),
@@ -692,6 +695,7 @@ fn test_fts_prefix_search() {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             },
         ],
     )
@@ -720,6 +724,7 @@ fn test_fts_no_results() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -836,6 +841,7 @@ fn test_unused_exported_symbols() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -853,6 +859,7 @@ fn test_unused_exported_symbols() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -907,6 +914,7 @@ fn test_delete_file_cascades_symbols_and_edges() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -1019,6 +1027,7 @@ fn test_find_symbol_by_name_across_files() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -1036,6 +1045,7 @@ fn test_find_symbol_by_name_across_files() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -1072,6 +1082,7 @@ fn test_stale_files() {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }],
     )
     .unwrap();
@@ -1517,4 +1528,160 @@ mod guard_binary {
             "creating a new file (not in index) must not be blocked"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Type hierarchy: Rust trait impls
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_type_hierarchy_rust_trait_impl() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "\
+pub trait Greet { fn greet(&self); }
+pub struct Alice;
+pub struct Bob;
+impl Greet for Alice { fn greet(&self) {} }
+impl Greet for Bob { fn greet(&self) {} }
+",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let subs = read::get_subtypes(&conn, "Greet").unwrap();
+    let sub_names: HashSet<&str> = subs.iter().map(|(h, _)| h.sub_name.as_str()).collect();
+    assert!(
+        sub_names.contains("Alice"),
+        "Alice should implement Greet, got: {sub_names:?}"
+    );
+    assert!(
+        sub_names.contains("Bob"),
+        "Bob should implement Greet, got: {sub_names:?}"
+    );
+    assert_eq!(subs.len(), 2);
+
+    let supers = read::get_supertypes(&conn, "Alice").unwrap();
+    assert_eq!(supers.len(), 1);
+    assert_eq!(supers[0].0.super_name, "Greet");
+    assert_eq!(supers[0].0.kind, "implements");
+}
+
+#[test]
+fn test_type_hierarchy_rust_multiple_traits() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "\
+pub trait Read { fn read(&self); }
+pub trait Write { fn write(&self); }
+pub struct File;
+impl Read for File { fn read(&self) {} }
+impl Write for File { fn write(&self) {} }
+",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let supers = read::get_supertypes(&conn, "File").unwrap();
+    let super_names: HashSet<&str> = supers.iter().map(|(h, _)| h.super_name.as_str()).collect();
+    assert_eq!(super_names.len(), 2, "File should implement Read + Write");
+    assert!(super_names.contains("Read"));
+    assert!(super_names.contains("Write"));
+}
+
+#[test]
+fn test_type_hierarchy_inherent_impl_no_relation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "\
+pub struct Foo;
+impl Foo { pub fn new() -> Self { Foo } }
+",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let subs = read::get_subtypes(&conn, "Foo").unwrap();
+    assert!(
+        subs.is_empty(),
+        "inherent impl should not create type hierarchy rows"
+    );
+}
+
+#[test]
+fn test_type_hierarchy_insert_and_cascade() {
+    let conn = setup();
+    let file_id = insert_file(&conn, "src/example.rs");
+
+    write::insert_type_relations(
+        &conn,
+        file_id,
+        &[
+            ("Alice".into(), "Greet".into(), "implements".into(), 10),
+            ("Bob".into(), "Greet".into(), "implements".into(), 20),
+        ],
+    )
+    .unwrap();
+
+    let subs = read::get_subtypes(&conn, "Greet").unwrap();
+    assert_eq!(subs.len(), 2);
+
+    // Delete the file; cascade should remove type_hierarchy rows
+    write::delete_file_data(&conn, file_id).unwrap();
+    let subs_after = read::get_subtypes(&conn, "Greet").unwrap();
+    assert!(
+        subs_after.is_empty(),
+        "cascade delete should remove type_hierarchy rows"
+    );
+}
+
+#[test]
+fn test_type_hierarchy_incremental_reindex() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "\
+pub trait T { fn t(&self); }
+pub struct A;
+impl T for A { fn t(&self) {} }
+",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let subs = read::get_subtypes(&conn, "T").unwrap();
+    assert_eq!(subs.len(), 1);
+
+    // Add a second implementor and re-index incrementally
+    fs::write(
+        dir.path().join("lib.rs"),
+        "\
+pub trait T { fn t(&self); }
+pub struct A;
+pub struct B;
+impl T for A { fn t(&self) {} }
+impl T for B { fn t(&self) {} }
+",
+    )
+    .unwrap();
+
+    index::incremental_index(&conn, dir.path(), &[dir.path().join("lib.rs")], &[]).unwrap();
+
+    let subs = read::get_subtypes(&conn, "T").unwrap();
+    assert_eq!(
+        subs.len(),
+        2,
+        "incremental reindex should pick up new implementor"
+    );
 }

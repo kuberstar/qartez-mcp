@@ -37,6 +37,7 @@ impl LanguageSupport for PhpSupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -156,6 +157,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -170,6 +173,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -184,6 +189,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -205,6 +212,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -327,6 +336,7 @@ fn extract_named_decl(
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -363,6 +373,7 @@ fn extract_class_body(
                             parent_idx: None,
                             unused_excluded: false,
                             complexity: Some(1 + method_cc),
+                            owner_type: None,
                         });
                         if let Some(body) = child.child_by_field_name("body") {
                             for grand in children(body) {
@@ -408,6 +419,7 @@ fn extract_property(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 return;
             }
@@ -426,6 +438,7 @@ fn extract_property(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 return;
             }
@@ -450,6 +463,7 @@ fn extract_const(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }

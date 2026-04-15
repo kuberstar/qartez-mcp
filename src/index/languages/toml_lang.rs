@@ -26,6 +26,7 @@ impl LanguageSupport for TomlSupport {
             symbols,
             imports: Vec::new(),
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -69,6 +70,7 @@ fn extract_table(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>) 
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             return;
@@ -94,6 +96,7 @@ fn extract_table_array(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSym
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             return;
@@ -122,6 +125,7 @@ fn extract_top_level_pair(node: Node, source: &[u8], symbols: &mut Vec<Extracted
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             return;

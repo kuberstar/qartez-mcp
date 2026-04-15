@@ -35,6 +35,7 @@ impl LanguageSupport for JenkinsfileSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -105,6 +106,7 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -126,6 +128,7 @@ fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -153,6 +156,7 @@ fn extract_dsl_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
         "stage" => {
@@ -168,6 +172,7 @@ fn extract_dsl_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
         "node" => {
@@ -183,6 +188,7 @@ fn extract_dsl_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
         "parallel" => {
@@ -196,6 +202,7 @@ fn extract_dsl_block(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
         _ => {}
@@ -231,6 +238,7 @@ fn extract_local_variable(node: Node, source: &[u8], symbols: &mut Vec<Extracted
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -262,6 +270,7 @@ fn extract_assignment(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

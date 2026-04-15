@@ -6,7 +6,8 @@ use rusqlite::Connection;
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::storage::write::{get_or_create_file, upsert_cochange_n};
+use crate::storage::read::get_file_by_path;
+use crate::storage::write::upsert_cochange_n;
 
 pub struct CoChangeConfig {
     pub commit_limit: u32,
@@ -119,16 +120,27 @@ pub fn analyze_cochanges(conn: &Connection, root: &Path, config: &CoChangeConfig
 
     let tx = conn.unchecked_transaction()?;
     let mut written = 0u32;
+    let mut skipped = 0u32;
     for ((path_a, path_b), count) in &pair_counts {
-        let file_a = get_or_create_file(&tx, path_a)?;
-        let file_b = get_or_create_file(&tx, path_b)?;
-        upsert_cochange_n(&tx, file_a, file_b, *count)?;
+        // Only record co-changes between files that currently exist on disk
+        // (i.e. were inserted by full_index). Paths seen only in git history
+        // — renames, deletes, moves — are dropped rather than resurrected as
+        // phantom rows with zero size/mtime.
+        let (Some(a), Some(b)) = (
+            get_file_by_path(&tx, path_a)?,
+            get_file_by_path(&tx, path_b)?,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        upsert_cochange_n(&tx, a.id, b.id, *count)?;
         written += 1;
     }
 
-    // Write per-file change counts into the files table.
+    // Write per-file change counts into the files table. Historical-only
+    // paths are dropped here for the same reason.
     for (path, count) in &file_change_counts {
-        if let Some(file) = crate::storage::read::get_file_by_path(&tx, path)? {
+        if let Some(file) = get_file_by_path(&tx, path)? {
             tx.execute(
                 "UPDATE files SET change_count = ?1 WHERE id = ?2",
                 rusqlite::params![*count as i64, file.id],
@@ -139,8 +151,9 @@ pub fn analyze_cochanges(conn: &Connection, root: &Path, config: &CoChangeConfig
     tx.commit()?;
 
     info!(
-        "Co-change analysis complete: {} pairs, {} file change counts written",
+        "Co-change analysis complete: {} pairs written ({} skipped: historical-only paths), {} file change counts written",
         written,
+        skipped,
         file_change_counts.len()
     );
     Ok(())
@@ -345,7 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn test_unindexed_files_are_auto_created() {
+    fn test_unregistered_paths_are_skipped() {
+        // Files that appear only in git history — never indexed from disk —
+        // must not be resurrected as phantom rows. Co-change pairs touching
+        // such paths are simply dropped.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let repo = init_repo(dir);
@@ -358,18 +374,25 @@ mod tests {
             "commit with non-indexed file",
         );
 
+        // Only a.rs and b.rs are registered (simulating files indexed from disk).
+        // deploy.yaml is seen in git history but not on disk.
         register_files(&conn, &["src/a.rs", "src/b.rs"]);
 
         analyze_cochanges(&conn, dir, &CoChangeConfig::default()).unwrap();
 
+        // Only the (a, b) pair should be recorded. (a, deploy) and (b, deploy)
+        // are skipped because deploy.yaml is not in the files table.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM co_changes", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 1);
 
-        let yaml_file = storage::read::get_file_by_path(&conn, "deploy.yaml")
-            .unwrap()
-            .expect("deploy.yaml should be auto-created");
-        assert_eq!(yaml_file.language, "yaml");
+        // deploy.yaml must NOT have been inserted.
+        assert!(
+            storage::read::get_file_by_path(&conn, "deploy.yaml")
+                .unwrap()
+                .is_none(),
+            "historical-only paths must not be resurrected as phantom rows"
+        );
     }
 }

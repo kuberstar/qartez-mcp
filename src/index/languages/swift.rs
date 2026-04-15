@@ -37,6 +37,7 @@ impl LanguageSupport for SwiftSupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -153,6 +154,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -171,6 +174,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -296,6 +301,7 @@ fn extract_named_decl(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -352,6 +358,7 @@ fn extract_type_body(
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: Some(1 + init_cc),
+                    owner_type: None,
                 });
                 if let Some(fn_body) = child.child_by_field_name("body") {
                     for grand in children(fn_body) {
@@ -393,6 +400,7 @@ fn extract_property(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

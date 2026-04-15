@@ -143,6 +143,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = CREATE_INDEX_RE.captures(trimmed) {
                 symbols.push(ExtractedSymbol {
@@ -155,6 +156,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = CREATE_VIEW_RE.captures(trimmed) {
                 symbols.push(ExtractedSymbol {
@@ -167,6 +169,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = CREATE_FUNCTION_RE.captures(trimmed) {
                 let idx = symbols.len();
@@ -180,6 +183,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 // Functions may have BEGIN...END blocks
                 if trimmed.to_uppercase().contains("BEGIN") {
@@ -197,6 +201,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 if trimmed.to_uppercase().contains("BEGIN") {
                     open_block_idx = Some(idx);
@@ -213,6 +218,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 if trimmed.to_uppercase().contains("BEGIN") {
                     open_block_idx = Some(idx);
@@ -228,6 +234,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = CREATE_SCHEMA_RE.captures(trimmed) {
                 symbols.push(ExtractedSymbol {
@@ -240,6 +247,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = CREATE_SEQUENCE_RE.captures(trimmed) {
                 symbols.push(ExtractedSymbol {
@@ -252,6 +260,7 @@ impl LanguageSupport for SqlSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = ALTER_TABLE_RE.captures(trimmed) {
                 let name = cap[1].to_string();
@@ -268,6 +277,7 @@ impl LanguageSupport for SqlSupport {
                         parent_idx: None,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 }
             }
@@ -287,6 +297,7 @@ impl LanguageSupport for SqlSupport {
             symbols,
             imports: Vec::new(),
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }

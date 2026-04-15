@@ -930,6 +930,7 @@ fn build_basename_index(root: &Path) -> HashMap<String, Vec<PathBuf>> {
     let walker = ignore::WalkBuilder::new(root)
         .max_depth(Some(MAX_PATH_DEPTH))
         .standard_filters(true)
+        .add_custom_ignore_filename(".qartezignore")
         .build();
     let mut count: usize = 0;
     for entry in walker.flatten() {

@@ -27,6 +27,7 @@ impl LanguageSupport for ZigSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -118,6 +119,7 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -294,6 +296,7 @@ fn extract_test(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -328,6 +331,7 @@ fn make_symbol(
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     }
 }
 

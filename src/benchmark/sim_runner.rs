@@ -364,6 +364,7 @@ fn walk_files(root: &Path, ext_filter: Option<&[String]>, exclude_globs: &[&str]
 
     WalkBuilder::new(root)
         .standard_filters(true)
+        .add_custom_ignore_filename(".qartezignore")
         .build()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
