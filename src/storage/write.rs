@@ -6,6 +6,10 @@ use crate::error::Result;
 use crate::storage::models::SymbolInsert;
 use crate::storage::read::get_file_by_path;
 
+/// Maximum lines stored per symbol body in `symbols_body_fts`. Caps FTS
+/// storage at a bounded size — very large functions are truncated.
+const MAX_BODY_LINES: usize = 500;
+
 pub fn upsert_file(
     conn: &Connection,
     path: &str,
@@ -247,13 +251,72 @@ pub fn rebuild_symbol_bodies(conn: &Connection, project_root: &std::path::Path) 
         let lines: Vec<&str> = text.lines().collect();
         for (id, line_start, line_end) in syms {
             let start = (line_start as usize).saturating_sub(1);
-            let end = (line_end as usize).min(lines.len());
+            let end = (line_end as usize)
+                .min(lines.len())
+                .min(start + MAX_BODY_LINES);
             if start >= lines.len() || start >= end {
                 continue;
             }
             let body = lines[start..end].join("\n");
             insert.execute(rusqlite::params![id, body])?;
         }
+    }
+    Ok(())
+}
+
+/// Insert `symbols_fts` entries for all symbols belonging to `file_id`.
+/// Called after `insert_symbols` during an incremental re-index so that only
+/// the affected file's entries are (re-)written rather than the whole table.
+/// `clear_file_content` must have already removed the old FTS rows for this
+/// file before this function is called.
+pub fn insert_fts_for_file(conn: &Connection, file_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO symbols_fts (rowid, name, kind, file_path)
+         SELECT s.id, s.name, s.kind, f.path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE s.file_id = ?1",
+        [file_id],
+    )?;
+    Ok(())
+}
+
+/// Insert `symbols_body_fts` entries for the symbols in a single file.
+/// Called during incremental re-indexing instead of `rebuild_symbol_bodies`
+/// (which rebuilds every file) to avoid unbounded WAL growth on large
+/// codebases. `clear_file_content` must have already removed the old body
+/// FTS rows for this file before this function is called.
+pub fn rebuild_symbol_bodies_for_file(
+    conn: &Connection,
+    project_root: &Path,
+    file_id: i64,
+    rel_path: &str,
+) -> Result<()> {
+    let abs = project_root.join(rel_path);
+    let Ok(text) = std::fs::read_to_string(&abs) else {
+        return Ok(());
+    };
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut select =
+        conn.prepare("SELECT id, line_start, line_end FROM symbols WHERE file_id = ?1")?;
+    let syms: Vec<(i64, u32, u32)> = select
+        .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(select);
+
+    let mut insert =
+        conn.prepare("INSERT INTO symbols_body_fts (rowid, body) VALUES (?1, ?2)")?;
+    for (id, line_start, line_end) in syms {
+        let start = (line_start as usize).saturating_sub(1);
+        let end = (line_end as usize)
+            .min(lines.len())
+            .min(start + MAX_BODY_LINES);
+        if start >= lines.len() || start >= end {
+            continue;
+        }
+        let body = lines[start..end].join("\n");
+        insert.execute(rusqlite::params![id, body])?;
     }
     Ok(())
 }
