@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0] — 2026-04-15
+
+### Added
+
+- **Background auto-update** — `qartez-mcp` checks GitHub for newer releases on startup (24h TTL, cross-process flock) and rebuilds from source via `install.sh` when a new version is available. Opt out with `QARTEZ_NO_AUTO_UPDATE=1`
+- **One-liner install** — `curl -sSfL https://qartez.dev/install | sh` downloads and builds from source without cloning the repo
+- **Runtime state mirroring** — setup wizard now writes MCP config into Claude Code's `.claude.json` state file so accounts with existing state pick up qartez immediately
+
+### Changed
+
+- **License upgraded to Small Team tier** — free for up to 3 users and <$1M annual revenue (was: individuals only). Added patent grant, explicit eligibility examples, and 30-day grace period
+- **Atomic binary install** — `install.sh` uses copy-to-`.new`-then-`mv` to avoid ETXTBSY and corruption during in-place upgrades
+
+### Fixed
+
+- Setup wizard now cleans up `.claude.json` state file on uninstall (previously only cleaned `settings.json`)
+- Update cache file only touched on successful GitHub API check, preventing stale cache from masking transient failures
+
 ## [0.1.1] — 2026-04-14
 
 ### Added

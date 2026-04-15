@@ -80,17 +80,23 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ## Quickstart
 
-Three commands. Under two minutes. No prerequisites needed — the installer handles everything.
+One command. No prerequisites needed — the installer handles everything.
 
 ```bash
-git clone https://github.com/kuberstar/qartez-mcp.git
-cd qartez-mcp
-./install.sh
+curl -sSfL https://qartez.dev/install | sh
 ```
 
 The installer checks for Rust (installs via [rustup](https://rustup.rs/) if missing), builds the release binaries, runs the test suite, installs them to `~/.local/bin/`, and launches `qartez-setup` in non-interactive mode - it auto-detects every MCP-capable IDE on your machine and configures them all in one pass, including the modification-guard hooks for Claude Code.
 
-If you have `make` installed, `make deploy` does the same thing.
+<details>
+<summary>Alternative: install from source</summary>
+
+```bash
+git clone https://github.com/kuberstar/qartez-mcp.git
+cd qartez-mcp
+make deploy
+```
+</details>
 
 Open any project in your IDE - Qartez indexes it automatically on session start. No manual step needed. The file watcher keeps the index fresh as you edit.
 

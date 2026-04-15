@@ -1,38 +1,184 @@
+SPDX-License-Identifier: LicenseRef-Qartez-Dual
+
 Qartez MCP - Dual License
 
 Copyright (c) 2026 Kuberstar
 
-This software is available under two licenses:
+This software is available under two licenses: a free tier for individuals
+and small teams, and a Commercial License for everyone else.
 
-1. FREE FOR INDIVIDUALS (Qartez Individual License)
+==========================================================================
+ACCEPTANCE
+==========================================================================
 
-   Permission is hereby granted, free of charge, to any individual person
-   obtaining a copy of this software and associated documentation files
-   (the "Software"), to use, copy, modify, and distribute the Software for
-   personal, educational, open-source, or non-commercial purposes, subject
-   to the following conditions:
+By using the Software, You agree to all of the terms and conditions of
+this license. If You do not agree, You may not use the Software.
 
-   - The above copyright notice and this permission notice shall be included
-     in all copies or substantial portions of the Software.
-   - The Software shall not be used as part of a product or service offered
-     by a business, company, or organization without a Commercial License.
+==========================================================================
+1. FREE FOR INDIVIDUALS AND SMALL TEAMS (Qartez Small Team License)
+==========================================================================
 
-2. COMMERCIAL LICENSE (Required for Business Use)
+Subject to the terms below, permission is hereby granted, free of charge,
+to any Eligible User obtaining a copy of this software and associated
+documentation files (the "Software") to use, copy, modify, and distribute
+the Software for any purpose, including personal, educational, open-source,
+hobby, and commercial use.
 
-   Any use of the Software by or on behalf of a company, corporation,
-   partnership, or other business entity - including but not limited to
-   internal tooling, commercial products, SaaS offerings, or consulting
-   services - requires a separate Commercial License.
+DEFINITIONS
 
-   For licensing inquiries, contact: hello@qartez.dev
+"Use" means any interaction with the Software that benefits You or Your
+Company, including running it locally as a development tool while
+authoring code or content that is later sold, licensed, or distributed.
 
-   "Business use" includes:
-   - Use by employees or contractors on behalf of a for-profit entity
-   - Integration into commercial products or services
-   - Use in revenue-generating activities
-   - Use by organizations with more than one person
+"Your Company" means the individual, legal entity, sole proprietorship,
+partnership, or other organization on whose behalf You Use the Software.
+When Your Company is a legal entity, Your Company also includes all
+organizations that have control over, are under the control of, or are
+under common control with that entity. Control means ownership of
+substantially all the assets of an entity, or the power to direct its
+management and policies by vote, contract, or otherwise. Control can be
+direct or indirect.
 
+A single-member LLC, sole proprietorship, or equivalent legal wrapper
+around one individual counts as that one individual for the purposes of
+counting Users. An individual acting alone, with no associated legal
+entity, is treated as Your Company of one.
+
+"Users" means the total number of distinct individuals within Your
+Company who regularly Use the Software, counted over any rolling ninety
+(90) day period. Employees, contractors, founders, and owners who
+interact with the Software as part of their normal workflow are counted.
+An individual who interacts with the Software only incidentally (for
+example, to evaluate, test, troubleshoot a one-off integration, or
+attend a demo) and does not make the Software part of their regular
+workflow is not counted as a User. Individuals at Your Company who do
+not interact with the Software at all are not counted.
+
+"Annual Revenue" means Your Company's gross commercial revenue in the
+prior fiscal year, measured in United States dollars using the exchange
+rate published by the United States Federal Reserve H.10 Daily Rates on
+the last business day of that fiscal year. Commercial revenue includes
+product sales, subscription fees, consulting fees, licensing fees,
+royalties, and advertising revenue. Commercial revenue does not include
+grants, donations, sponsorships, or crowdfunding contributions received
+in support of open-source work. For the first fiscal year of Your
+Company's existence, Annual Revenue is deemed to be zero.
+
+ELIGIBILITY
+
+You qualify as an Eligible User if both of the following are true:
+
+(a) Your Company has three (3) or fewer Users, AND
+(b) Your Company's Annual Revenue is less than one million United States
+    dollars ($1,000,000 USD).
+
+EXAMPLES OF PERMITTED USE
+
+The following are explicitly permitted under the free tier and require no
+Commercial License:
+
+- A solo developer using the Software to author open-source or commercial
+  code on their own machine.
+- A single-member LLC, sole proprietorship, or equivalent legal wrapper
+  around one individual, using the Software for its own projects.
+- A student using the Software for coursework, research, or learning.
+- A two-person cofounder team using the Software on their development
+  machines to build a product they later sell, as long as Your Company's
+  Annual Revenue remains under the threshold. Accepting investment does
+  not affect Eligibility; commercial revenue does.
+- A three-person startup using the Software internally, as long as
+  Annual Revenue is under the threshold. Funding stage and legal
+  structure do not affect Eligibility.
+- An open-source maintainer using the Software to work on a project that
+  accepts donations, grants, sponsorship, or paid content tiers. Such
+  income does not count toward Annual Revenue.
+- A team of any size where three or fewer members actually interact with
+  the Software. Users are counted by active seats, not by headcount of
+  Your Company.
+- Using the Software in Your Company's CI/CD pipelines, development
+  machines, or internal build servers to analyze Your Company's own
+  code, as an extension of local development tool use.
+
+==========================================================================
+PATENT LICENSE
+==========================================================================
+
+The licensor grants You a license, under any patent claims the licensor
+can license, or becomes able to license, to make, have made, use, sell,
+offer for sale, import and have imported the Software, in each case
+subject to the limitations and conditions in this license. This license
+does not cover any patent claims that You cause to be infringed by
+modifications or additions to the Software. If You or Your Company make
+any written claim that the Software infringes or contributes to
+infringement of any patent, Your patent license for the Software granted
+under these terms ends immediately. If Your Company makes such a claim,
+Your patent license ends immediately for work on behalf of Your Company.
+
+==========================================================================
+CONDITIONS
+==========================================================================
+
+- The copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+- If the number of Users at Your Company grows to four or more, OR if
+  Your Company's Annual Revenue reaches one million USD or more in any
+  fiscal year, You must obtain a Commercial License. If Your Company
+  first becomes aware, or with reasonable diligence should have become
+  aware, that it has exceeded either threshold, You have thirty (30)
+  days from that awareness date to either obtain a Commercial License,
+  reduce Users to three or fewer, or cease Use of the Software under
+  the free tier. Use of the Software during the grace period remains
+  licensed under the free tier.
+- The free tier does not grant the right to embed, bundle, or
+  redistribute the Software as a component of a paid product, hosted
+  service, or consulting deliverable offered to third parties, even when
+  Your Company has three or fewer Users. Authoring code with the
+  Software running as a local development tool is permitted; making the
+  Software itself part of what is sold or delivered to customers is not.
+- You may redistribute the Software and derivative works, in source or
+  binary form, to third parties free of charge, provided that You
+  include a copy of this license and do not remove the copyright notice.
+  Redistribution as a component of anything You sell, charge for, or
+  offer as a hosted service requires a Commercial License regardless
+  of Your Company's size or revenue.
+- This license does not grant You any rights in the "Qartez" name,
+  logo, or other trademarks of Kuberstar. Using "Qartez" solely to
+  identify the origin of the Software is permitted. Any other use of
+  the trademark is subject to applicable law.
+
+==========================================================================
+TERMINATION
+==========================================================================
+
+If You use the Software in violation of these terms, such use is not
+licensed, and Your licenses will automatically terminate. If the
+licensor provides You with a notice of Your violation, and You cease
+all violation of this license no later than thirty (30) days after You
+receive that notice, Your licenses will be reinstated retroactively.
+However, if You violate these terms after such reinstatement, any
+additional violation of these terms will cause Your licenses to
+terminate automatically and permanently.
+
+This clause is separate from, and in addition to, the threshold grace
+period described in CONDITIONS, which governs compliance with
+ELIGIBILITY when Your Company grows past the free-tier thresholds.
+
+==========================================================================
+2. COMMERCIAL LICENSE (Required Above Free-Tier Thresholds)
+==========================================================================
+
+Any Use of the Software by or on behalf of a company, corporation,
+partnership, or other organization with four (4) or more Users, OR with
+Annual Revenue of one million USD or more, requires a separate Commercial
+License. Redistribution of the Software as part of a product, hosted
+service, or consulting deliverable offered to third parties also requires
+a Commercial License, regardless of Your Company's size or revenue.
+
+For licensing inquiries and pricing, contact: hello@qartez.dev
+
+==========================================================================
 DISCLAIMER
+==========================================================================
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

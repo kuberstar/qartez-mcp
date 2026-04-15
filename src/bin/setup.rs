@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-04-13
+// Rust guideline compliant 2026-04-15
 //! `qartez-setup` — interactive IDE auto-setup wizard.
 //!
 //! Detects installed IDEs, presents an interactive checkbox prompt, and
@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, SystemTime};
 
 use chrono::Local;
 use clap::Parser;
@@ -41,6 +42,15 @@ struct Cli {
     /// Only configure specific IDEs (comma-separated or repeated).
     #[arg(long, value_delimiter = ',')]
     ide: Vec<String>,
+
+    /// Check for a newer release on GitHub and rebuild + reinstall if available.
+    #[arg(long)]
+    update: bool,
+
+    /// Internal flag: like --update, but throttled by ~/.qartez/last-update-check
+    /// (24h TTL) and silent on no-op. Used by qartez-mcp on startup.
+    #[arg(long, hide = true)]
+    update_background: bool,
 }
 
 // -- IDE registry ------------------------------------------------------------
@@ -195,6 +205,32 @@ fn discover_claude_dirs() -> Vec<PathBuf> {
     dirs.extend(variants);
 
     dirs
+}
+
+/// Returns Claude Code's runtime state file (`.claude.json`) for a given
+/// Claude config directory.
+///
+/// Claude Code persists active MCP server entries here, and this file takes
+/// precedence over `settings.json` for accounts that have one — so we must
+/// touch both to make qartez visible to the CLI on next launch.
+///
+/// Path layout differs between the default account and named variants:
+/// - Default `~/.claude/` → state at `~/.claude.json` (one level up).
+/// - Variant `~/.claude-<name>/` → state at `~/.claude-<name>/.claude.json`
+///   (inside the variant directory).
+fn claude_state_file(claude_dir: &Path) -> PathBuf {
+    let is_default = claude_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".claude");
+    if is_default {
+        claude_dir.parent().map_or_else(
+            || claude_dir.join(".claude.json"),
+            |p| p.join(".claude.json"),
+        )
+    } else {
+        claude_dir.join(".claude.json")
+    }
 }
 
 fn info(msg: &str) {
@@ -459,7 +495,28 @@ fn install_claude_one(claude_dir: &Path, bin: &str, guard_bin: Option<&str>) -> 
     write_json(&settings_path, &settings)?;
     info(&format!("Settings updated: {}", settings_path.display()));
 
-    // 3. Install CLAUDE.md snippet
+    // 3. Mirror the MCP entry into Claude Code's runtime state file
+    //    (`.claude.json`). Without this, accounts that already have a state
+    //    file won't pick up qartez until the user manually runs
+    //    `claude mcp add`.
+    let state_path = claude_state_file(claude_dir);
+    if state_path.is_file() {
+        backup_file(&state_path)?;
+        let mut state = read_json(&state_path)?;
+        if state.get("mcpServers").is_none() {
+            state["mcpServers"] = serde_json::json!({});
+        }
+        state["mcpServers"]["qartez"] = serde_json::json!({
+            "type": "stdio",
+            "command": bin,
+            "args": [],
+            "env": {}
+        });
+        write_json(&state_path, &state)?;
+        info(&format!("State updated: {}", state_path.display()));
+    }
+
+    // 4. Install CLAUDE.md snippet
     install_claude_md_snippet(&claude_dir.join("CLAUDE.md"))?;
 
     Ok(())
@@ -769,6 +826,20 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
 
         write_json(&settings_path, &settings)?;
         info(&format!("Settings cleaned up: {}", settings_path.display()));
+    }
+
+    // Mirror the cleanup into Claude Code's runtime state file.
+    let state_path = claude_state_file(claude_dir);
+    if state_path.is_file() {
+        backup_file(&state_path)?;
+        let mut state = read_json(&state_path)?;
+        if let Some(servers) = state.get_mut("mcpServers")
+            && let Some(obj) = servers.as_object_mut()
+        {
+            obj.remove("qartez");
+        }
+        write_json(&state_path, &state)?;
+        info(&format!("State cleaned up: {}", state_path.display()));
     }
 
     remove_claude_md_snippet(&claude_dir.join("CLAUDE.md"))?;
@@ -1369,6 +1440,10 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if cli.update || cli.update_background {
+        return run_update(cli.update_background);
+    }
+
     // Resolve binaries
     let bin = find_binary("qartez-mcp").map(|p| p.to_string_lossy().into_owned());
     let guard_bin = find_binary("qartez-guard").map(|p| p.to_string_lossy().into_owned());
@@ -1431,6 +1506,197 @@ fn run() -> anyhow::Result<()> {
             style("✓").green().bold()
         );
     }
+    Ok(())
+}
+
+// -- Auto-update -------------------------------------------------------------
+
+const QARTEZ_UPDATE_REPO: &str = "kuberstar/qartez-mcp";
+const QARTEZ_INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.sh";
+const UPDATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn update_cache_path() -> PathBuf {
+    home_dir().join(".qartez").join("last-update-check")
+}
+
+fn touch_update_cache() {
+    let path = update_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, "");
+}
+
+fn update_cache_is_fresh() -> bool {
+    let Ok(meta) = fs::metadata(update_cache_path()) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age < UPDATE_TTL)
+        .unwrap_or(false)
+}
+
+// Cross-process exclusion for the update path. Users frequently open many
+// Claude Code sessions at once — each starts qartez-mcp which spawns
+// qartez-setup --update-background. Without a lock, all of them would
+// race to the GitHub API and potentially to parallel install.sh rebuilds.
+//
+// Uses advisory flock on ~/.qartez/update.lock. The OS releases it on
+// process exit, so a crashed updater won't leave a dangling lock. The
+// returned file handle must be kept alive for the duration of the
+// critical section — dropping it releases the lock.
+fn acquire_update_lock() -> Option<fs::File> {
+    let path = home_dir().join(".qartez").join("update.lock");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
+
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.trim().trim_start_matches('v');
+    let core = s.split('-').next().unwrap_or(s);
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_semver(latest), parse_semver(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+fn fetch_latest_release_tag() -> anyhow::Result<String> {
+    let url = format!("https://api.github.com/repos/{QARTEZ_UPDATE_REPO}/releases/latest");
+    let output = Command::new("curl")
+        .args([
+            "-sSfL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: qartez-setup",
+            &url,
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to invoke curl: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "GitHub API request failed (curl exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("invalid JSON from GitHub API: {e}"))?;
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("`tag_name` missing from GitHub API response"))
+}
+
+fn run_update(background: bool) -> anyhow::Result<()> {
+    if std::env::var_os("QARTEZ_NO_AUTO_UPDATE").is_some() {
+        if !background {
+            eprintln!("  Auto-update disabled via QARTEZ_NO_AUTO_UPDATE.");
+        }
+        return Ok(());
+    }
+
+    if background && update_cache_is_fresh() {
+        return Ok(());
+    }
+
+    // Cross-process lock — only one qartez-setup update may run at a
+    // time across all Claude Code sessions. Other parallel invocations
+    // skip silently; by the time they check the TTL on their next start,
+    // the winning process will have touched the cache.
+    //
+    // The cache touch lives inside the lock critical section (on success
+    // paths) so transient network failures still leave the cache stale
+    // and the next startup can retry.
+    let _lock = match acquire_update_lock() {
+        Some(f) => f,
+        None => {
+            if !background {
+                eprintln!("  Another qartez-setup update is already running — skipping.");
+            }
+            return Ok(());
+        }
+    };
+
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = match fetch_latest_release_tag() {
+        Ok(tag) => tag,
+        Err(e) => {
+            if background {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+
+    if !is_newer_version(&latest, current) {
+        touch_update_cache();
+        if !background {
+            eprintln!("  Already on the latest version (v{current}).");
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "  {} qartez {} → {} — rebuilding from source...",
+        style("[+]").green(),
+        current,
+        latest.trim_start_matches('v'),
+    );
+
+    let install_cmd = format!("curl -sSfL {QARTEZ_INSTALL_URL} | sh");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&install_cmd)
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn installer: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("installer wait failed: {e}"))?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "installer exited with status {}",
+            status.code().unwrap_or(-1)
+        );
+    }
+
+    touch_update_cache();
+    eprintln!(
+        "  {} Update complete: {} → {}",
+        style("✓").green().bold(),
+        current,
+        latest.trim_start_matches('v'),
+    );
     Ok(())
 }
 
@@ -1529,4 +1795,241 @@ fn parse_ide_list(names: &[String]) -> anyhow::Result<Vec<Ide>> {
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_semver_strips_v_prefix_and_pre_release() {
+        assert_eq!(parse_semver("0.1.1"), Some((0, 1, 1)));
+        assert_eq!(parse_semver("v0.1.1"), Some((0, 1, 1)));
+        assert_eq!(parse_semver("v1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_semver(" v0.1.1 "), Some((0, 1, 1)));
+    }
+
+    #[test]
+    fn parse_semver_rejects_malformed() {
+        assert_eq!(parse_semver(""), None);
+        assert_eq!(parse_semver("v1.2"), None);
+        assert_eq!(parse_semver("1.2.3.4"), None);
+        assert_eq!(parse_semver("v1.x.0"), None);
+    }
+
+    #[test]
+    fn is_newer_uses_numeric_component_order() {
+        // Lexical compare would say "0.1.2" > "0.1.10" — make sure we don't.
+        assert!(is_newer_version("0.1.10", "0.1.2"));
+        assert!(is_newer_version("v0.2.0", "v0.1.99"));
+        assert!(is_newer_version("v1.0.0", "v0.99.99"));
+    }
+
+    #[test]
+    fn is_newer_returns_false_for_equal_or_older_or_unparseable() {
+        assert!(!is_newer_version("0.1.1", "0.1.1"));
+        assert!(!is_newer_version("v0.1.0", "v0.1.1"));
+        assert!(!is_newer_version("garbage", "0.1.1"));
+        assert!(!is_newer_version("0.1.1", "garbage"));
+        assert!(!is_newer_version("garbage", "garbage"));
+    }
+
+    // -- Test helpers for env-var–dependent code ----------------------------
+
+    // Serializes tests that mutate process-global env vars ($HOME, $PATH).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: all env-mutating tests are serialized by ENV_LOCK.
+            unsafe { std::env::set_var(key, val.as_ref()) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same serialization guarantee as set().
+            match &self.original {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    // -- Cache TTL ---------------------------------------------------------
+
+    #[test]
+    fn update_cache_missing_is_not_fresh() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        assert!(!update_cache_is_fresh());
+    }
+
+    #[test]
+    fn update_cache_fresh_after_touch() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        touch_update_cache();
+        assert!(update_cache_is_fresh());
+    }
+
+    #[test]
+    fn update_cache_stale_when_mtime_exceeds_ttl() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        touch_update_cache();
+        let path = update_cache_path();
+        let old = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        let times = fs::FileTimes::new().set_modified(old);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        assert!(!update_cache_is_fresh());
+    }
+
+    // -- Lock behavior -----------------------------------------------------
+
+    #[test]
+    fn acquire_lock_succeeds_and_creates_file() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        let lock = acquire_update_lock();
+        assert!(lock.is_some());
+        assert!(tmp.path().join(".qartez").join("update.lock").exists());
+    }
+
+    #[test]
+    fn acquire_lock_returns_none_for_unwritable_lock_file() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        let dir = tmp.path().join(".qartez");
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("update.lock");
+        fs::write(&lock_path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let result = acquire_update_lock();
+        assert!(result.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    #[test]
+    fn lock_released_on_drop_allows_reacquire() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+        {
+            let _lock = acquire_update_lock().unwrap();
+        }
+        let lock2 = acquire_update_lock();
+        assert!(lock2.is_some(), "reacquire after drop should succeed");
+    }
+
+    // -- Semver edge cases -------------------------------------------------
+
+    #[test]
+    fn parse_semver_handles_large_and_zero_components() {
+        assert_eq!(parse_semver("0.0.0"), Some((0, 0, 0)));
+        assert_eq!(parse_semver("999.999.999"), Some((999, 999, 999)));
+        assert_eq!(parse_semver("v100.0.0-beta.1"), Some((100, 0, 0)));
+    }
+
+    #[test]
+    fn parse_semver_rejects_overflow_and_edge_cases() {
+        assert_eq!(parse_semver("4294967296.0.0"), None);
+        assert_eq!(parse_semver("v"), None);
+        assert_eq!(parse_semver("1.2."), None);
+        assert_eq!(parse_semver(".1.2"), None);
+        assert_eq!(parse_semver("1..2"), None);
+    }
+
+    #[test]
+    fn is_newer_prerelease_compared_by_core_version() {
+        assert!(!is_newer_version("v1.0.0-rc1", "1.0.0"));
+        assert!(is_newer_version("v1.0.1-beta", "1.0.0"));
+    }
+
+    // -- Mock curl for fetch_latest_release_tag ----------------------------
+
+    #[cfg(unix)]
+    fn write_mock_curl(dir: &Path, body: &str) {
+        let mock = dir.join("curl");
+        fs::write(&mock, format!("#!/bin/sh\necho '{body}'")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_mock_curl_failing(dir: &Path, code: i32) {
+        let mock = dir.join("curl");
+        fs::write(&mock, format!("#!/bin/sh\nexit {code}")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_release_tag_parses_valid_github_response() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_mock_curl(tmp.path(), r#"{"tag_name": "v0.2.0"}"#);
+        let orig = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvGuard::set("PATH", format!("{}:{orig}", tmp.path().display()));
+        assert_eq!(fetch_latest_release_tag().unwrap(), "v0.2.0");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_release_tag_rejects_invalid_json() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_mock_curl(tmp.path(), "not json");
+        let orig = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvGuard::set("PATH", format!("{}:{orig}", tmp.path().display()));
+        assert!(fetch_latest_release_tag().is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_release_tag_rejects_missing_tag_name() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_mock_curl(tmp.path(), r#"{"name": "Release"}"#);
+        let orig = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvGuard::set("PATH", format!("{}:{orig}", tmp.path().display()));
+        assert!(fetch_latest_release_tag().is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_release_tag_returns_error_on_curl_failure() {
+        let _mu = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_mock_curl_failing(tmp.path(), 22);
+        let orig = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvGuard::set("PATH", format!("{}:{orig}", tmp.path().display()));
+        assert!(fetch_latest_release_tag().is_err());
+    }
 }

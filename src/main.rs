@@ -1,4 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use clap::Parser;
 use qartez_mcp::{cli, config, git, graph, index, server, storage, watch};
@@ -12,6 +14,8 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(&cli.log_level)
         .init();
+
+    schedule_update_check();
 
     let config = config::Config::from_cli(&cli)?;
 
@@ -102,4 +106,62 @@ async fn main() -> anyhow::Result<()> {
     service.waiting().await?;
 
     Ok(())
+}
+
+// Fire-and-forget background update check: spawns qartez-setup with
+// --update-background. The setup binary handles the GitHub API call,
+// version compare, and (if newer) re-runs install.sh from source.
+//
+// The TTL gate exists in two places on purpose:
+//   1. Here, to avoid the process-spawn cost on every Claude Code start
+//      when the cache is fresh (~5–20ms per spawn).
+//   2. Inside qartez-setup itself, as the source of truth — protects
+//      against concurrent qartez-mcp starts racing into the network.
+//
+// Skipped entirely when QARTEZ_NO_AUTO_UPDATE is set (any value).
+fn schedule_update_check() {
+    if std::env::var_os("QARTEZ_NO_AUTO_UPDATE").is_some() {
+        return;
+    }
+
+    if update_cache_is_fresh() {
+        return;
+    }
+
+    let Some(setup) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("qartez-setup")))
+        .filter(|p| p.is_file())
+    else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new(setup)
+            .arg("--update-background")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    });
+}
+
+fn update_cache_is_fresh() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let cache = PathBuf::from(home)
+        .join(".qartez")
+        .join("last-update-check");
+    let Ok(meta) = std::fs::metadata(&cache) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age.as_secs() < 24 * 60 * 60)
+        .unwrap_or(false)
 }
