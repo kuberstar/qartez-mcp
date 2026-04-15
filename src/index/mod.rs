@@ -29,6 +29,16 @@ struct IndexedFile {
     references: Vec<ExtractedReference>,
 }
 
+/// Maximum file size to index. Files larger than this are skipped — they are
+/// typically generated code and inflate the index without meaningful signal.
+/// Override via the `QARTEZ_MAX_FILE_BYTES` environment variable.
+fn max_file_bytes() -> u64 {
+    std::env::var("QARTEZ_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000) // 1 MB default
+}
+
 pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     let files = walker::walk_source_files(root);
     let pool = ParserPool::new();
@@ -58,6 +68,15 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
         };
         let mtime_ns = file_mtime_ns(&metadata);
         let size_bytes = metadata.len() as i64;
+
+        if metadata.len() > max_file_bytes() {
+            tracing::debug!(
+                "skipping oversized file {} ({} bytes)",
+                file_path.display(),
+                metadata.len()
+            );
+            continue;
+        }
 
         if !force
             && let Some(existing) = read::get_file_by_path(&tx, &rel_path)?
@@ -198,6 +217,13 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     write::set_meta(&tx, "last_index", &timestamp)?;
 
     tx.commit()?;
+
+    // Checkpoint the WAL so it doesn't grow unboundedly across indexing runs.
+    // Failure is non-fatal — the next run or SQLite's auto-checkpoint will
+    // eventually flush it.
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::debug!("WAL checkpoint after full_index failed (non-fatal): {e}");
+    }
 
     tracing::info!("indexing complete: {updated} updated, {skipped} skipped, {deleted} deleted");
     Ok(())
@@ -686,6 +712,15 @@ pub fn incremental_index(
         let mtime_ns = file_mtime_ns(&metadata);
         let size_bytes = metadata.len() as i64;
 
+        if metadata.len() > max_file_bytes() {
+            tracing::debug!(
+                "incremental: skipping oversized file {} ({} bytes)",
+                file_path.display(),
+                metadata.len()
+            );
+            continue;
+        }
+
         let source = match std::fs::read(file_path) {
             Ok(s) => s,
             Err(e) => {
@@ -785,9 +820,17 @@ pub fn incremental_index(
 
     resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
 
-    // --- Phase 4: rebuild global derived tables ---
-    write::sync_fts(&tx)?;
-    write::rebuild_symbol_bodies(&tx, root)?;
+    // --- Phase 4: update derived tables ---
+    // Update FTS and body index only for the files that actually changed.
+    // This avoids the O(whole-codebase) full-table DELETE+re-insert that
+    // sync_fts / rebuild_symbol_bodies would trigger on every file-save
+    // event — the primary cause of unbounded WAL growth on large codebases.
+    // clear_file_content (called above per file) already removed the old
+    // FTS rows, so here we only need to insert the new ones.
+    for entry in &indexed {
+        write::insert_fts_for_file(&tx, entry.file_id)?;
+        write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.rel_path)?;
+    }
     write::populate_unused_exports(&tx)?;
 
     let timestamp = std::time::SystemTime::now()
@@ -798,6 +841,12 @@ pub fn incremental_index(
     write::set_meta(&tx, "last_index", &timestamp)?;
 
     tx.commit()?;
+
+    // Checkpoint the WAL after each incremental index to prevent unbounded
+    // growth on large codebases with an active file watcher.
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::debug!("WAL checkpoint after incremental_index failed (non-fatal): {e}");
+    }
 
     tracing::info!(
         "incremental index: {updated} updated, {removed} removed ({} changed, {} deleted input)",
