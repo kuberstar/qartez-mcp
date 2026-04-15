@@ -134,6 +134,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: None,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                     depth = depth
                         .saturating_add(open_braces)
@@ -169,6 +170,7 @@ impl LanguageSupport for CaddyfileSupport {
                             parent_idx: None,
                             unused_excluded: false,
                             complexity: None,
+                            owner_type: None,
                         });
                     }
                 }
@@ -186,6 +188,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: current_site_idx,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 } else if let Some(cap) = REVERSE_PROXY_RE.captures(raw_line) {
                     symbols.push(ExtractedSymbol {
@@ -198,6 +201,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: current_site_idx,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 } else if let Some(cap) = RESPOND_RE.captures(raw_line) {
                     symbols.push(ExtractedSymbol {
@@ -210,6 +214,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: current_site_idx,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 } else if let Some(cap) = IMPORT_RE.captures(raw_line) {
                     imports.push(ExtractedImport {
@@ -228,6 +233,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: current_site_idx,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 } else if let Some(cap) = DIRECTIVE_RE.captures(raw_line) {
                     let directive = &cap[1];
@@ -247,6 +253,7 @@ impl LanguageSupport for CaddyfileSupport {
                         parent_idx: current_site_idx,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 }
             }
@@ -268,6 +275,7 @@ impl LanguageSupport for CaddyfileSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }

@@ -27,6 +27,7 @@ impl LanguageSupport for BashSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -118,6 +119,7 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -142,6 +144,7 @@ fn extract_variable(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -172,6 +175,7 @@ fn extract_export_variable(node: Node, source: &[u8], symbols: &mut Vec<Extracte
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
     }
@@ -198,6 +202,7 @@ fn extract_export_declaration(node: Node, source: &[u8], symbols: &mut Vec<Extra
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }

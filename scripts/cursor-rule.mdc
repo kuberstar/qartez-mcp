@@ -1,0 +1,36 @@
+---
+description: Qartez MCP code-intelligence tools -- use instead of Glob/Grep/Read for all code exploration
+globs:
+alwaysApply: true
+---
+
+# Qartez MCP -- Tool Priority
+
+When the `qartez` MCP server is available, use its tools INSTEAD OF built-in file tools for code exploration.
+
+## Tool mapping
+
+| Instead of | Use | When |
+|---|---|---|
+| Glob / find | `qartez_map` | Project structure, finding files |
+| Grep / rg | `qartez_grep` | Searching for symbols, types, functions |
+| Grep / rg | `qartez_find` | Looking up a specific symbol definition |
+| Read / cat | `qartez_read` | Reading symbol source code with context |
+
+## All 21 tools
+
+**Navigate:** `qartez_map`, `qartez_find`, `qartez_grep`, `qartez_read`, `qartez_outline`, `qartez_stats`
+**Analyze:** `qartez_impact`, `qartez_deps`, `qartez_refs`, `qartez_calls`, `qartez_cochange`, `qartez_context`, `qartez_unused`
+**Risk:** `qartez_hotspots`, `qartez_clones`, `qartez_boundaries`
+**Refactor:** `qartez_rename`, `qartez_move`, `qartez_rename_file`
+**Build:** `qartez_project`, `qartez_wiki`
+
+## Workflow
+
+1. `qartez_map` -- understand project structure first
+2. `qartez_find` / `qartez_grep` -- locate symbols
+3. `qartez_read` -- read code with semantic context
+4. `qartez_impact` -- check before modifying exports
+5. `qartez_context` -- before multi-file changes, surface files you might miss
+
+Use built-in file tools ONLY for non-code content (config files, text search, file patterns qartez cannot handle).

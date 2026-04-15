@@ -113,10 +113,6 @@ cd "$SCRIPT_DIR"
 info "Building release binaries (this may take a few minutes on first run)..."
 "$CARGO" build --release
 
-# --- Test (before install — don't copy broken binaries) ---
-info "Running tests..."
-"$CARGO" test
-
 # --- Install ---
 TARGET_DIR="${CARGO_TARGET_DIR:-${SCRIPT_DIR}/target}"
 mkdir -p "$INSTALL_DIR"

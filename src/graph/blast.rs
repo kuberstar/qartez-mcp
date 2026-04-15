@@ -63,6 +63,27 @@ pub fn blast_radius_for_files(conn: &Connection, file_ids: &[i64]) -> Result<Has
     Ok(out)
 }
 
+/// Batch version of [`blast_radius_for_file`] that returns full [`BlastResult`]
+/// structs (direct + transitive importers) for each file ID. Loads edges and
+/// builds the reverse adjacency list once.
+pub fn blast_radius_for_file_set(conn: &Connection, file_ids: &[i64]) -> Result<Vec<BlastResult>> {
+    let edges = get_all_edges(conn)?;
+    let reverse = build_reverse_adjacency(&edges);
+    Ok(file_ids
+        .iter()
+        .map(|&file_id| {
+            let direct_importers: Vec<i64> = reverse.get(&file_id).cloned().unwrap_or_default();
+            let transitive_importers = bfs_reachable(&reverse, file_id);
+            BlastResult {
+                file_id,
+                direct_importers,
+                transitive_count: transitive_importers.len(),
+                transitive_importers,
+            }
+        })
+        .collect())
+}
+
 fn blast_for_node(file_id: i64, edges: &[(i64, i64)]) -> BlastResult {
     let reverse = build_reverse_adjacency(edges);
 

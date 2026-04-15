@@ -682,6 +682,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 }],
             )
             .unwrap();

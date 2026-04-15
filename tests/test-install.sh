@@ -164,13 +164,11 @@ fi
 section "Build safety"
 # ============================================================
 
-# Tests run before install (not after)
-TEST_LINE=$(grep -n 'CARGO.*test' "$INSTALL_SH" | grep -v 'CARGO_TARGET' | head -1 | cut -d: -f1)
-INSTALL_LINE=$(grep -n 'cp.*INSTALL_DIR' "$INSTALL_SH" | head -1 | cut -d: -f1)
-if [ -n "$TEST_LINE" ] && [ -n "$INSTALL_LINE" ] && [ "$TEST_LINE" -lt "$INSTALL_LINE" ]; then
-    pass "tests run before install (line $TEST_LINE < $INSTALL_LINE)"
+# Tests are NOT run during install (they run in CI/prerelease)
+if grep -q 'cargo.*test' "$INSTALL_SH" 2>/dev/null; then
+    fail "install.sh should not run cargo test (tests belong in CI)"
 else
-    fail "tests should run BEFORE copying binaries to ~/.local/bin"
+    pass "install.sh does not run cargo test (handled by CI)"
 fi
 
 # CARGO_TARGET_DIR respected

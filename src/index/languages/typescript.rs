@@ -2,7 +2,8 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
-    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+    ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
+    ReferenceKind, RelationKind, SymbolKind,
 };
 
 pub struct TypeScriptSupport;
@@ -37,16 +38,104 @@ impl LanguageSupport for TypeScriptSupport {
             &mut imports,
             &mut references,
         );
+        let type_relations = extract_type_relations(root, source);
         ParseResult {
             symbols,
             imports,
             references,
+            type_relations,
         }
     }
 }
 
 fn children(node: Node) -> impl Iterator<Item = Node> {
     (0..node.child_count() as u32).filter_map(move |i| node.child(i))
+}
+
+fn extract_type_relations(node: Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    let mut relations = Vec::new();
+    collect_type_relations(node, source, &mut relations);
+    relations
+}
+
+fn collect_type_relations(node: Node, source: &[u8], out: &mut Vec<ExtractedRelation>) {
+    match node.kind() {
+        "class_declaration" | "abstract_class_declaration" => {
+            let class_name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or_default();
+            if !class_name.is_empty() {
+                collect_heritage(&class_name, node, source, out);
+            }
+        }
+        "export_statement" => {
+            for child in children(node) {
+                collect_type_relations(child, source, out);
+            }
+            return;
+        }
+        _ => {}
+    }
+    for child in children(node) {
+        collect_type_relations(child, source, out);
+    }
+}
+
+fn collect_heritage(
+    class_name: &str,
+    class_node: Node,
+    source: &[u8],
+    out: &mut Vec<ExtractedRelation>,
+) {
+    let line = class_node.start_position().row as u32 + 1;
+    for child in children(class_node) {
+        match child.kind() {
+            "extends_clause" => {
+                for type_child in children(child) {
+                    let name = extract_heritage_name(type_child, source);
+                    if !name.is_empty() {
+                        out.push(ExtractedRelation {
+                            sub_name: class_name.to_string(),
+                            super_name: name,
+                            kind: RelationKind::Extends,
+                            line,
+                        });
+                    }
+                }
+            }
+            "implements_clause" => {
+                for type_child in children(child) {
+                    let name = extract_heritage_name(type_child, source);
+                    if !name.is_empty() {
+                        out.push(ExtractedRelation {
+                            sub_name: class_name.to_string(),
+                            super_name: name,
+                            kind: RelationKind::Implements,
+                            line,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_heritage_name(node: Node, source: &[u8]) -> String {
+    match node.kind() {
+        "type_identifier" | "identifier" => node_text(node, source),
+        "generic_type" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        "member_expression" | "nested_type_identifier" => node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"))
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn extract_from_node(
@@ -146,6 +235,8 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -159,6 +250,8 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -181,6 +274,8 @@ fn record_reference(
                     line,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -407,6 +502,7 @@ fn extract_function_decl(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -426,6 +522,7 @@ fn extract_named_decl(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -450,6 +547,7 @@ fn extract_named_decl_by_field(
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -486,6 +584,7 @@ fn extract_class_methods(
                     parent_idx: None,
                     unused_excluded: false,
                     complexity,
+                    owner_type: None,
                 });
                 if let Some(method_body) = child.child_by_field_name("body") {
                     for grand in children(method_body) {
@@ -552,6 +651,7 @@ fn extract_variable_decl(node: Node, source: &[u8], symbols: &mut Vec<ExtractedS
             parent_idx: None,
             unused_excluded: false,
             complexity,
+            owner_type: None,
         });
     }
 }

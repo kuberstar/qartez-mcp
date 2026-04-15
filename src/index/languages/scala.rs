@@ -37,6 +37,7 @@ impl LanguageSupport for ScalaSupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -192,6 +193,7 @@ fn extract_named_decl(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -283,6 +285,7 @@ fn extract_val_var(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -303,6 +306,7 @@ fn extract_package(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: true,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -353,6 +357,8 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -372,6 +378,8 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Use,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -391,6 +399,8 @@ fn record_reference(
                     line,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }

@@ -1,8 +1,9 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ignore::gitignore::Gitignore;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
@@ -10,6 +11,8 @@ use tokio::sync::mpsc;
 use crate::graph;
 use crate::index;
 use crate::index::languages;
+
+const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
 
 /// Debounce window: events arriving within this interval after the first
 /// event in a batch are folded into the same re-index cycle.
@@ -91,11 +94,26 @@ impl Watcher {
     }
 }
 
+fn load_qartezignore(root: &Path) -> Gitignore {
+    let ignore_path = root.join(QARTEZIGNORE_FILENAME);
+    if ignore_path.exists() {
+        let (gi, err) = Gitignore::new(&ignore_path);
+        if let Some(e) = err {
+            tracing::warn!(path = %ignore_path.display(), error = %e, "partial parse of .qartezignore");
+        }
+        gi
+    } else {
+        Gitignore::empty()
+    }
+}
+
 fn start_notify_watcher(
     root: PathBuf,
     supported: HashSet<&'static str>,
     tx: mpsc::Sender<WatchBatch>,
 ) -> anyhow::Result<RecommendedWatcher> {
+    let qartezignore = load_qartezignore(&root);
+
     let mut watcher =
         notify::recommended_watcher(move |result: std::result::Result<Event, notify::Error>| {
             let event = match result {
@@ -122,6 +140,11 @@ fn start_notify_watcher(
                     p.extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|ext| supported.contains(ext))
+                })
+                .filter(|p| {
+                    !qartezignore
+                        .matched_path_or_any_parents(p, p.is_dir())
+                        .is_ignore()
                 })
                 .collect();
 

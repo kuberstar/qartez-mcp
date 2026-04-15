@@ -35,6 +35,9 @@ pub struct SymbolRow {
     /// Cyclomatic complexity. `None` for non-function symbols or languages
     /// without control-flow extraction.
     pub complexity: Option<u32>,
+    /// The type this method belongs to (e.g. "Foo" for `impl Foo { fn bar() }`).
+    /// `None` for free functions and top-level items.
+    pub owner_type: Option<String>,
 }
 
 /// Row in the `symbol_refs` table: one edge in the call / type / use graph
@@ -71,6 +74,8 @@ pub struct SymbolInsert {
     pub parent_idx: Option<usize>,
     /// Cyclomatic complexity for functions/methods.
     pub complexity: Option<u32>,
+    /// The type this method belongs to (from `impl Foo { fn bar() }`).
+    pub owner_type: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -87,4 +92,17 @@ pub struct CoChangeRow {
     pub file_a: i64,
     pub file_b: i64,
     pub count: i64,
+}
+
+/// Row in the `type_hierarchy` table: one type relationship edge
+/// (e.g. `impl Display for Foo`, `class Bar extends Baz`).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct TypeHierarchyRow {
+    pub id: i64,
+    pub file_id: i64,
+    pub sub_name: String,
+    pub super_name: String,
+    pub kind: String,
+    pub line: u32,
 }

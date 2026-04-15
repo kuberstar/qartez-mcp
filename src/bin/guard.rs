@@ -77,7 +77,10 @@ fn run() -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
 
-    if !matches!(hook.tool_name.as_str(), "Edit" | "Write" | "MultiEdit") {
+    if !matches!(
+        hook.tool_name.as_str(),
+        "Edit" | "Write" | "MultiEdit" | "replace" | "write_file"
+    ) {
         return Ok(());
     }
     let hook_cwd = hook.cwd.clone();
@@ -140,7 +143,7 @@ fn run() -> anyhow::Result<()> {
     let ack_fresh = guard::ack_is_fresh(&project_root, &rel_path, cfg.ack_ttl_secs);
     let decision = guard::evaluate(&facts, &cfg, ack_fresh);
 
-    if let Some(json) = guard::render_stdout(&decision) {
+    if let Some(json) = guard::render_stdout(&decision, hook.hook_event_name.as_deref()) {
         println!("{json}");
     }
     Ok(())

@@ -1,9 +1,8 @@
 [package]
 name = "qartez-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "MCP server for codebase intelligence — tree-sitter indexing, PageRank, blast radius"
-license = "LicenseRef-Qartez-Dual"
 license-file = "LICENSE"
 repository = "https://github.com/kuberstar/qartez-mcp"
 homepage = "https://qartez.dev"

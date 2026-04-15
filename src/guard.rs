@@ -87,15 +87,17 @@ impl GuardConfig {
     }
 }
 
-/// Shape of the PreToolUse hook payload Claude Code sends on stdin.
+/// Shape of the tool-use hook payload (compatible with Claude Code and Gemini CLI).
 /// Only the fields the guard actually uses are deserialized — unknown fields
-/// are ignored so a future Claude Code release adding keys doesn't break us.
+/// are ignored so future CLI releases adding keys don't break us.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
     pub tool_name: String,
     pub tool_input: ToolInput,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub hook_event_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +110,7 @@ pub struct ToolInput {
 pub enum GuardDecision {
     /// Let the edit proceed. The guard emits an empty response and exits 0.
     Allow,
-    /// Block the edit and surface `reason` to Claude via the PreToolUse
-    /// `permissionDecision: "deny"` JSON contract.
+    /// Block the edit and surface `reason` to the AI via the CLI's hook contract.
     Deny { reason: String },
 }
 
@@ -186,21 +187,31 @@ fn format_deny_reason(
     reason
 }
 
-/// Render a `GuardDecision` as the exact JSON Claude Code expects on stdout
-/// for a PreToolUse hook. `Allow` produces no output (the caller should just
-/// exit 0); `Deny` produces the `hookSpecificOutput` envelope.
-pub fn render_stdout(decision: &GuardDecision) -> Option<String> {
+/// Render a `GuardDecision` as the exact JSON the CLI expects on stdout.
+/// Handles both Claude Code (PreToolUse) and Gemini CLI (BeforeTool).
+/// `Allow` produces no output; `Deny` produces the appropriate hook envelope.
+pub fn render_stdout(decision: &GuardDecision, event_name: Option<&str>) -> Option<String> {
     match decision {
         GuardDecision::Allow => None,
         GuardDecision::Deny { reason } => {
-            let envelope = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            });
-            Some(envelope.to_string())
+            if event_name == Some("BeforeTool") {
+                // Gemini CLI format
+                let envelope = serde_json::json!({
+                    "decision": "deny",
+                    "reason": reason,
+                });
+                Some(envelope.to_string())
+            } else {
+                // Claude Code format (default)
+                let envelope = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                });
+                Some(envelope.to_string())
+            }
         }
     }
 }
@@ -410,14 +421,17 @@ mod tests {
 
     #[test]
     fn render_stdout_allow_is_empty() {
-        assert!(render_stdout(&GuardDecision::Allow).is_none());
+        assert!(render_stdout(&GuardDecision::Allow, None).is_none());
     }
 
     #[test]
-    fn render_stdout_deny_is_valid_json() {
-        let out = render_stdout(&GuardDecision::Deny {
-            reason: "test".to_string(),
-        })
+    fn render_stdout_deny_is_valid_json_claude() {
+        let out = render_stdout(
+            &GuardDecision::Deny {
+                reason: "test".to_string(),
+            },
+            Some("PreToolUse"),
+        )
         .expect("expected some JSON for deny");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
@@ -426,6 +440,20 @@ mod tests {
             parsed["hookSpecificOutput"]["permissionDecisionReason"],
             "test"
         );
+    }
+
+    #[test]
+    fn render_stdout_deny_is_valid_json_gemini() {
+        let out = render_stdout(
+            &GuardDecision::Deny {
+                reason: "test".to_string(),
+            },
+            Some("BeforeTool"),
+        )
+        .expect("expected some JSON for deny");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(parsed["reason"], "test");
     }
 
     #[test]

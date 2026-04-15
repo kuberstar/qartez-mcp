@@ -1,0 +1,32 @@
+<!-- qartez-mcp-instructions -->
+## Qartez MCP — MANDATORY Tool Priority
+
+When the `qartez` MCP server is available, you MUST use its tools INSTEAD OF built-in `glob`, `grep_search`, and `read_file` for codebase exploration. This is enforced by a BeforeTool hook — `glob` and `grep_search` will be DENIED when `.qartez/` exists.
+
+**Tool mapping (MUST follow):**
+
+| Instead of | MUST use | When |
+|---|---|---|
+| `glob` | `qartez_map` | Understanding project structure, finding files |
+| `grep_search` | `qartez_grep` | Searching for symbols, functions, types |
+| `grep_search` | `qartez_find` | Looking up specific symbol definitions |
+| `read_file` | `qartez_read` | Reading symbol source code with context |
+| — | `qartez_impact` | BEFORE modifying any heavily-imported file |
+| — | `qartez_cochange` | Understanding which files change together |
+| — | `qartez_unused` | Finding dead/unused code |
+| — | `qartez_refs` | Finding all references to a symbol |
+| — | `qartez_project` | Getting full project statistics |
+| — | `qartez_move` | Moving a symbol between files |
+| — | `qartez_rename` | Renaming a symbol across the codebase |
+| — | `qartez_rename_file` | Renaming a file and updating all imports |
+
+**Workflow:**
+1. `qartez_map` — understand project structure first
+2. `qartez_find` / `qartez_grep` — locate symbols
+3. `qartez_read` — read code with semantic context
+4. `qartez_impact` — check before modifying exports
+
+**Modification guard (ENFORCED):** A BeforeTool hook (`qartez-guard`) blocks `replace`/`write_file` on load-bearing files — those with PageRank ≥ 0.05 OR transitive blast radius ≥ 10. When blocked, the error tells you exactly which thresholds fired and which file to pass to `qartez_impact`. Calling `qartez_impact file_path=<the file>` acts as an acknowledgment: subsequent edits on that file are allowed for 10 minutes (one conversation turn). Override per-project with env vars `QARTEZ_GUARD_PAGERANK_MIN`, `QARTEZ_GUARD_BLAST_MIN`, `QARTEZ_GUARD_ACK_TTL_SECS`, or disable with `QARTEZ_GUARD_DISABLE=1`.
+
+**Fallback:** Use `glob`/`grep_search`/`read_file` ONLY for non-code content (config files, text search, file patterns that qartez cannot handle).
+<!-- /qartez-mcp-instructions -->

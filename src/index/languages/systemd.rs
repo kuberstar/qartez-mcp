@@ -96,6 +96,7 @@ impl LanguageSupport for SystemdSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
                 current_section_idx = Some(idx);
                 continue;
@@ -131,6 +132,7 @@ impl LanguageSupport for SystemdSupport {
                     parent_idx: current_section_idx,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -165,6 +167,7 @@ impl LanguageSupport for SystemdSupport {
             symbols,
             imports: Vec::new(),
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }

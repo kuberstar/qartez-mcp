@@ -26,6 +26,7 @@ impl LanguageSupport for NginxSupport {
             symbols,
             imports: Vec::new(),
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -87,6 +88,7 @@ fn extract_attribute(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
             // Recurse into the block for location blocks etc.
             extract_nodes(node, source, symbols);
@@ -108,6 +110,7 @@ fn extract_attribute(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbo
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
         }
@@ -137,6 +140,7 @@ fn extract_location(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     });
 
     // Recurse for nested locations

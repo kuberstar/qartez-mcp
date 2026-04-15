@@ -75,6 +75,7 @@ impl LanguageSupport for DockerfileSupport {
                         parent_idx: None,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 } else {
                     symbols.push(ExtractedSymbol {
@@ -87,6 +88,7 @@ impl LanguageSupport for DockerfileSupport {
                         parent_idx: None,
                         unused_excluded: false,
                         complexity: None,
+                        owner_type: None,
                     });
                 }
             } else if let Some(cap) = ARG_RE.captures(line) {
@@ -100,6 +102,7 @@ impl LanguageSupport for DockerfileSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = ENV_RE.captures(line) {
                 symbols.push(ExtractedSymbol {
@@ -112,6 +115,7 @@ impl LanguageSupport for DockerfileSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = EXPOSE_RE.captures(line) {
                 symbols.push(ExtractedSymbol {
@@ -124,6 +128,7 @@ impl LanguageSupport for DockerfileSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             } else if let Some(cap) = ENTRYPOINT_RE.captures(line) {
                 symbols.push(ExtractedSymbol {
@@ -136,6 +141,7 @@ impl LanguageSupport for DockerfileSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
 
@@ -148,6 +154,8 @@ impl LanguageSupport for DockerfileSupport {
                         line: line_num,
                         from_symbol_idx: None,
                         kind: ReferenceKind::Use,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
@@ -157,6 +165,7 @@ impl LanguageSupport for DockerfileSupport {
             symbols,
             imports: Vec::new(),
             references,
+            ..Default::default()
         }
     }
 }

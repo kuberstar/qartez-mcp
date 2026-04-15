@@ -234,48 +234,48 @@ impl QartezServer {
         Parameters(args): Parameters<SoulPreMergeArgs>,
     ) -> GetPromptResult {
         let files = split_files(&args.files);
-        let (file_list, plan) = if files.is_empty() {
-            (
-                "(no files supplied — ask the user or read `git diff --name-only`)".to_string(),
-                "1. If the caller did not provide any files, run `git diff --name-only` via Bash and feed the result back through this prompt.".to_string(),
-            )
+        let text = if files.is_empty() {
+            "Pre-merge safety check using Qartez.\n\
+             \n\
+             No files were specified. Run these steps:\n\
+             \n\
+             1. Call `qartez_diff_impact` with `base=\"main\"` (or the appropriate target branch) \
+             to get a unified impact report: changed files, union blast radius, convergence points, \
+             and co-change omissions in one call.\n\
+             2. Call `qartez_unused` (no arguments) to surface any exports that became dead after the change.\n\
+             \n\
+             Then return a merge-risk report:\n\
+             - total blast radius (union of direct importers across the changed files)\n\
+             - co-change partners that were NOT touched - suspicious omissions worth a sanity-check\n\
+             - exports that are now unused - candidates for deletion or a follow-up PR\n\
+             - a final ship / hold recommendation with a one-line justification"
+                .to_string()
         } else {
-            let listed = files
+            let file_list = files
                 .iter()
                 .map(|f| format!("- {f}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let steps = files
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    format!(
-                        "{step}. Call `qartez_impact` with `file_path=\"{f}\"` AND `qartez_cochange` with `file_path=\"{f}\"` to collect direct importers plus historical co-change partners.",
-                        step = i + 1,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (listed, steps)
+            format!(
+                "Pre-merge safety check for this change set using Qartez.\n\
+                 \n\
+                 Changed files:\n\
+                 {file_list}\n\
+                 \n\
+                 Run these steps:\n\
+                 \n\
+                 1. Call `qartez_diff_impact` with `base=\"main\"` (or the appropriate target branch). \
+                 This single call covers blast radius, convergence points, and co-change omissions \
+                 for all changed files.\n\
+                 2. Call `qartez_unused` (no arguments) to surface any exports that became dead after the change.\n\
+                 \n\
+                 Then return a merge-risk report:\n\
+                 - total blast radius (union of direct importers across the changed files)\n\
+                 - co-change partners that were NOT touched - suspicious omissions worth a sanity-check\n\
+                 - exports that are now unused - candidates for deletion or a follow-up PR\n\
+                 - a final ship / hold recommendation with a one-line justification"
+            )
         };
-        let final_step = files.len() + 1;
-        let text = format!(
-            "Pre-merge safety check for this change set using Qartez.\n\
-             \n\
-             Changed files:\n\
-             {file_list}\n\
-             \n\
-             Run these tools in order:\n\
-             \n\
-             {plan}\n\
-             {final_step}. Call `qartez_unused` (no arguments) to surface any exports that became dead after the change.\n\
-             \n\
-             Then return a merge-risk report:\n\
-             - total blast radius (union of direct importers across the changed files)\n\
-             - co-change partners that were NOT touched — suspicious omissions worth a sanity-check\n\
-             - exports that are now unused — candidates for deletion or a follow-up PR\n\
-             - a final ship / hold recommendation with a one-line justification"
-        );
         GetPromptResult::new(user_text(text))
             .with_description("Qartez pre-merge safety-check workflow".to_string())
     }

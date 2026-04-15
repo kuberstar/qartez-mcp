@@ -86,6 +86,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             // Local variable: `local varName = ...`
@@ -100,6 +101,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             // Hidden method: `fieldName(args):: value`
@@ -114,6 +116,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             // Hidden field: `fieldName:: value`
@@ -128,6 +131,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             // Visible object field: `fieldName: value`
@@ -142,6 +146,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
             // Top-level function: `function(args) { ... }`
@@ -156,6 +161,7 @@ impl LanguageSupport for JsonnetSupport {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 });
             }
 
@@ -180,6 +186,7 @@ impl LanguageSupport for JsonnetSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }

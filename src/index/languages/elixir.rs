@@ -28,6 +28,7 @@ impl LanguageSupport for ElixirSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -143,6 +144,7 @@ fn extract_defmodule(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -190,6 +192,7 @@ fn extract_def(node: Node, source: &[u8], is_exported: bool) -> Option<Extracted
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -207,6 +210,7 @@ fn extract_defstruct(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -254,6 +258,7 @@ fn extract_module_attribute(node: Node, source: &[u8]) -> Option<ExtractedSymbol
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

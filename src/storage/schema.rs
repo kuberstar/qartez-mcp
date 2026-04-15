@@ -127,6 +127,23 @@ const CREATE_IDX_FILE_CLUSTERS_CLUSTER: &str =
 
 const CREATE_IDX_SYMBOLS_SHAPE_HASH: &str = "CREATE INDEX IF NOT EXISTS idx_symbols_shape_hash ON symbols(shape_hash) WHERE shape_hash IS NOT NULL";
 
+const CREATE_TYPE_HIERARCHY: &str = "
+CREATE TABLE IF NOT EXISTS type_hierarchy (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    sub_name    TEXT    NOT NULL,
+    super_name  TEXT    NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'implements',
+    line        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(file_id, sub_name, super_name, kind)
+)";
+
+const CREATE_IDX_TYPE_HIERARCHY_SUB: &str =
+    "CREATE INDEX IF NOT EXISTS idx_type_hierarchy_sub ON type_hierarchy(sub_name)";
+
+const CREATE_IDX_TYPE_HIERARCHY_SUPER: &str =
+    "CREATE INDEX IF NOT EXISTS idx_type_hierarchy_super ON type_hierarchy(super_name)";
+
 pub fn create_schema(conn: &Connection) -> Result<()> {
     // Phase 1: create tables (IF NOT EXISTS). Idempotent on existing DBs.
     conn.execute_batch(
@@ -141,6 +158,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             CREATE_UNUSED_EXPORTS,
             CREATE_META,
             CREATE_FILE_CLUSTERS,
+            CREATE_TYPE_HIERARCHY,
         ]
         .join(";\n"),
     )?;
@@ -166,6 +184,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             CREATE_IDX_UNUSED_EXPORTS_FILE,
             CREATE_IDX_FILE_CLUSTERS_CLUSTER,
             CREATE_IDX_SYMBOLS_SHAPE_HASH,
+            CREATE_IDX_TYPE_HIERARCHY_SUB,
+            CREATE_IDX_TYPE_HIERARCHY_SUPER,
         ]
         .join(";\n"),
     )?;
@@ -209,6 +229,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Per-symbol cyclomatic complexity. NULL for non-function symbols or
     // languages that do not extract control-flow information.
     try_add_column(conn, "ALTER TABLE symbols ADD COLUMN complexity INTEGER")?;
+    // Owner type for methods extracted from `impl Foo { fn bar() }` blocks.
+    // NULL for free functions and top-level items.
+    try_add_column(conn, "ALTER TABLE symbols ADD COLUMN owner_type TEXT")?;
     // Per-file git change count — how many commits touched this file within
     // the configured analysis window. Defaults to 0 for non-git repos or
     // files that appear only in the working tree.

@@ -13,105 +13,24 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 
+mod cache;
+mod helpers;
+mod overview;
+mod params;
 mod prompts;
+mod treesitter;
+
+use cache::ParseCache;
+use helpers::*;
+use params::*;
+use treesitter::*;
+
 use rusqlite::Connection;
-use schemars::JsonSchema;
-use serde::Deserialize;
 
 use crate::graph::blast;
 use crate::guard;
-use crate::index::languages;
 use crate::storage::read;
 use crate::toolchain;
-
-/// Tolerant deserializers for MCP tool parameters.
-///
-/// Some MCP clients (notably Claude Code as of 2026-04) serialize numeric
-/// and boolean tool arguments as JSON strings before forwarding them over
-/// the JSON-RPC bridge — e.g. `{"limit":"30"}` instead of `{"limit":30}`.
-/// Strict serde then rejects the string where a `u32` or `bool` is expected,
-/// which surfaces to the user as a cryptic `invalid type: string "30"` error.
-///
-/// These helpers accept either the native JSON form or the stringified form
-/// and produce the same value. `schemars` still emits `{"type":"integer"}`
-/// / `{"type":"boolean"}` in the tool schema, so well-behaved clients are
-/// unaffected.
-mod flexible {
-    use serde::{Deserialize, Deserializer, de::Error};
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum U32OrStr {
-        Num(u32),
-        Str(String),
-    }
-
-    pub(super) fn u32_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
-        match Option::<U32OrStr>::deserialize(d)? {
-            None => Ok(None),
-            Some(U32OrStr::Num(n)) => Ok(Some(n)),
-            Some(U32OrStr::Str(s)) => s
-                .parse::<u32>()
-                .map(Some)
-                .map_err(|e| D::Error::custom(format!("expected u32, got \"{s}\": {e}"))),
-        }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrStr {
-        Bool(bool),
-        Str(String),
-    }
-
-    pub(super) fn bool_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
-        match Option::<BoolOrStr>::deserialize(d)? {
-            None => Ok(None),
-            Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
-            Some(BoolOrStr::Str(s)) => match s.as_str() {
-                "true" | "True" | "TRUE" | "1" => Ok(Some(true)),
-                "false" | "False" | "FALSE" | "0" => Ok(Some(false)),
-                _ => Err(D::Error::custom(format!("expected bool, got \"{s}\""))),
-            },
-        }
-    }
-}
-
-/// Per-file tree-sitter parse cache, keyed by relative path. Each entry is
-/// mtime-stamped so a stale file triggers reparse on next access.
-///
-/// Why: `qartez_rename` and `qartez_calls` both walk tree-sitter ASTs of large
-/// files (e.g. `src/server/mod.rs`, ~2300 lines of Rust). A cold parse of
-/// that file runs in the 3-6 ms range, and walking it for call names is
-/// another ~0.5 ms. On repeated invocations (benchmark warmup + measured
-/// runs, multi-file renames that revisit the definition file, depth-2 call
-/// hierarchies), those costs dominate. Caching source / tree / call sites
-/// turns the steady-state cost into a HashMap lookup plus a shallow clone
-/// of `Arc` handles.
-///
-/// Fields are populated lazily: a caller that only needs the raw source
-/// (e.g. the text prefilter in `qartez_calls`) does not pay the parse cost,
-/// and a caller that needs pre-extracted call sites gets them walked once
-/// per file lifetime.
-#[derive(Default)]
-struct ParseCache {
-    entries: HashMap<String, ParseEntry>,
-}
-
-/// Per-file identifier map keyed by identifier text. Each occurrence is
-/// `(row, start_byte, end_byte)`.
-type IdentMap = HashMap<String, Vec<(usize, usize, usize)>>;
-
-#[derive(Default)]
-struct ParseEntry {
-    mtime_ns: i64,
-    source: Option<Arc<String>>,
-    tree: Option<Arc<tree_sitter::Tree>>,
-    calls: Option<Arc<Vec<(String, usize)>>>,
-    /// Full name→occurrences map built from a single AST walk. Used by
-    /// `qartez_rename` to skip the per-name walk on repeat invocations.
-    idents: Option<Arc<IdentMap>>,
-}
 
 #[derive(Clone)]
 pub struct QartezServer {
@@ -158,6 +77,44 @@ impl QartezServer {
         }
     }
 
+    /// Resolve a user-supplied relative path against the project root,
+    /// rejecting absolute paths and directory traversal beyond the root.
+    ///
+    /// Returns the joined absolute path on success. Returns an error if
+    /// the path is absolute or if `..` components would escape the
+    /// project root.
+    fn safe_resolve(&self, user_path: &str) -> Result<PathBuf, String> {
+        let path = std::path::Path::new(user_path);
+        if path.is_absolute() {
+            return Err(format!(
+                "Path '{}' must be relative to the project root",
+                user_path
+            ));
+        }
+        let mut depth: isize = 0;
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(format!("Path '{}' escapes the project root", user_path));
+                    }
+                }
+                std::path::Component::Normal(_) => {
+                    depth += 1;
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "Path '{}' must be relative to the project root",
+                        user_path
+                    ));
+                }
+            }
+        }
+        Ok(self.project_root.join(user_path))
+    }
+
     /// Acquire the server's shared SQLite connection under its mutex.
     ///
     /// Added for the benchmark harness's grounding verifier (slice B of
@@ -179,706 +136,6 @@ impl QartezServer {
     pub fn db_arc(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.db)
     }
-
-    /// Read a file's mtime in nanoseconds, or `None` if the file is missing
-    /// or the filesystem does not expose a modification time.
-    fn file_mtime_ns(&self, rel_path: &str) -> Option<i64> {
-        let abs_path = self.project_root.join(rel_path);
-        std::fs::metadata(&abs_path)
-            .ok()?
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| i64::try_from(d.as_nanos()).unwrap_or(0))
-    }
-
-    /// Return the cached source for `rel_path`, reading and caching it on
-    /// the first miss. Returns `None` only when the file cannot be read.
-    ///
-    /// Used by the `qartez_calls` callers-loop prefilter: reading is cheap,
-    /// parsing is not, so we check whether the identifier is textually
-    /// present before committing to a parse.
-    fn cached_source(&self, rel_path: &str) -> Option<Arc<String>> {
-        let mtime_ns = self.file_mtime_ns(rel_path)?;
-        if let Ok(cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get(rel_path)
-            && entry.mtime_ns == mtime_ns
-            && let Some(src) = &entry.source
-        {
-            return Some(src.clone());
-        }
-
-        let abs_path = self.project_root.join(rel_path);
-        let raw = std::fs::read_to_string(&abs_path).ok()?;
-        let arc = Arc::new(raw);
-
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            let entry = cache.entries.entry(rel_path.to_string()).or_default();
-            if entry.mtime_ns != mtime_ns {
-                // File changed since the last cached extract — drop stale
-                // per-file artifacts and re-key the entry.
-                *entry = ParseEntry::default();
-                entry.mtime_ns = mtime_ns;
-            }
-            entry.source = Some(arc.clone());
-        }
-        Some(arc)
-    }
-
-    /// Return a parsed tree-sitter tree for `rel_path`, along with its
-    /// source bytes. Parses on first miss, returns from cache on subsequent
-    /// calls with matching mtime.
-    ///
-    /// Returns `None` when the file cannot be read, the extension has no
-    /// language support, or the parse itself fails. Callers must fall back
-    /// to non-AST paths in those cases.
-    fn cached_tree(&self, rel_path: &str) -> Option<(Arc<String>, Arc<tree_sitter::Tree>)> {
-        let mtime_ns = self.file_mtime_ns(rel_path)?;
-        if let Ok(cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get(rel_path)
-            && entry.mtime_ns == mtime_ns
-            && let (Some(src), Some(tree)) = (&entry.source, &entry.tree)
-        {
-            return Some((src.clone(), tree.clone()));
-        }
-
-        let source_arc = self.cached_source(rel_path)?;
-        let ext = rel_path.rsplit('.').next().unwrap_or("");
-        let lang_support = languages::get_language_for_ext(ext)?;
-        let ts_lang = lang_support.tree_sitter_language(ext);
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&ts_lang).ok()?;
-        let tree = parser.parse(source_arc.as_bytes(), None)?;
-        let tree_arc = Arc::new(tree);
-
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            let entry = cache.entries.entry(rel_path.to_string()).or_default();
-            if entry.mtime_ns != mtime_ns {
-                *entry = ParseEntry::default();
-                entry.mtime_ns = mtime_ns;
-                entry.source = Some(source_arc.clone());
-            }
-            entry.tree = Some(tree_arc.clone());
-        }
-        Some((source_arc, tree_arc))
-    }
-
-    /// Return the per-file identifier map for `rel_path`, keyed by
-    /// identifier text. Walks the cached tree exactly once per file
-    /// mtime; subsequent lookups (any name, any tool) are just a
-    /// `HashMap::get`.
-    ///
-    /// Returns `None` when the file cannot be parsed (unsupported
-    /// language or read error). Callers must fall back to a word-boundary
-    /// scan in that case.
-    fn cached_idents(&self, rel_path: &str) -> Option<Arc<IdentMap>> {
-        let mtime_ns = self.file_mtime_ns(rel_path)?;
-        if let Ok(cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get(rel_path)
-            && entry.mtime_ns == mtime_ns
-            && let Some(idents) = &entry.idents
-        {
-            return Some(idents.clone());
-        }
-
-        let (source_arc, tree_arc) = self.cached_tree(rel_path)?;
-        let mut map: IdentMap = HashMap::new();
-        collect_identifiers_grouped(&mut tree_arc.walk(), source_arc.as_bytes(), &mut map);
-        let arc = Arc::new(map);
-
-        if let Ok(mut cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get_mut(rel_path)
-        {
-            entry.idents = Some(arc.clone());
-        }
-        Some(arc)
-    }
-
-    /// Return the pre-extracted call sites for `rel_path`. Walks the cached
-    /// tree on first miss, returns the cached vector on subsequent calls.
-    /// Returns an empty vector when the file cannot be parsed.
-    fn cached_calls(&self, rel_path: &str) -> Arc<Vec<(String, usize)>> {
-        if let Some(mtime_ns) = self.file_mtime_ns(rel_path)
-            && let Ok(cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get(rel_path)
-            && entry.mtime_ns == mtime_ns
-            && let Some(calls) = &entry.calls
-        {
-            return calls.clone();
-        }
-
-        let Some((source_arc, tree_arc)) = self.cached_tree(rel_path) else {
-            return Arc::new(Vec::new());
-        };
-        let mut results = Vec::new();
-        collect_call_names(&mut tree_arc.walk(), source_arc.as_bytes(), &mut results);
-        let arc = Arc::new(results);
-
-        if let Ok(mut cache) = self.parse_cache.lock()
-            && let Some(entry) = cache.entries.get_mut(rel_path)
-        {
-            entry.calls = Some(arc.clone());
-        }
-        arc
-    }
-
-    fn project_name(&self) -> String {
-        self.project_root
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .or_else(|| {
-                self.project_root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-
-    /// Render a symbol-centric overview: top symbols by symbol-level
-    /// PageRank, grouped by their defining file. Invoked from `qartez_map`
-    /// when the caller passes `by=symbols`. Designed to be a drop-in
-    /// replacement for the file-ranked overview on the same token budget,
-    /// so the output structure intentionally mirrors `build_overview`'s
-    /// header/table shape.
-    fn build_symbol_overview(&self, top_n: i64, token_budget: usize, concise: bool) -> String {
-        let conn = match self.db.lock() {
-            Ok(c) => c,
-            Err(e) => return format!("DB lock error: {e}"),
-        };
-        let file_count = read::get_file_count(&conn).unwrap_or(0);
-        let symbol_count = read::get_symbol_count(&conn).unwrap_or(0);
-        let effective_limit = if top_n == i64::MAX { 1000 } else { top_n };
-
-        let symbols = match read::get_symbols_ranked(&conn, effective_limit) {
-            Ok(s) => s,
-            Err(e) => return format!("Error reading symbols: {e}"),
-        };
-
-        // If the symbol PageRank column is entirely zero (legacy DB, or no
-        // symbol_refs were extracted for this language), fall back to the
-        // file-ranked view with a short explanatory note rather than
-        // returning a section of zero-rank junk.
-        let any_nonzero = symbols.iter().any(|(s, _)| s.pagerank > 0.0);
-        if !any_nonzero {
-            let mut out = String::from(
-                "# Symbol PageRank unavailable\n\
-                 No symbol-level PageRank data in the index. This is expected for \
-                 languages without a reference extractor yet (see docs) or DBs that \
-                 predate symbol PageRank. Falling back to file ranking.\n\n",
-            );
-            out.push_str(&self.build_overview(top_n, token_budget, None, None, concise, false));
-            return out;
-        }
-
-        let mut out = String::new();
-        if concise {
-            out.push_str(&format!(
-                "{} files, {} symbols (rank name kind file PR)\n",
-                file_count, symbol_count,
-            ));
-        } else {
-            out.push_str(&format!(
-                "# Codebase: {} ({} files, {} symbols indexed) — by symbols\n\n",
-                self.project_name(),
-                file_count,
-                symbol_count,
-            ));
-            out.push_str(" # | Symbol                         | Kind       | File                               | PageRank\n");
-            out.push_str("---+--------------------------------+------------+------------------------------------+---------\n");
-        }
-
-        for (i, (sym, file)) in symbols.iter().enumerate() {
-            if sym.pagerank <= 0.0 {
-                // Skip the trailing tail of unranked symbols — they carry no
-                // signal and only bloat the output.
-                break;
-            }
-            let line = if concise {
-                format!(
-                    "{} {} {} {} {:.4}\n",
-                    i + 1,
-                    sym.name,
-                    sym.kind,
-                    file.path,
-                    sym.pagerank,
-                )
-            } else {
-                format!(
-                    "{:>2} | {:<30} | {:<10} | {:<34} | {:>8.4}\n",
-                    i + 1,
-                    truncate_path(&sym.name, 30),
-                    truncate_path(&sym.kind, 10),
-                    truncate_path(&file.path, 34),
-                    sym.pagerank,
-                )
-            };
-            if estimate_tokens(&out) + estimate_tokens(&line) > token_budget {
-                break;
-            }
-            out.push_str(&line);
-        }
-
-        out
-    }
-
-    fn build_overview(
-        &self,
-        top_n: i64,
-        token_budget: usize,
-        boost_files: Option<&[String]>,
-        boost_terms: Option<&[String]>,
-        concise: bool,
-        all_files: bool,
-    ) -> String {
-        let conn = match self.db.lock() {
-            Ok(c) => c,
-            Err(e) => return format!("DB lock error: {e}"),
-        };
-        let file_count = read::get_file_count(&conn).unwrap_or(0);
-        let symbol_count = read::get_symbol_count(&conn).unwrap_or(0);
-
-        let has_boosts = boost_files.is_some() || boost_terms.is_some();
-        let fetch_limit = if has_boosts {
-            top_n.saturating_mul(3)
-        } else {
-            top_n
-        };
-
-        let mut files = if all_files {
-            match read::get_all_files_ranked(&conn) {
-                Ok(f) => f,
-                Err(e) => return format!("Error reading files: {e}"),
-            }
-        } else {
-            match read::get_files_ranked(&conn, fetch_limit) {
-                Ok(f) => f,
-                Err(e) => return format!("Error reading files: {e}"),
-            }
-        };
-
-        if !all_files && has_boosts {
-            let mut boosted_ids: HashSet<i64> = HashSet::new();
-
-            if let Some(paths) = boost_files {
-                for file in &files {
-                    for bp in paths {
-                        if file.path.contains(bp.as_str()) {
-                            boosted_ids.insert(file.id);
-                        }
-                    }
-                }
-            }
-
-            if let Some(terms) = boost_terms {
-                for term in terms {
-                    let fts_query = if term.contains('*') {
-                        term.clone()
-                    } else {
-                        format!("{term}*")
-                    };
-                    if let Ok(ids) = read::search_file_ids_by_fts(&conn, &fts_query) {
-                        for id in ids {
-                            boosted_ids.insert(id);
-                        }
-                    }
-                }
-            }
-
-            if !boosted_ids.is_empty() {
-                for file in &mut files {
-                    if boosted_ids.contains(&file.id) {
-                        file.pagerank *= 10.0;
-                    }
-                }
-                files.sort_by(|a, b| {
-                    b.pagerank
-                        .partial_cmp(&a.pagerank)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-
-            files.truncate(top_n as usize);
-        }
-
-        let visible_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
-        let blast_radii = blast::blast_radius_for_files(&conn, &visible_ids).unwrap_or_default();
-
-        let mut out = String::new();
-        if concise {
-            // Terse header: no project name, no ASCII table framing. Columns are
-            // positional — rank, path, pagerank, exports, blast radius — and
-            // labeled once in the hint so callers know the schema without
-            // paying per-row framing bytes. The arrow on the blast column is
-            // read as "this file ripples out to N files downstream".
-            out.push_str(&format!(
-                "{} files, {} symbols (rank path PR exp →blast)\n",
-                file_count, symbol_count,
-            ));
-        } else {
-            out.push_str(&format!(
-                "# Codebase: {} ({} files, {} symbols indexed)\n\n",
-                self.project_name(),
-                file_count,
-                symbol_count,
-            ));
-            out.push_str(" # | File                                | PageRank | Exports | Blast\n");
-            out.push_str("---+-------------------------------------+----------+---------+------\n");
-        }
-
-        let mut file_symbols: Vec<(String, Vec<crate::storage::models::SymbolRow>)> = Vec::new();
-
-        for (i, file) in files.iter().enumerate() {
-            let symbols = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
-            let export_count = symbols.iter().filter(|s| s.is_exported).count();
-            let blast_r = blast_radii.get(&file.id).copied().unwrap_or(0);
-
-            let line = if concise {
-                format!(
-                    "{} {} {:.3} {} →{}\n",
-                    i + 1,
-                    file.path,
-                    file.pagerank,
-                    export_count,
-                    blast_r,
-                )
-            } else {
-                format!(
-                    "{:>2} | {:<35} | {:>8.4} | {:>7} | →{}\n",
-                    i + 1,
-                    truncate_path(&file.path, 35),
-                    file.pagerank,
-                    export_count,
-                    blast_r,
-                )
-            };
-
-            if estimate_tokens(&out) + estimate_tokens(&line) > token_budget {
-                break;
-            }
-            out.push_str(&line);
-            file_symbols.push((file.path.clone(), symbols));
-        }
-
-        if !concise {
-            out.push('\n');
-        }
-
-        if !concise {
-            for (path, symbols) in &file_symbols {
-                let exported: Vec<&crate::storage::models::SymbolRow> =
-                    symbols.iter().filter(|s| s.is_exported).collect();
-                if exported.is_empty() {
-                    continue;
-                }
-
-                let section_header = format!("## {path}\n");
-                if estimate_tokens(&out) + estimate_tokens(&section_header) > token_budget {
-                    break;
-                }
-                out.push_str(&section_header);
-
-                let remaining = token_budget.saturating_sub(estimate_tokens(&out));
-                if let Some(elided) =
-                    elide_file_source(&self.project_root, path, symbols, remaining)
-                {
-                    out.push_str(&elided);
-                } else {
-                    for sym in &exported {
-                        let fallback = format!("{} {}", sym.kind, sym.name);
-                        let sig = sym.signature.as_deref().unwrap_or(&fallback);
-                        let line = format!("  + {sig}\n");
-                        if estimate_tokens(&out) + estimate_tokens(&line) > token_budget {
-                            break;
-                        }
-                        out.push_str(&line);
-                    }
-                }
-                out.push('\n');
-            }
-        }
-
-        out
-    }
-}
-
-fn elide_file_source(
-    project_root: &std::path::Path,
-    file_path: &str,
-    symbols: &[crate::storage::models::SymbolRow],
-    token_budget_remaining: usize,
-) -> Option<String> {
-    let abs_path = project_root.join(file_path);
-    let source = std::fs::read_to_string(&abs_path).ok()?;
-    let lines: Vec<&str> = source.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut sorted: Vec<&crate::storage::models::SymbolRow> =
-        symbols.iter().filter(|s| s.is_exported).collect();
-    if sorted.is_empty() {
-        return None;
-    }
-    sorted.sort_by_key(|s| s.line_start);
-
-    let mut out = String::new();
-    let mut last_shown_line: usize = 0;
-
-    for sym in &sorted {
-        let start = (sym.line_start as usize).saturating_sub(1);
-        let end = (sym.line_end as usize).min(lines.len());
-        if start >= lines.len() || start >= end {
-            continue;
-        }
-
-        if start > last_shown_line + 1 {
-            out.push_str("⋯\n");
-        }
-
-        let body_kinds = ["function", "method", "constructor"];
-        if body_kinds.contains(&sym.kind.as_str()) {
-            let sym_text: String = lines[start..end].join("\n");
-            if let Some(brace_pos) = sym_text.find('{') {
-                let before = sym_text[..brace_pos].trim_end();
-                out.push_str(before);
-                out.push_str(" {⋯}\n");
-            } else {
-                out.push_str(lines[start]);
-                out.push_str(" {⋯}\n");
-            }
-        } else {
-            let span = end - start;
-            if span <= 5 {
-                for line in &lines[start..end] {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            } else {
-                for line in &lines[start..(start + 2).min(end)] {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-                out.push_str("    ⋯\n");
-                if end > 0 {
-                    out.push_str(lines[end - 1]);
-                    out.push('\n');
-                }
-            }
-        }
-
-        last_shown_line = end;
-
-        if estimate_tokens(&out) > token_budget_remaining {
-            out.push_str("⋯\n");
-            break;
-        }
-    }
-
-    if !out.is_empty() { Some(out) } else { None }
-}
-
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        path.to_string()
-    } else if max_len <= 3 {
-        path[..path.floor_char_boundary(max_len)].to_string()
-    } else {
-        let start = path.floor_char_boundary(path.len() - (max_len - 3));
-        format!("...{}", &path[start..])
-    }
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
-}
-
-fn human_bytes(bytes: i64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let n = bytes as f64;
-    if n >= GB {
-        format!("{:.1}G", n / GB)
-    } else if n >= MB {
-        format!("{:.1}M", n / MB)
-    } else if n >= KB {
-        format!("{:.1}K", n / KB)
-    } else {
-        format!("{bytes}B")
-    }
-}
-
-/// Per-signal contribution to a `qartez_context` candidate score. Kept as a
-/// separate struct (rather than a flat f64) so `explain=true` can print the
-/// breakdown and callers can reason about why a given file ranked where it did.
-#[derive(Debug, Default, Clone)]
-struct ScoreBreakdown {
-    imports: f64,
-    importer: f64,
-    cochange: f64,
-    transitive: f64,
-    task_match: f64,
-}
-
-impl ScoreBreakdown {
-    fn total(&self) -> f64 {
-        self.imports + self.importer + self.cochange + self.transitive + self.task_match
-    }
-
-    fn reasons(&self) -> Vec<&'static str> {
-        let mut r = Vec::new();
-        if self.imports > 0.0 {
-            r.push("imports");
-        }
-        if self.importer > 0.0 {
-            r.push("importer");
-        }
-        if self.cochange > 0.0 {
-            r.push("cochange");
-        }
-        if self.transitive > 0.0 {
-            r.push("transitive");
-        }
-        if self.task_match > 0.0 {
-            r.push("task-match");
-        }
-        r
-    }
-
-    fn explain(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if self.imports > 0.0 {
-            parts.push(format!("imports={:.1}", self.imports));
-        }
-        if self.importer > 0.0 {
-            parts.push(format!("importer={:.1}", self.importer));
-        }
-        if self.cochange > 0.0 {
-            parts.push(format!("cochange={:.1}", self.cochange));
-        }
-        if self.transitive > 0.0 {
-            parts.push(format!("transitive={:.1}", self.transitive));
-        }
-        if self.task_match > 0.0 {
-            parts.push(format!("task-match={:.1}", self.task_match));
-        }
-        parts.join(" + ")
-    }
-}
-
-fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(old) {
-        let abs_pos = start + pos;
-        let before_ok = if abs_pos == 0 {
-            true
-        } else {
-            let ch = text[..abs_pos].chars().next_back().unwrap();
-            !ch.is_alphanumeric() && ch != '_'
-        };
-        let after_pos = abs_pos + old.len();
-        let after_ok = if after_pos >= text.len() {
-            true
-        } else {
-            let ch = text[after_pos..].chars().next().unwrap();
-            !ch.is_alphanumeric() && ch != '_'
-        };
-
-        if before_ok && after_ok {
-            result.push_str(&text[start..abs_pos]);
-            result.push_str(new);
-        } else {
-            result.push_str(&text[start..abs_pos + old.len()]);
-        }
-        start = after_pos;
-    }
-    result.push_str(&text[start..]);
-    result
-}
-
-const IDENTIFIER_NODE_KINDS: &[&str] = &[
-    "identifier",
-    "type_identifier",
-    "field_identifier",
-    "property_identifier",
-    "simple_identifier",
-    "shorthand_property_identifier_pattern",
-    "shorthand_property_identifier",
-];
-
-/// Walk the tree once and group every identifier occurrence by its source
-/// text. Used to populate the cross-invocation identifier cache so later
-/// `qartez_rename` calls turn into O(1) HashMap lookups.
-fn collect_identifiers_grouped(
-    cursor: &mut tree_sitter::TreeCursor,
-    source: &[u8],
-    results: &mut IdentMap,
-) {
-    loop {
-        let node = cursor.node();
-        if IDENTIFIER_NODE_KINDS.contains(&node.kind())
-            && let Ok(text) = node.utf8_text(source)
-        {
-            let line = node.start_position().row + 1;
-            results.entry(text.to_string()).or_default().push((
-                line,
-                node.start_byte(),
-                node.end_byte(),
-            ));
-        }
-
-        if cursor.goto_first_child() {
-            collect_identifiers_grouped(cursor, source, results);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-/// Output verbosity for query tools. Encoded as a proper JSON Schema enum so
-/// clients see the allowed values at tool-listing time instead of having to
-/// try-and-fail on a free-form string.
-#[derive(Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum Format {
-    #[default]
-    Detailed,
-    Concise,
-}
-
-/// Toolchain command selector for `qartez_project`. `Info` is the default so a
-/// caller can probe the detected toolchain with a bare `qartez_project({})`.
-#[derive(Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum ProjectAction {
-    #[default]
-    Info,
-    Run,
-    Test,
-    Build,
-    Lint,
-    Typecheck,
-}
-
-/// Call hierarchy direction for `qartez_calls`. `Both` is the default because it
-/// is the most useful on a cold exploration.
-#[derive(Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum CallDirection {
-    Callers,
-    Callees,
-    #[default]
-    Both,
-}
-
-fn is_concise(format: &Option<Format>) -> bool {
-    matches!(format, Some(Format::Concise))
 }
 
 /// Convert a user-supplied string into an FTS5-safe query.
@@ -886,566 +143,6 @@ fn is_concise(format: &Option<Format>) -> bool {
 /// FTS5 treats `#`, `(`, `)`, `:`, `^`, `"`, `[`, `]`, and `{`, `}` as syntax
 /// and rejects them in bareword queries — so a caller asking for `#[tool` or
 use crate::storage::read::sanitize_fts_query;
-
-/// Walk up to `commit_limit` recent commits from HEAD, count co-change pairs
-/// involving `target_path`, and return the top `limit` partners descending.
-///
-/// Commits touching more than `max_commit_size` files are skipped — they are
-/// typically format passes, bulk renames, or lockfile bumps whose pair counts
-/// drown the signal from real feature work.
-///
-/// Returns `None` only when git is unavailable in `project_root`.
-fn compute_cochange_pairs(
-    project_root: &std::path::Path,
-    target_path: &str,
-    max_commit_size: usize,
-    commit_limit: usize,
-    limit: usize,
-) -> Option<Vec<(String, u32)>> {
-    let repo = git2::Repository::open(project_root).ok()?;
-    let head_oid = repo.head().ok()?.target()?;
-    let mut revwalk = repo.revwalk().ok()?;
-    revwalk.set_sorting(git2::Sort::TIME).ok()?;
-    revwalk.push(head_oid).ok()?;
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for oid_result in revwalk.take(commit_limit) {
-        let Ok(oid) = oid_result else { continue };
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
-        };
-        let Ok(tree) = commit.tree() else { continue };
-        let parent_tree = if commit.parent_count() > 0 {
-            commit.parent(0).ok().and_then(|p| p.tree().ok())
-        } else {
-            None
-        };
-        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
-            continue;
-        };
-        let mut files: Vec<String> = diff
-            .deltas()
-            .filter_map(|d| {
-                d.new_file()
-                    .path()
-                    .and_then(|p| p.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        files.sort();
-        files.dedup();
-        if files.len() < 2 || files.len() > max_commit_size {
-            continue;
-        }
-        if !files.iter().any(|f| f == target_path) {
-            continue;
-        }
-        for f in &files {
-            if f != target_path {
-                *counts.entry(f.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let mut pairs: Vec<(String, u32)> = counts.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    pairs.truncate(limit);
-    Some(pairs)
-}
-
-/// Heuristic: return true for paths that look like test files (so they can be
-/// excluded from blast radius and aggregate counts by default). Covers common
-/// conventions across Rust, Go, TypeScript/JavaScript, Python, Java, and Ruby.
-fn is_test_path(path: &str) -> bool {
-    // Directory-based patterns (all languages)
-    if path.starts_with("tests/")
-        || path.starts_with("benches/")
-        || path.starts_with("__tests__/")
-        || path.starts_with("spec/")
-    {
-        return true;
-    }
-    if path.contains("/tests/")
-        || path.contains("/benches/")
-        || path.contains("/__tests__/")
-        || path.contains("/spec/")
-    {
-        return true;
-    }
-    if let Some(name) = path.rsplit('/').next() {
-        // Rust: test.rs, tests.rs, _test.rs, _tests.rs
-        if matches!(name, "test.rs" | "tests.rs") {
-            return true;
-        }
-        if name.ends_with("_test.rs") || name.ends_with("_tests.rs") {
-            return true;
-        }
-        // Go: _test.go
-        if name.ends_with("_test.go") {
-            return true;
-        }
-        // TypeScript/JavaScript: .test.ts, .spec.ts, .test.tsx, .spec.tsx,
-        //                        .test.js, .spec.js, .test.jsx, .spec.jsx
-        if name.ends_with(".test.ts")
-            || name.ends_with(".spec.ts")
-            || name.ends_with(".test.tsx")
-            || name.ends_with(".spec.tsx")
-            || name.ends_with(".test.js")
-            || name.ends_with(".spec.js")
-            || name.ends_with(".test.jsx")
-            || name.ends_with(".spec.jsx")
-        {
-            return true;
-        }
-        // Python: test_*.py, *_test.py
-        if (name.starts_with("test_") && name.ends_with(".py")) || name.ends_with("_test.py") {
-            return true;
-        }
-        // Java/Kotlin: *Test.java, *Tests.java, *Test.kt, *Tests.kt
-        if name.ends_with("Test.java")
-            || name.ends_with("Tests.java")
-            || name.ends_with("Test.kt")
-            || name.ends_with("Tests.kt")
-        {
-            return true;
-        }
-        // Ruby: _spec.rb
-        if name.ends_with("_spec.rb") {
-            return true;
-        }
-        // C#: *Tests.cs, *Test.cs
-        if name.ends_with("Test.cs") || name.ends_with("Tests.cs") {
-            return true;
-        }
-    }
-    false
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct QartezParams {
-    #[schemars(
-        description = "Number of top files to show (default: 20). Pass 0 or set all_files=true to return every file PageRank-sorted."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    top_n: Option<u32>,
-    #[schemars(
-        description = "If true, return all files sorted by PageRank (ignores top_n). Watch for token-budget truncation on large repos."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    all_files: Option<bool>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-    #[schemars(
-        description = "File paths to boost in ranking (e.g., recently edited or mentioned files)"
-    )]
-    boost_files: Option<Vec<String>>,
-    #[schemars(description = "Search terms to boost files containing matching symbols")]
-    boost_terms: Option<Vec<String>>,
-    #[schemars(
-        description = "'concise' = file list only, 'detailed' (default) = files + exported symbols"
-    )]
-    format: Option<Format>,
-    #[schemars(
-        description = "Ranking axis: 'files' (default) shows top files by PageRank; 'symbols' shows top symbols by symbol-level PageRank + their defining file."
-    )]
-    by: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulFindParams {
-    #[schemars(
-        description = "Exact symbol name to search for (or regex when regex=true). Accepts aliases `symbol`, `symbol_name`, and `query`."
-    )]
-    #[serde(alias = "symbol", alias = "symbol_name", alias = "query")]
-    name: String,
-    #[schemars(description = "Filter by symbol kind (function, struct, class, etc.)")]
-    kind: Option<String>,
-    #[schemars(
-        description = "'concise' = name + file only, 'detailed' (default) = full info with signatures"
-    )]
-    format: Option<Format>,
-    #[schemars(
-        description = "If true, interpret `name` as a regex applied to indexed symbol names (anchored match semantics: `is_match`). Default false (exact)."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    regex: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulReadParams {
-    #[schemars(
-        description = "Name of a single symbol to read. For batch reads, use `symbols` instead. Accepts the aliases `symbol` and `name`."
-    )]
-    #[serde(alias = "symbol", alias = "name")]
-    symbol_name: Option<String>,
-    #[schemars(
-        description = "Batch mode: list of symbol names to read in one call. Results are concatenated in order. Cheaper than multiple qartez_read calls. Either `symbols` or `symbol_name` must be set."
-    )]
-    symbols: Option<Vec<String>>,
-    #[schemars(
-        description = "Filter all symbols to a specific file path. When set without any symbol, reads the raw file contents — the whole file by default, or the slice defined by start_line/end_line/limit. max_bytes still bounds the output. Aliases: `file`, `path`."
-    )]
-    #[serde(alias = "file", alias = "path")]
-    file_path: Option<String>,
-    #[schemars(
-        description = "Max response size in bytes (default: 25000). Symbols past the cap are omitted with a truncation marker."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    max_bytes: Option<u32>,
-    #[schemars(
-        description = "Lines of source context to include BEFORE the symbol's own range (default: 0). Use when you need to see surrounding use-blocks or comments."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    context_lines: Option<u32>,
-    #[schemars(
-        description = "Read partial body: 1-based start line. Combined with `end_line` or `limit`. When set together with `file_path` but without any symbol, dumps that raw line range from the file — lets you read non-symbol code (imports, module headers) without falling back to Read. Alias: `offset`."
-    )]
-    #[serde(default, alias = "offset", deserialize_with = "flexible::u32_opt")]
-    start_line: Option<u32>,
-    #[schemars(description = "Partial-body end line (inclusive). Pairs with `start_line`.")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    end_line: Option<u32>,
-    #[schemars(
-        description = "Partial-body line count. Alternative to `end_line`: when set, reads `limit` lines starting at `start_line` (defaults to 1). Mirrors the built-in Read tool's `limit` parameter so callers can copy-paste the same shape."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulImpactParams {
-    #[schemars(
-        description = "Relative file path to analyze blast radius for. Aliases: `file`, `path`, `name`."
-    )]
-    #[serde(alias = "file", alias = "path", alias = "name")]
-    file_path: String,
-    #[schemars(description = "'concise' = counts only, 'detailed' (default) = full file lists")]
-    format: Option<Format>,
-    #[schemars(description = "Include test files in the transitive blast radius (default: false)")]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    include_tests: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulCochangeParams {
-    #[schemars(
-        description = "Relative file path to find co-change partners for. Aliases: `file`, `path`."
-    )]
-    #[serde(alias = "file", alias = "path")]
-    file_path: String,
-    #[schemars(description = "Max number of results (default: 10)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "'concise' = file paths + counts only, 'detailed' (default) = table format"
-    )]
-    format: Option<Format>,
-    #[schemars(
-        description = "Skip commits touching more than this many files when recomputing pair counts from git (default: 30). Guards against huge refactor commits inflating counts."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    max_commit_size: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulGrepParams {
-    #[schemars(
-        description = "FTS5 search query (supports prefix* matching) or regex when regex=true. Accepts the alias `pattern` for parity with Grep."
-    )]
-    #[serde(alias = "pattern")]
-    query: String,
-    #[schemars(description = "Max number of results (default: 20)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "'concise' = names only, 'detailed' (default) = names + kind + file + lines"
-    )]
-    format: Option<Format>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-    #[schemars(
-        description = "If true, interpret query as a regex applied to indexed symbol names (not bodies). Default false (FTS5 prefix)."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    regex: Option<bool>,
-    #[schemars(
-        description = "If true, search pre-indexed function bodies via FTS5 instead of symbol names. Useful for finding strings/comments/identifiers that don't appear in declarations. Default false."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    search_bodies: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulRefsParams {
-    #[schemars(
-        description = "Symbol name to find references for. Accepts aliases `name` and `symbol_name`."
-    )]
-    #[serde(alias = "name", alias = "symbol_name")]
-    symbol: String,
-    #[schemars(description = "Include transitive dependents (default: false)")]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    transitive: Option<bool>,
-    #[schemars(
-        description = "'concise' = file paths only, 'detailed' (default) = full import chain"
-    )]
-    format: Option<Format>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulRenameParams {
-    #[schemars(description = "Current symbol name to rename")]
-    old_name: String,
-    #[schemars(description = "New name for the symbol")]
-    new_name: String,
-    #[schemars(
-        description = "If true, apply the rename. If false (default), show a preview of changes."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    apply: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulProjectParams {
-    #[schemars(
-        description = "Which project command to run. Defaults to `info`, which prints the detected toolchain without executing anything. `run` dry-prints the resolved command; the other variants execute it."
-    )]
-    action: Option<ProjectAction>,
-    #[schemars(description = "Optional filter (e.g., test name pattern, specific package)")]
-    filter: Option<String>,
-    #[schemars(description = "Timeout in seconds (default: 60)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    timeout: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulMoveParams {
-    #[schemars(description = "Symbol name to move. Accepts aliases `name` and `symbol_name`.")]
-    #[serde(alias = "name", alias = "symbol_name")]
-    symbol: String,
-    #[schemars(
-        description = "Target file path (relative to project root). Created if it doesn't exist."
-    )]
-    to_file: String,
-    #[schemars(description = "If true, apply the move. If false (default), show a preview.")]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    apply: Option<bool>,
-    #[schemars(
-        description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method'). Accepts the kinds returned by qartez_find."
-    )]
-    kind: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulRenameFileParams {
-    #[schemars(description = "Current file path (relative to project root)")]
-    from: String,
-    #[schemars(description = "New file path (relative to project root)")]
-    to: String,
-    #[schemars(description = "If true, apply the rename. If false (default), show a preview.")]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    apply: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulOutlineParams {
-    #[schemars(description = "Relative file path to get outline for. Aliases: `file`, `path`.")]
-    #[serde(alias = "file", alias = "path")]
-    file_path: String,
-    #[schemars(
-        description = "'concise' = names + lines only, 'detailed' (default) = grouped by kind with signatures"
-    )]
-    format: Option<Format>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-    #[schemars(
-        description = "Skip the first N non-field symbols before rendering. Pair with token_budget to page through very large files."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    offset: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulDepsParams {
-    #[schemars(
-        description = "Relative file path to show dependencies for. Aliases: `file`, `path`."
-    )]
-    #[serde(alias = "file", alias = "path")]
-    file_path: String,
-    #[schemars(
-        description = "'concise' = file paths only, 'detailed' (default) = paths + edge kinds"
-    )]
-    format: Option<Format>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulStatsParams {
-    #[schemars(
-        description = "Optional relative file path for per-file stats: LOC, symbol count, imports, importers. Aliases: `file`, `path`."
-    )]
-    #[serde(alias = "file", alias = "path")]
-    file_path: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulUnusedParams {
-    #[schemars(
-        description = "Max number of unused exports to return (default: 50). Pre-materialized at index time; paging through this list is O(1)."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(description = "Pagination offset into the unused-exports list (default: 0)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    offset: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulCallsParams {
-    #[schemars(
-        description = "Function/method name to analyze call hierarchy for. Accepts aliases `symbol` and `symbol_name`."
-    )]
-    #[serde(alias = "symbol", alias = "symbol_name")]
-    name: String,
-    #[schemars(
-        description = "Which edges to walk. `both` is the default and shows callers and callees."
-    )]
-    direction: Option<CallDirection>,
-    #[schemars(
-        description = "Max depth for call chain traversal (default: 1). Pass 2 to also see transitive chains — this can emit many lines on hub functions."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    depth: Option<u32>,
-    #[schemars(
-        description = "'concise' = names only, 'detailed' (default) = with file paths and lines"
-    )]
-    format: Option<Format>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulContextParams {
-    #[schemars(description = "File paths to analyze context for (files you plan to modify)")]
-    files: Vec<String>,
-    #[schemars(description = "Optional task description to help prioritize relevant context")]
-    task: Option<String>,
-    #[schemars(description = "Max number of context files to return (default: 15)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "'concise' = file list only, 'detailed' (default) = files with reasons"
-    )]
-    format: Option<Format>,
-    #[schemars(description = "Approximate token budget for output (default: 4000)")]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    token_budget: Option<u32>,
-    #[schemars(
-        description = "When true, show score breakdown per component (imports, importer, cochange, transitive, task-match) and count of files excluded by limit / budget. Use to diagnose why a file was or was not surfaced."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    explain: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulHotspotsParams {
-    #[schemars(
-        description = "Max number of hotspot results to return (default: 20). Hotspots are sorted by composite score = complexity × coupling × change_frequency."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "Granularity: 'file' (default) ranks whole files, 'symbol' ranks individual functions/methods."
-    )]
-    level: Option<HotspotLevel>,
-    #[schemars(
-        description = "'concise' = compact table, 'detailed' (default) = full breakdown with per-metric scores"
-    )]
-    format: Option<Format>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum HotspotLevel {
-    File,
-    Symbol,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulClonesParams {
-    #[schemars(
-        description = "Max number of clone groups to return (default: 20). Groups are sorted by size (most duplicates first)."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "Page offset for pagination — skip this many groups before returning (default: 0)."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    offset: Option<u32>,
-    #[schemars(
-        description = "Minimum number of source lines for a symbol to be considered (default: 5). Filters out trivial getters."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    min_lines: Option<u32>,
-    #[schemars(
-        description = "'concise' = compact list, 'detailed' (default) = grouped output with file paths and line ranges"
-    )]
-    format: Option<Format>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulWikiParams {
-    #[schemars(
-        description = "File path to write the wiki to (relative to project root). If omitted, returns the markdown inline."
-    )]
-    write_to: Option<String>,
-    #[schemars(
-        description = "Leiden resolution parameter (default: 1.0). Larger values produce more, smaller clusters; smaller values merge clusters."
-    )]
-    resolution: Option<f64>,
-    #[schemars(
-        description = "Minimum cluster size (default: 3). Clusters smaller than this are folded into the `misc` bucket."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    min_cluster_size: Option<u32>,
-    #[schemars(
-        description = "Max files listed per cluster section (default: 20). Remaining files are summarised as `... and N more`."
-    )]
-    #[serde(default, deserialize_with = "flexible::u32_opt")]
-    max_files_per_section: Option<u32>,
-    #[schemars(
-        description = "Recompute clusters even if the file_clusters table is already populated (default: false)."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    recompute: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct SoulBoundariesParams {
-    #[schemars(
-        description = "Path to the boundary config (TOML), relative to the project root. Defaults to `.qartez/boundaries.toml`."
-    )]
-    config_path: Option<String>,
-    #[schemars(
-        description = "If true, skip the checker and emit a starter config derived from the current Leiden clustering instead."
-    )]
-    #[serde(default, deserialize_with = "flexible::bool_opt")]
-    suggest: Option<bool>,
-    #[schemars(
-        description = "When `suggest` is true and `write_to` is set, write the generated TOML to this path (relative to the project root) instead of returning it inline."
-    )]
-    write_to: Option<String>,
-    #[schemars(
-        description = "'concise' = one-line-per-violation summary, 'detailed' (default) = grouped output with rule text."
-    )]
-    format: Option<Format>,
-}
 
 #[tool_router(router = tool_router)]
 impl QartezServer {
@@ -1628,7 +325,7 @@ impl QartezServer {
         let no_symbols_requested = params.symbol_name.as_deref().is_none_or(|s| s.is_empty())
             && params.symbols.as_ref().is_none_or(|v| v.is_empty());
         if no_symbols_requested && let Some(ref fp) = params.file_path {
-            let abs_path = self.project_root.join(fp);
+            let abs_path = self.safe_resolve(fp)?;
             let source = std::fs::read_to_string(&abs_path)
                 .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
             let lines: Vec<&str> = source.lines().collect();
@@ -1753,6 +450,7 @@ impl QartezServer {
         match_file_ids.sort_unstable();
         match_file_ids.dedup();
         let blast_radii = blast::blast_radius_for_files(&conn, &match_file_ids).unwrap_or_default();
+        drop(conn);
 
         let total_symbols: usize = per_query.iter().map(|(_, f)| f.len()).sum();
         let mut out = String::new();
@@ -1959,6 +657,240 @@ impl QartezServer {
                     sym.name, sym.kind, sym.pagerank, sym.line_start, sym.line_end,
                 ));
             }
+        }
+
+        Ok(out)
+    }
+
+    #[tool(
+        name = "qartez_diff_impact",
+        description = "Batch impact analysis for a git diff range. Pass a revspec like 'main..HEAD' to get a unified report: changed files with PageRank, union blast radius, convergence points (files affected by 2+ changes), and co-change omissions (historically coupled files missing from the diff). Single call replaces N calls to qartez_impact + qartez_cochange.",
+        annotations(
+            title = "Diff Impact Analysis",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_diff_impact(
+        &self,
+        Parameters(params): Parameters<SoulDiffImpactParams>,
+    ) -> Result<String, String> {
+        let concise = is_concise(&params.format);
+        let include_tests = params.include_tests.unwrap_or(false);
+
+        let changed = crate::git::diff::changed_files_in_range(&self.project_root, &params.base)
+            .map_err(|e| format!("Git error: {e}"))?;
+
+        if changed.is_empty() {
+            return Ok(format!("No files changed in range '{}'.", params.base));
+        }
+
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+        let changed_set: HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
+
+        let mut indexed = Vec::new();
+        let mut not_indexed = Vec::new();
+        for path in &changed {
+            match read::get_file_by_path(&conn, path) {
+                Ok(Some(file)) => {
+                    guard::touch_ack(&self.project_root, &file.path);
+                    indexed.push(file);
+                }
+                _ => not_indexed.push(path.as_str()),
+            }
+        }
+
+        let file_ids: Vec<i64> = indexed.iter().map(|f| f.id).collect();
+        let blast_results = blast::blast_radius_for_file_set(&conn, &file_ids)
+            .map_err(|e| format!("Blast radius error: {e}"))?;
+
+        let changed_ids: HashSet<i64> = file_ids.iter().copied().collect();
+
+        // Union of direct importers: importer_id -> source file paths that cause it.
+        let mut direct_union: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut transitive_union: HashSet<i64> = HashSet::new();
+
+        for (file, br) in indexed.iter().zip(blast_results.iter()) {
+            for &imp_id in &br.direct_importers {
+                if !changed_ids.contains(&imp_id) {
+                    direct_union
+                        .entry(imp_id)
+                        .or_default()
+                        .push(file.path.clone());
+                }
+            }
+            for &tid in &br.transitive_importers {
+                if !changed_ids.contains(&tid) {
+                    transitive_union.insert(tid);
+                }
+            }
+        }
+
+        let resolve_path = |id: i64| -> Option<String> {
+            read::get_file_by_id(&conn, id)
+                .ok()
+                .flatten()
+                .map(|f| f.path)
+                .filter(|p| include_tests || !is_test_path(p))
+        };
+
+        let mut direct_entries: Vec<(String, Vec<String>)> = direct_union
+            .iter()
+            .filter_map(|(&id, sources)| resolve_path(id).map(|path| (path, sources.clone())))
+            .collect();
+        direct_entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+
+        let transitive_count = transitive_union
+            .iter()
+            .filter_map(|&id| resolve_path(id))
+            .count();
+
+        let convergence: Vec<&(String, Vec<String>)> = direct_entries
+            .iter()
+            .filter(|(_, sources)| sources.len() >= 2)
+            .collect();
+
+        // Co-change omissions: partners not in the diff set.
+        let mut omissions_map: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        for file in &indexed {
+            let cochanges = read::get_cochanges(&conn, file.id, 10).unwrap_or_default();
+            for (cc, partner) in cochanges {
+                if !changed_set.contains(partner.path.as_str())
+                    && (include_tests || !is_test_path(&partner.path))
+                {
+                    omissions_map
+                        .entry(partner.path)
+                        .or_default()
+                        .push((file.path.clone(), cc.count as u32));
+                }
+            }
+        }
+        let mut omissions: Vec<(String, Vec<(String, u32)>)> = omissions_map.into_iter().collect();
+        omissions.sort_by(|a, b| {
+            let max_a = a.1.iter().map(|(_, c)| c).max().unwrap_or(&0);
+            let max_b = b.1.iter().map(|(_, c)| c).max().unwrap_or(&0);
+            max_b.cmp(max_a)
+        });
+
+        if concise {
+            let files_list = changed
+                .iter()
+                .map(|p| truncate_path(p, 40))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let omission_list: String = omissions
+                .iter()
+                .take(5)
+                .map(|(p, pairs)| {
+                    let max_count = pairs.iter().map(|(_, c)| c).max().unwrap_or(&0);
+                    format!("{} (x{max_count})", truncate_path(p, 35))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(format!(
+                "Diff: {} | {} files | blast union: {} | convergence: {} | omissions: {}\nFiles: {}\nOmissions: {}",
+                params.base,
+                changed.len(),
+                direct_entries.len(),
+                convergence.len(),
+                omissions.len(),
+                files_list,
+                if omissions.is_empty() {
+                    "none".to_string()
+                } else {
+                    omission_list
+                },
+            ));
+        }
+
+        let mut out = format!(
+            "# Diff impact: {} ({} files changed)\n\n",
+            params.base,
+            changed.len(),
+        );
+
+        out.push_str("## Changed files\n");
+        out.push_str(" # | File                                | PageRank | Blast\n");
+        out.push_str("---+-------------------------------------+----------+------\n");
+        let mut row_idx = 0usize;
+        for (i, file) in indexed.iter().enumerate() {
+            row_idx += 1;
+            let blast_count = blast_results[i].transitive_importers.len();
+            out.push_str(&format!(
+                "{:>2} | {:<35} | {:>8.4} | {}{}\n",
+                row_idx,
+                truncate_path(&file.path, 35),
+                file.pagerank,
+                "->",
+                blast_count,
+            ));
+        }
+        for path in &not_indexed {
+            row_idx += 1;
+            out.push_str(&format!(
+                "{row_idx:>2} | {:<35} | {:>8} | not indexed\n",
+                truncate_path(path, 35),
+                "-",
+            ));
+        }
+
+        out.push_str(&format!(
+            "\n## Union blast radius: {} direct, {} transitive\n",
+            direct_entries.len(),
+            transitive_count,
+        ));
+        if direct_entries.is_empty() {
+            out.push_str("No external importers affected.\n");
+        } else {
+            for (path, sources) in &direct_entries {
+                let short_sources: Vec<&str> = sources
+                    .iter()
+                    .map(|s| s.rsplit('/').next().unwrap_or(s))
+                    .collect();
+                out.push_str(&format!(
+                    "  - {} (from: {})\n",
+                    path,
+                    short_sources.join(", "),
+                ));
+            }
+        }
+
+        if !convergence.is_empty() {
+            out.push_str(&format!(
+                "\n## Convergence points ({} files affected by 2+ changes)\n",
+                convergence.len(),
+            ));
+            for (path, sources) in &convergence {
+                out.push_str(&format!("  - {} ({} sources)\n", path, sources.len()));
+            }
+        }
+
+        if !omissions.is_empty() {
+            out.push_str(&format!(
+                "\n## Co-change omissions ({} files)\n",
+                omissions.len(),
+            ));
+            out.push_str(
+                "Files that historically change with the diff set but are NOT included:\n",
+            );
+            for (partner, pairs) in omissions.iter().take(15) {
+                let detail: Vec<String> = pairs
+                    .iter()
+                    .map(|(src, count)| {
+                        format!("{} x{count}", src.rsplit('/').next().unwrap_or(src))
+                    })
+                    .collect();
+                out.push_str(&format!("  - {} ({})\n", partner, detail.join(", ")));
+            }
+        }
+
+        if !indexed.is_empty() {
+            out.push_str(&format!(
+                "\nGuard ACK written for {} indexed file(s).\n",
+                indexed.len(),
+            ));
         }
 
         Ok(out)
@@ -2207,29 +1139,52 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRefsParams>,
     ) -> Result<String, String> {
-        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
-        let refs = read::get_symbol_references(&conn, &params.symbol)
-            .map_err(|e| format!("DB error: {e}"))?;
-
-        if refs.is_empty() {
-            return Ok(format!("No symbol found with name '{}'", params.symbol));
-        }
-
         let transitive = params.transitive.unwrap_or(false);
-        let mut out = String::new();
 
-        // FTS fallback: files whose symbol bodies mention the target
-        // identifier. Supplements the edge graph because not every caller
-        // shows up as a direct importer — external-crate `use` lines are
-        // dropped at index time, `use crate::a::sub;` resolves to `a/mod.rs`
-        // not `a/sub.rs`, and child modules pulled in via `use super::*;`
-        // carry a wildcard specifier that the old importer filter dropped.
-        // Failures are non-fatal: if FTS is missing we still have the
-        // edge-based scan set below.
-        let fts_fallback_paths: Vec<String> =
-            read::find_file_paths_by_body_text(&conn, &params.symbol).unwrap_or_default();
+        // All DB queries under one lock acquisition; the lock is dropped
+        // before the tree-sitter / FS phase (cached_calls) so the watcher
+        // and other handlers are not blocked during parsing.
+        let (refs, fts_fallback_paths, reverse_graph, file_path_lookup) = {
+            let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+            let refs = read::get_symbol_references(&conn, &params.symbol)
+                .map_err(|e| format!("DB error: {e}"))?;
+            if refs.is_empty() {
+                return Ok(format!("No symbol found with name '{}'", params.symbol));
+            }
+
+            // FTS fallback: files whose symbol bodies mention the target
+            // identifier. Supplements the edge graph because not every caller
+            // shows up as a direct importer — external-crate `use` lines are
+            // dropped at index time, `use crate::a::sub;` resolves to `a/mod.rs`
+            // not `a/sub.rs`, and child modules pulled in via `use super::*;`
+            // carry a wildcard specifier that the old importer filter dropped.
+            // Failures are non-fatal: if FTS is missing we still have the
+            // edge-based scan set below.
+            let fts_fallback_paths: Vec<String> =
+                read::find_file_paths_by_body_text(&conn, &params.symbol).unwrap_or_default();
+
+            let (reverse_graph, file_path_lookup) = if transitive {
+                let all_edges = read::get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
+                let mut reverse: HashMap<i64, Vec<i64>> = HashMap::new();
+                for &(from, to) in &all_edges {
+                    reverse.entry(to).or_default().push(from);
+                }
+                let lookup: HashMap<i64, String> = read::get_all_files(&conn)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| (f.id, f.path))
+                    .collect();
+                (reverse, lookup)
+            } else {
+                (HashMap::new(), HashMap::new())
+            };
+
+            (refs, fts_fallback_paths, reverse_graph, file_path_lookup)
+        };
+
+        let mut out = String::new();
 
         for (sym, file, importers) in &refs {
             if concise {
@@ -2318,18 +1273,11 @@ impl QartezServer {
             }
 
             if transitive {
-                let all_edges = read::get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
-
-                let mut reverse: HashMap<i64, Vec<i64>> = HashMap::new();
-                for &(from, to) in &all_edges {
-                    reverse.entry(to).or_default().push(from);
-                }
-
                 let mut visited: HashSet<i64> = HashSet::new();
                 let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
                 let mut by_depth: HashMap<u32, Vec<String>> = HashMap::new();
 
-                if let Some(neighbors) = reverse.get(&file.id) {
+                if let Some(neighbors) = reverse_graph.get(&file.id) {
                     for &n in neighbors {
                         if visited.insert(n) {
                             queue.push_back((n, 1));
@@ -2338,10 +1286,10 @@ impl QartezServer {
                 }
 
                 while let Some((current, depth)) = queue.pop_front() {
-                    if let Ok(Some(f)) = read::get_file_by_id(&conn, current) {
-                        by_depth.entry(depth).or_default().push(f.path);
+                    if let Some(path) = file_path_lookup.get(&current) {
+                        by_depth.entry(depth).or_default().push(path.clone());
                     }
-                    if let Some(neighbors) = reverse.get(&current) {
+                    if let Some(neighbors) = reverse_graph.get(&current) {
                         for &n in neighbors {
                             if n != file.id && visited.insert(n) {
                                 queue.push_back((n, depth + 1));
@@ -2428,6 +1376,7 @@ impl QartezServer {
             }
         }
         let files_to_scan: Vec<String> = file_set.into_iter().collect();
+        drop(conn);
 
         let apply = params.apply.unwrap_or(false);
         // (file_path, line_number, old_line_text, new_line_text)
@@ -2623,7 +1572,7 @@ impl QartezServer {
 
     #[tool(
         name = "qartez_project",
-        description = "Run project commands (test, build, lint, typecheck) with auto-detected toolchain (Cargo, npm/bun/yarn, Go, Python, Make). Use action='info' to see detected commands. Use filter for targeted runs (e.g., test name).",
+        description = "Run project commands (test, build, lint, typecheck) with auto-detected toolchain (Cargo, npm/bun/yarn/pnpm, Go, Python, Dart/Flutter, Maven, Gradle, sbt, Ruby, Make). Use action='info' to see detected commands. Use filter for targeted runs (e.g., test name).",
         annotations(
             title = "Run Project Command",
             read_only_hint = false,
@@ -2641,7 +1590,7 @@ impl QartezServer {
 
         if action == ProjectAction::Info {
             if all_toolchains.is_empty() {
-                return Err("No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, Gemfile, Makefile".to_string());
+                return Err("No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string());
             }
             let mut out = String::new();
             for (i, tc) in all_toolchains.iter().enumerate() {
@@ -2669,7 +1618,7 @@ impl QartezServer {
         }
 
         let tc = all_toolchains.into_iter().next().ok_or_else(|| {
-            "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, Gemfile, Makefile".to_string()
+            "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string()
         })?;
 
         if action == ProjectAction::Run {
@@ -2806,7 +1755,7 @@ impl QartezServer {
 
         let (sym, source_file) = &results[0];
         let source_abs = self.project_root.join(&source_file.path);
-        let target_abs = self.project_root.join(&params.to_file);
+        let target_abs = self.safe_resolve(&params.to_file)?;
 
         if source_file.path != params.to_file
             && let Ok(Some(target_file)) = read::get_file_by_path(&conn, &params.to_file)
@@ -3016,8 +1965,8 @@ impl QartezServer {
             .map_err(|e| format!("DB error: {e}"))?
             .ok_or_else(|| format!("File '{}' not found in index", params.from))?;
 
-        let from_abs = self.project_root.join(&params.from);
-        let to_abs = self.project_root.join(&params.to);
+        let from_abs = self.safe_resolve(&params.from)?;
+        let to_abs = self.safe_resolve(&params.to)?;
 
         if !from_abs.exists() {
             return Err(format!(
@@ -3487,7 +2436,7 @@ impl QartezServer {
         };
 
         let mut out = format!(
-            "files={} (src={}/test={}) loc={}/{} syms={} edges={} indexed={}/{}\n",
+            "files={} (src={}/test={}) loc={}/{} syms={} edges={} with_symbols={}/{}\n",
             file_count,
             src_files.len(),
             test_files.len(),
@@ -3551,7 +2500,6 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulCallsParams>,
     ) -> Result<String, String> {
-        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
         let direction = params.direction.unwrap_or_default();
         let want_callers = matches!(direction, CallDirection::Callers | CallDirection::Both);
@@ -3560,8 +2508,18 @@ impl QartezServer {
         // explode on hub functions, so callers opt in explicitly.
         let max_depth = params.depth.unwrap_or(1) as usize;
 
-        let symbols =
-            read::find_symbol_by_name(&conn, &params.name).map_err(|e| format!("DB error: {e}"))?;
+        // Lock 1: resolve the target symbol and fetch the file list.
+        let (symbols, all_files) = {
+            let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+            let symbols = read::find_symbol_by_name(&conn, &params.name)
+                .map_err(|e| format!("DB error: {e}"))?;
+            let all_files = if want_callers {
+                read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?
+            } else {
+                Vec::new()
+            };
+            (symbols, all_files)
+        };
 
         if symbols.is_empty() {
             return Err(format!("No symbol '{}' found in index", params.name));
@@ -3600,11 +2558,10 @@ impl QartezServer {
             ));
 
             if want_callers {
-                let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
-
-                // Collect all call sites up-front, then render as grouped
-                // one-liners. Grouping elides the per-file header.
-                let mut sites: Vec<(String, usize, Option<String>)> = Vec::new();
+                // Scan phase (no lock): FS reads + tree-sitter parsing for
+                // every file. This is the heaviest phase and must not hold
+                // the db mutex.
+                let mut raw_sites: Vec<(i64, String, Vec<usize>)> = Vec::new();
                 for file in &all_files {
                     let source = match self.cached_source(&file.path) {
                         Some(s) => s,
@@ -3619,26 +2576,35 @@ impl QartezServer {
                         .filter(|(name, _)| name == &params.name)
                         .map(|(_, l)| *l)
                         .collect();
-                    if matching.is_empty() {
-                        continue;
+                    if !matching.is_empty() {
+                        raw_sites.push((file.id, file.path.clone(), matching));
                     }
-                    let file_syms = file_syms_cache.entry(file.id).or_insert_with(|| {
-                        read::get_symbols_for_file(&conn, file.id).unwrap_or_default()
-                    });
-                    for line in &matching {
-                        let enclosing = file_syms
-                            .iter()
-                            .filter(|s| {
-                                s.line_start as usize <= *line
-                                    && *line <= s.line_end as usize
-                                    && matches!(
-                                        s.kind.as_str(),
-                                        "function" | "method" | "constructor"
-                                    )
-                            })
-                            .max_by_key(|s| s.line_start)
-                            .map(|s| s.name.clone());
-                        sites.push((file.path.clone(), *line, enclosing));
+                }
+
+                // Resolve phase (lock 2): fetch per-file symbol lists to
+                // find the enclosing function for each call site.
+                let mut sites: Vec<(String, usize, Option<String>)> = Vec::new();
+                if !raw_sites.is_empty() {
+                    let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                    for (file_id, file_path, matching) in &raw_sites {
+                        let file_syms = file_syms_cache.entry(*file_id).or_insert_with(|| {
+                            read::get_symbols_for_file(&conn, *file_id).unwrap_or_default()
+                        });
+                        for line in matching {
+                            let enclosing = file_syms
+                                .iter()
+                                .filter(|s| {
+                                    s.line_start as usize <= *line
+                                        && *line <= s.line_end as usize
+                                        && matches!(
+                                            s.kind.as_str(),
+                                            "function" | "method" | "constructor"
+                                        )
+                                })
+                                .max_by_key(|s| s.line_start)
+                                .map(|s| s.name.clone());
+                            sites.push((file_path.clone(), *line, enclosing));
+                        }
                     }
                 }
 
@@ -3660,6 +2626,7 @@ impl QartezServer {
             }
 
             if want_callees {
+                // Scan phase (no lock): tree-sitter on the def file only.
                 let all_calls = self.cached_calls(&def_file.path);
                 let start = sym.line_start as usize;
                 let end = sym.line_end as usize;
@@ -3683,13 +2650,19 @@ impl QartezServer {
                 } else {
                     out.push_str(&format!("callees: {}\n", seen_order.len()));
                     if !concise {
-                        for callee_name in &seen_order {
-                            let _line = first_line[callee_name];
-                            let resolved =
+                        // Resolve phase: batch-resolve all callee names.
+                        {
+                            let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                            for callee_name in &seen_order {
                                 resolve_cache.entry(callee_name.clone()).or_insert_with(|| {
                                     read::find_symbol_by_name(&conn, callee_name)
                                         .unwrap_or_default()
                                 });
+                            }
+                        }
+                        for callee_name in &seen_order {
+                            let _line = first_line[callee_name];
+                            let resolved = resolve_cache.get(callee_name).unwrap();
                             match resolved.first() {
                                 Some((_, f)) => {
                                     out.push_str(&format!("  {callee_name} @ {}\n", f.path))
@@ -3728,13 +2701,22 @@ impl QartezServer {
                     visited.insert(d.clone());
                 }
 
+                // Resolve all direct callee definitions under the lock,
+                // then drop it before the tree-sitter walk over their files.
+                {
+                    let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                    for callee_name in &direct {
+                        resolve_cache.entry(callee_name.clone()).or_insert_with(|| {
+                            read::find_symbol_by_name(&conn, callee_name).unwrap_or_default()
+                        });
+                    }
+                }
+
                 // Group depth-2 chains by their root callee so repeats get
                 // elided: `callee → {a, b, c}` instead of three lines.
                 let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
                 for callee_name in &direct {
-                    let resolved = resolve_cache.entry(callee_name.clone()).or_insert_with(|| {
-                        read::find_symbol_by_name(&conn, callee_name).unwrap_or_default()
-                    });
+                    let resolved = resolve_cache.get(callee_name).unwrap();
                     let mut targets: Vec<String> = Vec::new();
                     for (s2, f2) in resolved.iter() {
                         if !matches!(s2.kind.as_str(), "function" | "method") {
@@ -4260,7 +3242,7 @@ impl QartezServer {
         if let Some(path) = params.write_to.as_deref().map(str::trim)
             && !path.is_empty()
         {
-            let abs = self.project_root.join(path);
+            let abs = self.safe_resolve(path)?;
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
@@ -4305,7 +3287,7 @@ impl QartezServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(".qartez/boundaries.toml");
-        let abs_path = self.project_root.join(rel_path);
+        let abs_path = self.safe_resolve(rel_path)?;
         let concise = is_concise(&params.format);
 
         if params.suggest.unwrap_or(false) {
@@ -4329,7 +3311,7 @@ impl QartezServer {
             if let Some(write_rel) = params.write_to.as_deref().map(str::trim)
                 && !write_rel.is_empty()
             {
-                let write_abs = self.project_root.join(write_rel);
+                let write_abs = self.safe_resolve(write_rel)?;
                 if let Some(parent) = write_abs.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
@@ -4412,203 +3394,152 @@ impl QartezServer {
         }
         Ok(out)
     }
-}
 
-const CALL_NODE_KINDS: &[&str] = &[
-    "call_expression",
-    "method_invocation",
-    "function_call",
-    "member_expression",
-];
+    #[tool(
+        name = "qartez_hierarchy",
+        description = "Query the type hierarchy: find all types that implement a trait/interface, or all traits/interfaces a type implements. Works across Rust (impl Trait for Type), TypeScript/Java (extends/implements), Python (base classes), and Go (interface embedding)."
+    )]
+    fn qartez_hierarchy(
+        &self,
+        Parameters(params): Parameters<SoulHierarchyParams>,
+    ) -> Result<String, String> {
+        let concise = is_concise(&params.format);
+        let direction = params.direction.as_deref().unwrap_or("sub").to_lowercase();
+        let transitive = params.transitive.unwrap_or(false);
 
-const CALLEE_FIELD_NAMES: &[&str] = &["function", "name", "method"];
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
-fn collect_call_names(
-    cursor: &mut tree_sitter::TreeCursor,
-    source: &[u8],
-    results: &mut Vec<(String, usize)>,
-) {
-    loop {
-        let node = cursor.node();
-        if CALL_NODE_KINDS.contains(&node.kind()) {
-            for field in CALLEE_FIELD_NAMES {
-                if let Some(callee) = node.child_by_field_name(field) {
-                    let name = extract_callee_name(callee, source);
-                    if !name.is_empty() {
-                        let line = node.start_position().row + 1;
-                        results.push((name, line));
-                    }
-                    break;
+        let mut out = String::new();
+
+        match direction.as_str() {
+            "sub" | "down" | "implementors" => {
+                let rows = read::get_subtypes(&conn, &params.symbol)
+                    .map_err(|e| format!("DB error: {e}"))?;
+                if rows.is_empty() {
+                    return Ok(format!(
+                        "No types found that implement or extend '{}'.",
+                        params.symbol
+                    ));
                 }
-            }
-            if results
-                .last()
-                .map(|(_, l)| *l != node.start_position().row + 1)
-                .unwrap_or(true)
-                && let Some(first_child) = node.child(0)
-            {
-                let name = extract_callee_name(first_child, source);
-                if !name.is_empty() {
-                    let line = node.start_position().row + 1;
-                    results.push((name, line));
-                }
-            }
-        }
-
-        if cursor.goto_first_child() {
-            collect_call_names(cursor, source, results);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn extract_callee_name(node: tree_sitter::Node, source: &[u8]) -> String {
-    match node.kind() {
-        "identifier" | "simple_identifier" | "property_identifier" => {
-            node.utf8_text(source).unwrap_or("").to_string()
-        }
-        "field_expression" | "member_expression" | "scoped_identifier" | "attribute" => {
-            if let Some(field) = node
-                .child_by_field_name("field")
-                .or_else(|| node.child_by_field_name("property"))
-                .or_else(|| node.child_by_field_name("name"))
-            {
-                field.utf8_text(source).unwrap_or("").to_string()
-            } else {
-                let count = node.child_count();
-                if count > 0 {
-                    if let Some(last) = node.child((count - 1) as u32) {
-                        last.utf8_text(source).unwrap_or("").to_string()
+                out.push_str(&format!(
+                    "# Types implementing/extending '{}' ({} found)\n\n",
+                    params.symbol,
+                    rows.len()
+                ));
+                for (rel, file) in &rows {
+                    if concise {
+                        out.push_str(&format!(
+                            "{} {} {} ({}:L{})\n",
+                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                        ));
                     } else {
-                        String::new()
+                        out.push_str(&format!(
+                            "  {} {} {}\n    {} [L{}]\n",
+                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                        ));
                     }
-                } else {
-                    String::new()
+                }
+
+                if transitive {
+                    let mut visited: HashSet<String> = HashSet::new();
+                    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+                    for (rel, _) in &rows {
+                        if visited.insert(rel.sub_name.clone()) {
+                            queue.push_back((rel.sub_name.clone(), 1));
+                        }
+                    }
+                    let mut transitive_rows = Vec::new();
+                    while let Some((name, depth)) = queue.pop_front() {
+                        let sub_rows = read::get_subtypes(&conn, &name)
+                            .map_err(|e| format!("DB error: {e}"))?;
+                        for (rel, file) in sub_rows {
+                            if visited.insert(rel.sub_name.clone()) {
+                                queue.push_back((rel.sub_name.clone(), depth + 1));
+                                transitive_rows.push((rel, file, depth));
+                            }
+                        }
+                    }
+                    if !transitive_rows.is_empty() {
+                        out.push_str(&format!(
+                            "\n  Transitive subtypes ({}):\n",
+                            transitive_rows.len()
+                        ));
+                        for (rel, file, depth) in &transitive_rows {
+                            out.push_str(&format!(
+                                "    [depth {}] {} {} {} ({}:L{})\n",
+                                depth, rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            ));
+                        }
+                    }
                 }
             }
-        }
-        _ => node.utf8_text(source).unwrap_or("").to_string(),
-    }
-}
+            "super" | "up" | "supertypes" => {
+                let rows = read::get_supertypes(&conn, &params.symbol)
+                    .map_err(|e| format!("DB error: {e}"))?;
+                if rows.is_empty() {
+                    return Ok(format!("No supertypes found for '{}'.", params.symbol));
+                }
+                out.push_str(&format!(
+                    "# Supertypes of '{}' ({} found)\n\n",
+                    params.symbol,
+                    rows.len()
+                ));
+                for (rel, file) in &rows {
+                    if concise {
+                        out.push_str(&format!(
+                            "{} {} {} ({}:L{})\n",
+                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  {} {} {}\n    {} [L{}]\n",
+                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                        ));
+                    }
+                }
 
-fn capitalize_kind(kind: &str) -> String {
-    let mut chars = kind.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => {
-            let upper: String = c.to_uppercase().collect();
-            let rest: String = chars.collect();
-            let singular = format!("{}{}", upper, rest);
-            if singular.ends_with('s') || singular.ends_with("sh") || singular.ends_with("ch") {
-                format!("{}es", singular)
-            } else {
-                format!("{}s", singular)
+                if transitive {
+                    let mut visited: HashSet<String> = HashSet::new();
+                    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+                    for (rel, _) in &rows {
+                        if visited.insert(rel.super_name.clone()) {
+                            queue.push_back((rel.super_name.clone(), 1));
+                        }
+                    }
+                    let mut transitive_rows = Vec::new();
+                    while let Some((name, depth)) = queue.pop_front() {
+                        let sup_rows = read::get_supertypes(&conn, &name)
+                            .map_err(|e| format!("DB error: {e}"))?;
+                        for (rel, file) in sup_rows {
+                            if visited.insert(rel.super_name.clone()) {
+                                queue.push_back((rel.super_name.clone(), depth + 1));
+                                transitive_rows.push((rel, file, depth));
+                            }
+                        }
+                    }
+                    if !transitive_rows.is_empty() {
+                        out.push_str(&format!(
+                            "\n  Transitive supertypes ({}):\n",
+                            transitive_rows.len()
+                        ));
+                        for (rel, file, depth) in &transitive_rows {
+                            out.push_str(&format!(
+                                "    [depth {}] {} {} {} ({}:L{})\n",
+                                depth, rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Invalid direction '{}'. Use 'sub' (what implements this?) or 'super' (what does this implement?).",
+                    direction
+                ));
             }
         }
-    }
-}
 
-fn path_to_import_stem(file_path: &str) -> String {
-    let without_ext = file_path
-        .rsplit_once('.')
-        .map(|(base, _)| base)
-        .unwrap_or(file_path);
-    without_ext.replace('/', "::")
-}
-
-fn relative_import_stem(file_path: &str) -> String {
-    let without_ext = file_path
-        .rsplit_once('.')
-        .map(|(base, _)| base)
-        .unwrap_or(file_path);
-    let stem = without_ext
-        .rsplit_once('/')
-        .map(|(_, name)| name)
-        .unwrap_or(without_ext);
-    stem.to_string()
-}
-
-/// Resolve the parent module file that declares `mod <name>;` for a given
-/// Rust source file. Covers both the `foo/mod.rs` and flat `foo.rs` module
-/// layouts, falling back to the crate root (`lib.rs` / `main.rs`) when the
-/// file lives directly under a crate source directory.
-///
-/// Returns `None` when the file is not a Rust source file or no parent
-/// declaration file can be located — callers should skip the mod-decl
-/// rewrite in that case rather than erroring out.
-fn find_parent_mod_file(
-    project_root: &std::path::Path,
-    rel_path: &str,
-) -> Option<std::path::PathBuf> {
-    if !rel_path.ends_with(".rs") {
-        return None;
-    }
-    let path = std::path::Path::new(rel_path);
-    let parent = path.parent()?;
-    let file_name = path.file_name()?.to_str()?;
-
-    // `foo/mod.rs` declares the `foo` module itself, so the parent is one
-    // level up from the directory containing mod.rs.
-    let effective_parent: std::path::PathBuf = if file_name == "mod.rs" {
-        parent.parent()?.to_path_buf()
-    } else {
-        parent.to_path_buf()
-    };
-
-    // Try in priority order: sibling `<parent>.rs`, nested `<parent>/mod.rs`,
-    // then crate roots. Whichever exists on disk wins — Rust's own resolver
-    // uses the same candidate set.
-    let candidates: Vec<std::path::PathBuf> = if effective_parent.as_os_str().is_empty() {
-        // Flat layout: the file sits at the crate root, look for lib/main.
-        vec![
-            std::path::PathBuf::from("lib.rs"),
-            std::path::PathBuf::from("main.rs"),
-        ]
-    } else {
-        let mut v = vec![effective_parent.join("mod.rs")];
-        if let Some(parent_of_parent) = effective_parent.parent()
-            && let Some(dir_name) = effective_parent.file_name()
-        {
-            let mut flat = parent_of_parent.to_path_buf();
-            flat.push(format!("{}.rs", dir_name.to_string_lossy()));
-            v.push(flat);
-        }
-        // Crate roots as last resort — handles files directly under `src/`.
-        v.push(effective_parent.join("lib.rs"));
-        v.push(effective_parent.join("main.rs"));
-        v
-    };
-
-    for cand in candidates {
-        let abs = project_root.join(&cand);
-        if abs.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
-/// Rewrite `mod <old>;` / `pub mod <old>;` declarations in `content` to use
-/// `<new>`. Preserves visibility, attributes, and whitespace. Inline modules
-/// (`mod foo { ... }`) are left alone because they are not backed by a file
-/// and renaming the file has no effect on them.
-fn rewrite_mod_decl(content: &str, old: &str, new: &str) -> String {
-    // Match `mod foo ;` at start of line or after whitespace, with optional
-    // `pub`/`pub(crate)`/etc, and only when terminated by `;` (a file-backed
-    // declaration) — never by `{` (an inline module body).
-    let pattern = format!(
-        r"(?m)^(?P<prefix>\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+){}(?P<suffix>\s*;)",
-        regex::escape(old),
-    );
-    match regex::Regex::new(&pattern) {
-        Ok(re) => re
-            .replace_all(content, format!("${{prefix}}{new}${{suffix}}"))
-            .to_string(),
-        Err(_) => content.to_string(),
+        Ok(out)
     }
 }
 
@@ -4656,6 +3587,11 @@ impl QartezServer {
                 let p: SoulImpactParams =
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
                 self.qartez_impact(Parameters(p))
+            }
+            "qartez_diff_impact" => {
+                let p: SoulDiffImpactParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_diff_impact(Parameters(p))
             }
             "qartez_cochange" => {
                 let p: SoulCochangeParams =
@@ -4735,6 +3671,11 @@ impl QartezServer {
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
                 self.qartez_boundaries(Parameters(p))
             }
+            "qartez_hierarchy" => {
+                let p: SoulHierarchyParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_hierarchy(Parameters(p))
+            }
             _ => Err(format!("unknown tool: {name}")),
         }
     }
@@ -4752,6 +3693,7 @@ impl ServerHandler for QartezServer {
                 .build(),
         )
         .with_server_info(Implementation::new("qartez-mcp", env!("CARGO_PKG_VERSION")))
+        .with_instructions(include_str!("mcp_instructions.md"))
     }
 
     fn list_resources(
@@ -4759,7 +3701,7 @@ impl ServerHandler for QartezServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        let resource = Annotated {
+        let overview = Annotated {
             raw: RawResource {
                 uri: "qartez://overview".to_string(),
                 name: "Codebase Overview".to_string(),
@@ -4775,9 +3717,41 @@ impl ServerHandler for QartezServer {
             },
             annotations: None,
         };
+        let hotspots = Annotated {
+            raw: RawResource {
+                uri: "qartez://hotspots".to_string(),
+                name: "Hotspots".to_string(),
+                title: Some("Code Hotspots".to_string()),
+                description: Some(
+                    "Top files ranked by composite score (complexity x coupling x change frequency)"
+                        .to_string(),
+                ),
+                mime_type: Some("text/plain".to_string()),
+                size: None,
+                icons: None,
+                meta: None,
+            },
+            annotations: None,
+        };
+        let stats = Annotated {
+            raw: RawResource {
+                uri: "qartez://stats".to_string(),
+                name: "Project Stats".to_string(),
+                title: Some("Project Statistics".to_string()),
+                description: Some(
+                    "File counts, LOC, symbol counts, language breakdown, and top imported files"
+                        .to_string(),
+                ),
+                mime_type: Some("text/plain".to_string()),
+                size: None,
+                icons: None,
+                meta: None,
+            },
+            annotations: None,
+        };
         std::future::ready(Ok(ListResourcesResult {
             meta: None,
-            resources: vec![resource],
+            resources: vec![overview, hotspots, stats],
             next_cursor: None,
         }))
     }
@@ -4787,19 +3761,106 @@ impl ServerHandler for QartezServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
-        let result = if request.uri == "qartez://overview" {
-            let overview = self.build_overview(20, 4000, None, None, false, false);
-            Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                overview,
-                "qartez://overview",
-            )]))
-        } else {
-            Err(ErrorData::resource_not_found(
+        let result = match request.uri.as_str() {
+            "qartez://overview" => {
+                let text = self.build_overview(20, 4000, None, None, false, false);
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    text,
+                    "qartez://overview",
+                )]))
+            }
+            "qartez://hotspots" => {
+                let params = SoulHotspotsParams {
+                    limit: Some(15),
+                    level: Some(HotspotLevel::File),
+                    format: Some(Format::Concise),
+                };
+                let text = self
+                    .qartez_hotspots(Parameters(params))
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    text,
+                    "qartez://hotspots",
+                )]))
+            }
+            "qartez://stats" => {
+                let params = SoulStatsParams { file_path: None };
+                let text = self
+                    .qartez_stats(Parameters(params))
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    text,
+                    "qartez://stats",
+                )]))
+            }
+            _ => Err(ErrorData::resource_not_found(
                 format!("Unknown resource URI: {}", request.uri),
                 None,
-            ))
+            )),
         };
         std::future::ready(result)
+    }
+}
+
+#[cfg(test)]
+mod safe_resolve_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn dummy_server(root: &std::path::Path) -> QartezServer {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::schema::create_schema(&conn).unwrap();
+        QartezServer::new(conn, root.to_path_buf(), 0)
+    }
+
+    #[test]
+    fn accepts_plain_relative_path() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("src/main.rs");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/project/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_path() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be relative"));
+    }
+
+    #[test]
+    fn rejects_traversal_beyond_root() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("../../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes"));
+    }
+
+    #[test]
+    fn rejects_sneaky_traversal() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("src/../../secret");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes"));
+    }
+
+    #[test]
+    fn allows_internal_parent_within_root() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("src/../lib/mod.rs");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_single_parent_dir() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("../sibling/file.rs");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes"));
     }
 }
 

@@ -2,7 +2,8 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
-    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+    ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
+    ReferenceKind, RelationKind, SymbolKind,
 };
 
 pub struct GoSupport;
@@ -33,16 +34,67 @@ impl LanguageSupport for GoSupport {
             &mut imports,
             &mut references,
         );
+        let type_relations = extract_type_relations(root, source);
         ParseResult {
             symbols,
             imports,
             references,
+            type_relations,
         }
     }
 }
 
 fn children(node: Node) -> impl Iterator<Item = Node> {
     (0..node.child_count() as u32).filter_map(move |i| node.child(i))
+}
+
+/// Extract interface embedding relationships from Go type declarations.
+/// `type ReadWriter interface { Reader; Writer }` produces two "extends"
+/// relations: (ReadWriter, Reader) and (ReadWriter, Writer).
+fn extract_type_relations(node: Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    let mut relations = Vec::new();
+    collect_type_relations(node, source, &mut relations);
+    relations
+}
+
+fn collect_type_relations(node: Node, source: &[u8], out: &mut Vec<ExtractedRelation>) {
+    if node.kind() == "type_declaration" {
+        for child in children(node) {
+            if child.kind() == "type_spec" {
+                let iface_name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, source))
+                    .unwrap_or_default();
+                if let Some(tn) = child.child_by_field_name("type")
+                    && tn.kind() == "interface_type"
+                    && !iface_name.is_empty()
+                {
+                    let line = node.start_position().row as u32 + 1;
+                    for member in children(tn) {
+                        let embedded = match member.kind() {
+                            "type_identifier" => node_text(member, source),
+                            "qualified_type" => member
+                                .child_by_field_name("name")
+                                .map(|n| node_text(n, source))
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        if !embedded.is_empty() {
+                            out.push(ExtractedRelation {
+                                sub_name: iface_name.clone(),
+                                super_name: embedded,
+                                kind: RelationKind::Extends,
+                                line,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for child in children(node) {
+        collect_type_relations(child, source, out);
+    }
 }
 
 fn is_exported(name: &str) -> bool {
@@ -127,6 +179,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -145,6 +199,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -263,6 +319,7 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -286,6 +343,7 @@ fn extract_method(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
+        owner_type: None,
     })
 }
 
@@ -323,6 +381,7 @@ fn extract_type_spec(spec: Node, decl: Node, source: &[u8]) -> Option<ExtractedS
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -365,6 +424,7 @@ fn extract_single_spec(
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
     }

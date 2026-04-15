@@ -63,8 +63,8 @@ pub fn insert_symbols(
     symbols: &[SymbolInsert],
 ) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
-        "INSERT INTO symbols (file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, unused_excluded, complexity)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO symbols (file_id, name, kind, line_start, line_end, signature, is_exported, shape_hash, parent_id, unused_excluded, complexity, owner_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
     // Resolve parent_idx -> real rowid on the fly: inserts happen in input
     // order, so a child's parent (lower index) is always written first.
@@ -83,6 +83,7 @@ pub fn insert_symbols(
             parent_id,
             sym.unused_excluded as i32,
             sym.complexity,
+            sym.owner_type,
         ])?;
         idx_to_id.push(conn.last_insert_rowid());
     }
@@ -143,6 +144,7 @@ pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
     // Only outgoing edges — incoming edges stay so other files' import
     // relationships remain valid.
     conn.execute("DELETE FROM edges WHERE from_file = ?1", [file_id])?;
+    conn.execute("DELETE FROM type_hierarchy WHERE file_id = ?1", [file_id])?;
     Ok(())
 }
 
@@ -371,6 +373,21 @@ pub fn upsert_file_cluster(
     Ok(())
 }
 
+pub fn insert_type_relations(
+    conn: &Connection,
+    file_id: i64,
+    relations: &[(String, String, String, u32)],
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO type_hierarchy (file_id, sub_name, super_name, kind, line)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (sub, sup, kind, line) in relations {
+        stmt.execute(rusqlite::params![file_id, sub, sup, kind, line])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +445,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             },
             SymbolInsert {
                 name: "new".to_string(),
@@ -440,6 +458,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             },
         ];
         insert_symbols(&conn, file_id, &symbols).unwrap();
@@ -498,6 +517,7 @@ mod tests {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }];
         insert_symbols(&conn, f1, &symbols).unwrap();
         insert_edge(&conn, f1, f2, "import", None).unwrap();
@@ -565,6 +585,7 @@ mod tests {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }];
         insert_symbols(&conn, file_id, &symbols).unwrap();
         sync_fts(&conn).unwrap();
@@ -594,6 +615,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
                 SymbolInsert {
                     name: "callee".to_string(),
@@ -606,6 +628,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
             ],
         )
@@ -654,6 +677,7 @@ mod tests {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             }],
         )
         .unwrap();
@@ -691,6 +715,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
                 SymbolInsert {
                     name: "b".to_string(),
@@ -703,6 +728,7 @@ mod tests {
                     parent_idx: None,
                     unused_excluded: false,
                     complexity: None,
+                    owner_type: None,
                 },
             ],
         )
@@ -759,6 +785,7 @@ mod tests {
             parent_idx: None,
             unused_excluded: false,
             complexity: None,
+            owner_type: None,
         }];
         insert_symbols(&conn, file_id, &symbols).unwrap();
         insert_edge(&conn, file_id, file_id, "import", None).unwrap();

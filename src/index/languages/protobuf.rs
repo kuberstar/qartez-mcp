@@ -27,6 +27,7 @@ impl LanguageSupport for ProtobufSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -90,6 +91,7 @@ fn extract_package(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -138,6 +140,7 @@ fn extract_message(
         parent_idx: parent,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     });
 
     let body = match children(node).find(|c| c.kind() == "message_body") {
@@ -180,6 +183,7 @@ fn extract_field(node: Node, source: &[u8], parent_idx: usize) -> Option<Extract
         parent_idx: Some(parent_idx),
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -208,6 +212,7 @@ fn extract_enum(
         parent_idx: parent,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     });
 
     let body = match children(node).find(|c| c.kind() == "enum_body") {
@@ -241,6 +246,7 @@ fn extract_enum_variant(node: Node, source: &[u8], parent_idx: usize) -> Option<
         parent_idx: Some(parent_idx),
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -264,6 +270,7 @@ fn extract_service(node: Node, source: &[u8], symbols: &mut Vec<ExtractedSymbol>
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     });
 
     for child in children(node) {
@@ -292,6 +299,7 @@ fn extract_rpc(node: Node, source: &[u8], parent_idx: usize) -> Option<Extracted
         parent_idx: Some(parent_idx),
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 

@@ -37,6 +37,7 @@ impl LanguageSupport for CSupport {
             symbols,
             imports,
             references,
+            ..Default::default()
         }
     }
 }
@@ -155,6 +156,7 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -176,6 +178,7 @@ fn extract_tagged_type(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ex
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -195,6 +198,7 @@ fn extract_typedef(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -229,6 +233,7 @@ fn extract_global_declaration(node: Node, source: &[u8], symbols: &mut Vec<Extra
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
     }
@@ -250,6 +255,7 @@ fn extract_macro(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -340,6 +346,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -358,6 +366,8 @@ fn record_reference(
                     line: node.start_position().row as u32 + 1,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }

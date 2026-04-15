@@ -27,6 +27,7 @@ impl LanguageSupport for NixSupport {
             symbols,
             imports,
             references: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -113,6 +114,7 @@ fn extract_function_params(node: Node, source: &[u8], symbols: &mut Vec<Extracte
                                 parent_idx: None,
                                 unused_excluded: false,
                                 complexity: None,
+                                owner_type: None,
                             });
                         }
                     }
@@ -180,6 +182,7 @@ fn extract_binding(
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     });
 
     if let Some(value) = value_node {

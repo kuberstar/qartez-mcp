@@ -2,7 +2,8 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{
-    ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
+    ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
+    ReferenceKind, RelationKind, SymbolKind,
 };
 
 pub struct RustSupport;
@@ -24,6 +25,7 @@ impl LanguageSupport for RustSupport {
         let mut symbols = Vec::new();
         let mut imports = Vec::new();
         let mut references = Vec::new();
+        let mut type_relations = Vec::new();
         let root = tree.root_node();
         extract_from_node(
             root,
@@ -32,11 +34,13 @@ impl LanguageSupport for RustSupport {
             &mut symbols,
             &mut imports,
             &mut references,
+            &mut type_relations,
         );
         ParseResult {
             symbols,
             imports,
             references,
+            type_relations,
         }
     }
 }
@@ -56,6 +60,7 @@ fn extract_from_node(
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
+    type_relations: &mut Vec<ExtractedRelation>,
 ) {
     let kind = node.kind();
     let mut new_enclosing = enclosing;
@@ -90,7 +95,7 @@ fn extract_from_node(
             }
         }
         "impl_item" => {
-            extract_impl_methods(node, source, symbols, imports, references);
+            extract_impl_methods(node, source, symbols, imports, references, type_relations);
             return;
         }
         "type_item" => {
@@ -126,7 +131,15 @@ fn extract_from_node(
     record_reference(node, source, enclosing, references);
 
     for child in children(node) {
-        extract_from_node(child, source, new_enclosing, symbols, imports, references);
+        extract_from_node(
+            child,
+            source,
+            new_enclosing,
+            symbols,
+            imports,
+            references,
+            type_relations,
+        );
     }
 }
 
@@ -145,19 +158,21 @@ fn record_reference(
     match node.kind() {
         "call_expression" => {
             if let Some(func) = node.child_by_field_name("function") {
-                let name = extract_callee_name(func, source);
+                let (name, qualifier) = extract_callee_info(func, source);
                 if !name.is_empty() {
                     references.push(ExtractedReference {
                         name,
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        qualifier,
+                        receiver_type_hint: None,
                     });
                 }
             }
         }
         "macro_invocation" => {
-            // `foo!(...)` — the macro name behaves like a callee.
+            // `foo!(...)` -- the macro name behaves like a callee.
             if let Some(mac) = node.child_by_field_name("macro") {
                 let name = match mac.kind() {
                     "identifier" => node_text(mac, source),
@@ -173,12 +188,14 @@ fn record_reference(
                         line,
                         from_symbol_idx: enclosing,
                         kind: ReferenceKind::Call,
+                        qualifier: None,
+                        receiver_type_hint: None,
                     });
                 }
             }
         }
         "type_identifier" => {
-            // Skip type_identifiers that are the name of a definition — those
+            // Skip type_identifiers that are the name of a definition -- those
             // are not references to external symbols but the definitions
             // themselves. tree-sitter-rust attaches them as a direct child of
             // the defining node.
@@ -196,6 +213,8 @@ fn record_reference(
                     line,
                     from_symbol_idx: enclosing,
                     kind: ReferenceKind::TypeRef,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -204,24 +223,50 @@ fn record_reference(
 }
 
 /// Given the `function` field of a `call_expression`, return the callee
-/// name we want to resolve. Handles simple, scoped, field, and generic
-/// call shapes.
-fn extract_callee_name(func: Node, source: &[u8]) -> String {
+/// name and an optional type qualifier. The qualifier lets the resolver
+/// prefer `impl Foo { fn new() }` over other `new` symbols when the call
+/// site is `Foo::new()`.
+fn extract_callee_info(func: Node, source: &[u8]) -> (String, Option<String>) {
     match func.kind() {
-        "identifier" => node_text(func, source),
-        "scoped_identifier" => func
-            .child_by_field_name("name")
-            .map(|n| node_text(n, source))
-            .unwrap_or_default(),
-        "field_expression" => func
-            .child_by_field_name("field")
-            .map(|n| node_text(n, source))
-            .unwrap_or_default(),
+        "identifier" => (node_text(func, source), None),
+        "scoped_identifier" => {
+            let name = func
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or_default();
+            // Extract qualifier: for `Foo::new()`, the path is `Foo`.
+            // For `module::Foo::new()`, we want the type, which is
+            // the segment right before the name (the path child).
+            let qualifier = func
+                .child_by_field_name("path")
+                .map(|p| {
+                    // If the path is itself a scoped_identifier (e.g. module::Foo),
+                    // take only the last segment (Foo).
+                    if p.kind() == "scoped_identifier" {
+                        p.child_by_field_name("name")
+                            .map(|n| node_text(n, source))
+                            .unwrap_or_default()
+                    } else {
+                        node_text(p, source)
+                    }
+                })
+                .filter(|q| !q.is_empty() && q.starts_with(|c: char| c.is_uppercase()));
+            (name, qualifier)
+        }
+        "field_expression" => {
+            let name = func
+                .child_by_field_name("field")
+                .map(|n| node_text(n, source))
+                .unwrap_or_default();
+            // For `self.foo()` or `x.foo()`, the qualifier is unknown at the
+            // syntactic level. Receiver type tracking populates it later.
+            (name, None)
+        }
         "generic_function" => func
             .child_by_field_name("function")
-            .map(|n| extract_callee_name(n, source))
+            .map(|n| extract_callee_info(n, source))
             .unwrap_or_default(),
-        _ => String::new(),
+        _ => (String::new(), None),
     }
 }
 
@@ -342,6 +387,7 @@ fn extract_named_item(node: Node, source: &[u8], kind: SymbolKind) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity,
+        owner_type: None,
     })
 }
 
@@ -361,6 +407,7 @@ fn extract_macro(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         parent_idx: None,
         unused_excluded: false,
         complexity: None,
+        owner_type: None,
     })
 }
 
@@ -430,6 +477,7 @@ fn extract_named_struct_fields(
             // own — the struct's own export status drives the check.
             unused_excluded: true,
             complexity: None,
+            owner_type: None,
         });
     }
 }
@@ -472,9 +520,50 @@ fn extract_tuple_struct_fields(
             parent_idx: Some(parent_idx),
             unused_excluded: true,
             complexity: None,
+            owner_type: None,
         });
         field_idx += 1;
         pending_vis = false;
+    }
+}
+
+/// Extract the trait name from a trait node in `impl Trait for Type`.
+/// Handles `type_identifier`, `generic_type` (e.g. `Iterator<Item = T>`),
+/// and `scoped_type_identifier` (e.g. `std::fmt::Display`).
+fn extract_trait_name(trait_node: Node, source: &[u8]) -> String {
+    match trait_node.kind() {
+        "type_identifier" => node_text(trait_node, source),
+        "generic_type" => trait_node
+            .child_by_field_name("type")
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        "scoped_type_identifier" => trait_node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Extract the implementing type name from an `impl` node.
+/// For `impl Foo { ... }` returns `Some("Foo")`.
+/// For `impl<T> Foo<T> { ... }` returns `Some("Foo")`.
+/// For `impl Trait for Foo { ... }` returns `Some("Foo")` (the concrete type).
+fn extract_impl_type_name(impl_node: Node, source: &[u8]) -> Option<String> {
+    // For `impl Trait for Type`, tree-sitter-rust puts the concrete type in
+    // the "type" field. For `impl Type`, same field holds the type directly.
+    let type_node = impl_node.child_by_field_name("type")?;
+    match type_node.kind() {
+        "type_identifier" => Some(node_text(type_node, source)),
+        // `impl Foo<Bar>` -- generic type, take the type name part.
+        "generic_type" => type_node
+            .child_by_field_name("type")
+            .map(|n| node_text(n, source)),
+        // `impl module::Foo` -- scoped type, take the last segment.
+        "scoped_type_identifier" => type_node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source)),
+        _ => None,
     }
 }
 
@@ -484,6 +573,7 @@ fn extract_impl_methods(
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
+    type_relations: &mut Vec<ExtractedRelation>,
 ) {
     let body = match impl_node.child_by_field_name("body") {
         Some(b) => b,
@@ -492,8 +582,24 @@ fn extract_impl_methods(
     // Trait impl methods are called via dynamic dispatch, so the static
     // "no file imports the defining file" check can't tell whether they
     // are actually unused. Flag them here so `qartez_unused` skips them at
-    // query time — much cheaper than re-walking the AST for every call.
-    let in_trait_impl = impl_node.child_by_field_name("trait").is_some();
+    // query time -- much cheaper than re-walking the AST for every call.
+    let trait_node = impl_node.child_by_field_name("trait");
+    let in_trait_impl = trait_node.is_some();
+    let owner = extract_impl_type_name(impl_node, source);
+
+    // Record type hierarchy: `impl Trait for Type` produces (Type, Trait, implements).
+    if let (Some(trait_n), Some(owner_name)) = (trait_node, owner.as_deref()) {
+        let trait_name = extract_trait_name(trait_n, source);
+        if !trait_name.is_empty() {
+            type_relations.push(ExtractedRelation {
+                sub_name: owner_name.to_string(),
+                super_name: trait_name,
+                kind: RelationKind::Implements,
+                line: impl_node.start_position().row as u32 + 1,
+            });
+        }
+    }
+
     for child in children(body) {
         if child.kind() == "function_item"
             && let Some(name_node) = child.child_by_field_name("name")
@@ -515,12 +621,21 @@ fn extract_impl_methods(
                     parent_idx: None,
                     unused_excluded: in_trait_impl,
                     complexity: Some(1 + method_cc),
+                    owner_type: owner.clone(),
                 });
                 // Walk the method body with the method as enclosing so every
                 // call/type reference inside is attributed to it.
                 if let Some(method_body) = child.child_by_field_name("body") {
                     for grand in children(method_body) {
-                        extract_from_node(grand, source, Some(idx), symbols, imports, references);
+                        extract_from_node(
+                            grand,
+                            source,
+                            Some(idx),
+                            symbols,
+                            imports,
+                            references,
+                            type_relations,
+                        );
                     }
                 }
             }
@@ -1162,6 +1277,158 @@ fn main() {
                 .iter()
                 .any(|r| r.name == "some_user_macro"),
             "user-defined macro call should be retained"
+        );
+    }
+
+    #[test]
+    fn test_impl_methods_have_owner_type() {
+        let result = parse_rust(
+            r#"
+struct Foo;
+impl Foo {
+    pub fn new() -> Self { Foo }
+    fn helper(&self) {}
+}
+"#,
+        );
+        let new_method = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "new" && matches!(s.kind, SymbolKind::Method))
+            .expect("new method should be extracted");
+        assert_eq!(
+            new_method.owner_type.as_deref(),
+            Some("Foo"),
+            "impl Foo {{ fn new() }} should have owner_type = Foo"
+        );
+        let helper = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper method");
+        assert_eq!(helper.owner_type.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn test_trait_impl_methods_have_owner_type() {
+        let result = parse_rust(
+            r#"
+struct Bar;
+trait Greet { fn greet(&self); }
+impl Greet for Bar {
+    fn greet(&self) {}
+}
+"#,
+        );
+        let greet = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet" && matches!(s.kind, SymbolKind::Method))
+            .expect("greet method from trait impl");
+        assert_eq!(
+            greet.owner_type.as_deref(),
+            Some("Bar"),
+            "impl Greet for Bar {{ fn greet() }} should have owner_type = Bar"
+        );
+    }
+
+    #[test]
+    fn test_generic_impl_owner_type() {
+        let result = parse_rust(
+            r#"
+struct Wrapper<T>(T);
+impl<T> Wrapper<T> {
+    fn inner(&self) -> &T { &self.0 }
+}
+"#,
+        );
+        let inner = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "inner")
+            .expect("inner method");
+        assert_eq!(
+            inner.owner_type.as_deref(),
+            Some("Wrapper"),
+            "generic impl should extract base type name without params"
+        );
+    }
+
+    #[test]
+    fn test_free_function_no_owner_type() {
+        let result = parse_rust(
+            r#"
+pub fn standalone() {}
+"#,
+        );
+        let f = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "standalone")
+            .expect("standalone function");
+        assert!(
+            f.owner_type.is_none(),
+            "free function should have no owner_type"
+        );
+    }
+
+    #[test]
+    fn test_scoped_call_has_qualifier() {
+        let result = parse_rust(
+            r#"
+struct Foo;
+impl Foo { pub fn new() -> Self { Foo } }
+fn main() {
+    let _x = Foo::new();
+}
+"#,
+        );
+        let new_ref = result
+            .references
+            .iter()
+            .find(|r| r.name == "new" && matches!(r.kind, ReferenceKind::Call))
+            .expect("Foo::new() call reference");
+        assert_eq!(
+            new_ref.qualifier.as_deref(),
+            Some("Foo"),
+            "Foo::new() should have qualifier = Foo"
+        );
+    }
+
+    #[test]
+    fn test_plain_call_no_qualifier() {
+        let result = parse_rust(
+            r#"
+fn helper() {}
+fn main() { helper(); }
+"#,
+        );
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("helper() call");
+        assert!(r.qualifier.is_none(), "plain call should have no qualifier");
+    }
+
+    #[test]
+    fn test_module_scoped_call_qualifier() {
+        let result = parse_rust(
+            r#"
+fn main() {
+    let _x = std::collections::HashMap::new();
+}
+"#,
+        );
+        let new_ref = result
+            .references
+            .iter()
+            .find(|r| r.name == "new" && matches!(r.kind, ReferenceKind::Call))
+            .expect("HashMap::new() call reference");
+        assert_eq!(
+            new_ref.qualifier.as_deref(),
+            Some("HashMap"),
+            "std::collections::HashMap::new() should have qualifier = HashMap"
         );
     }
 }

@@ -63,6 +63,7 @@ impl LanguageSupport for HelmSupport {
                 parent_idx: None,
                 unused_excluded: false,
                 complexity: None,
+                owner_type: None,
             });
         }
 
@@ -83,6 +84,8 @@ impl LanguageSupport for HelmSupport {
                     line,
                     from_symbol_idx: None,
                     kind: ReferenceKind::Call,
+                    qualifier: None,
+                    receiver_type_hint: None,
                 });
             }
         }
@@ -91,6 +94,7 @@ impl LanguageSupport for HelmSupport {
             symbols,
             imports: Vec::new(),
             references,
+            ..Default::default()
         }
     }
 }

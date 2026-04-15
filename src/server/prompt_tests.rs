@@ -128,7 +128,7 @@ fn qartez_onboard_prompt_biases_map_on_area_keyword() {
 }
 
 #[test]
-fn qartez_pre_merge_prompt_emits_one_step_per_changed_file() {
+fn qartez_pre_merge_prompt_recommends_diff_impact() {
     let (server, _dir) = make_server();
     let result = server.qartez_pre_merge_prompt(Parameters(SoulPreMergeArgs {
         files: "src/server/mod.rs, src/server/prompts.rs\nsrc/lib.rs".into(),
@@ -138,14 +138,11 @@ fn qartez_pre_merge_prompt_emits_one_step_per_changed_file() {
     assert!(text.contains("src/server/mod.rs"));
     assert!(text.contains("src/server/prompts.rs"));
     assert!(text.contains("src/lib.rs"));
-    assert!(text.contains("qartez_impact"));
-    assert!(text.contains("qartez_cochange"));
-    assert!(text.contains("qartez_unused"));
-    assert_eq!(
-        text.matches("qartez_impact").count(),
-        3,
-        "one qartez_impact invocation per changed file"
+    assert!(
+        text.contains("qartez_diff_impact"),
+        "should recommend qartez_diff_impact for batch analysis"
     );
+    assert!(text.contains("qartez_unused"));
 }
 
 #[test]
@@ -155,7 +152,10 @@ fn qartez_pre_merge_prompt_handles_empty_file_list() {
         files: "   ".into(),
     }));
     let text = user_text(&result);
-    assert!(text.contains("no files supplied"));
+    assert!(
+        text.contains("qartez_diff_impact"),
+        "empty file list should recommend qartez_diff_impact"
+    );
     assert!(text.contains("qartez_unused"));
 }
 
