@@ -29,63 +29,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Database ready at {}", config.db_path.display());
 
-    if config.has_project {
-        for root in &config.project_roots {
-            tracing::info!("Indexing root: {}", root.display());
-            index::full_index(&conn, root, config.reindex)?;
-        }
-        graph::pagerank::compute_pagerank(&conn, &Default::default())?;
-        graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
-        git::cochange::analyze_cochanges(
-            &conn,
-            &config.primary_root,
-            &git::cochange::CoChangeConfig {
-                commit_limit: config.git_depth,
-                ..Default::default()
-            },
-        )?;
-        tracing::info!("Index complete for {} root(s)", config.project_roots.len());
-
-        if let Some(wiki_path) = cli.wiki.as_ref() {
-            let project_name = config
-                .primary_root
-                .canonicalize()
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .or_else(|| {
-                    config
-                        .primary_root
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "project".to_string());
-            let wiki_cfg = graph::wiki::WikiConfig {
-                project_name,
-                recompute: true,
-                leiden: graph::leiden::LeidenConfig {
-                    resolution: cli.leiden_resolution,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let (markdown, modularity) = graph::wiki::render_wiki(&conn, &wiki_cfg)?;
-            let abs = config.primary_root.join(wiki_path);
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&abs, &markdown)?;
-            tracing::info!(
-                "Wrote {} bytes to {} (modularity {:.2})",
-                markdown.len(),
-                abs.display(),
-                modularity.unwrap_or(0.0),
-            );
-        }
-    } else {
+    if !config.has_project {
         tracing::info!("No project detected, starting MCP server with empty index");
     }
 
-    let server = server::QartezServer::new(conn, config.primary_root, config.git_depth);
+    // Create the server immediately — this wraps `conn` in Arc<Mutex<Connection>>
+    // so the MCP transport can start and respond to `initialize` right away.
+    // Indexing is deferred to a background task spawned after the handshake.
+    let server = server::QartezServer::new(conn, config.primary_root.clone(), config.git_depth);
+
+    // Grab the shared DB handle before `serve()` consumes the server.
+    let db_for_index = server.db_arc();
 
     if !cli.no_watch && config.has_project {
         let db = server.db_arc();
@@ -100,8 +54,90 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Start the MCP transport. `serve()` completes the initialize handshake
+    // and returns — tools are immediately available to the client.
     let transport = (tokio::io::stdin(), tokio::io::stdout());
     let service = server.serve(transport).await?;
+
+    // Spawn indexing as a background blocking task so it doesn't block the
+    // handshake. Tool calls that arrive before indexing finishes will block
+    // briefly on the DB mutex — acceptable; not connecting at all is not.
+    if config.has_project {
+        let roots = config.project_roots.clone();
+        let primary_root = config.primary_root.clone();
+        let git_depth = config.git_depth;
+        let reindex = config.reindex;
+        let wiki_path = cli.wiki.clone();
+        let leiden_resolution = cli.leiden_resolution;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db_for_index.lock().expect("qartez db mutex poisoned");
+            for root in &roots {
+                tracing::info!("Indexing root: {}", root.display());
+                if let Err(e) = index::full_index(&conn, root, reindex) {
+                    tracing::error!("indexing error for {}: {e}", root.display());
+                }
+            }
+            if let Err(e) = graph::pagerank::compute_pagerank(&conn, &Default::default()) {
+                tracing::error!("pagerank failed: {e}");
+            }
+            if let Err(e) = graph::pagerank::compute_symbol_pagerank(&conn, &Default::default()) {
+                tracing::error!("symbol pagerank failed: {e}");
+            }
+            if let Err(e) = git::cochange::analyze_cochanges(
+                &conn,
+                &primary_root,
+                &git::cochange::CoChangeConfig {
+                    commit_limit: git_depth,
+                    ..Default::default()
+                },
+            ) {
+                tracing::error!("cochange analysis failed: {e}");
+            }
+            tracing::info!("Index complete for {} root(s)", roots.len());
+
+            if let Some(wiki_path) = wiki_path.as_ref() {
+                let project_name = primary_root
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .or_else(|| {
+                        primary_root
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "project".to_string());
+                let wiki_cfg = graph::wiki::WikiConfig {
+                    project_name,
+                    recompute: true,
+                    leiden: graph::leiden::LeidenConfig {
+                        resolution: leiden_resolution,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                match graph::wiki::render_wiki(&conn, &wiki_cfg) {
+                    Ok((markdown, modularity)) => {
+                        let abs = primary_root.join(wiki_path);
+                        if let Some(parent) = abs.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = std::fs::write(&abs, &markdown) {
+                            tracing::error!("failed to write wiki: {e}");
+                        } else {
+                            tracing::info!(
+                                "Wrote {} bytes to {} (modularity {:.2})",
+                                markdown.len(),
+                                abs.display(),
+                                modularity.unwrap_or(0.0),
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!("wiki generation failed: {e}"),
+                }
+            }
+        });
+    }
 
     service.waiting().await?;
 
