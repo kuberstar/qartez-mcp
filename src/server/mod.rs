@@ -959,6 +959,7 @@ fn compute_cochange_pairs(
 fn is_test_path(path: &str) -> bool {
     // Directory-based patterns (all languages)
     if path.starts_with("tests/")
+        || path.starts_with("test/")
         || path.starts_with("benches/")
         || path.starts_with("__tests__/")
         || path.starts_with("spec/")
@@ -966,6 +967,7 @@ fn is_test_path(path: &str) -> bool {
         return true;
     }
     if path.contains("/tests/")
+        || path.contains("/test/")
         || path.contains("/benches/")
         || path.contains("/__tests__/")
         || path.contains("/spec/")
@@ -982,6 +984,10 @@ fn is_test_path(path: &str) -> bool {
         }
         // Go: _test.go
         if name.ends_with("_test.go") {
+            return true;
+        }
+        // Dart: _test.dart
+        if name.ends_with("_test.dart") {
             return true;
         }
         // TypeScript/JavaScript: .test.ts, .spec.ts, .test.tsx, .spec.tsx,
@@ -3487,7 +3493,7 @@ impl QartezServer {
         };
 
         let mut out = format!(
-            "files={} (src={}/test={}) loc={}/{} syms={} edges={} indexed={}/{}\n",
+            "files={} (src={}/test={}) loc={}/{} syms={} edges={} with_symbols={}/{}\n",
             file_count,
             src_files.len(),
             test_files.len(),
