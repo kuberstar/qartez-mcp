@@ -34,10 +34,7 @@ async fn main() -> anyhow::Result<()> {
             // Wiki generation depends on a fresh index + pagerank + co-change,
             // and the CLI caller is explicitly waiting for the output file.
             // Keep this path synchronous.
-            for root in &config.project_roots {
-                tracing::info!("Indexing root: {}", root.display());
-                index::full_index(&conn, root, config.reindex)?;
-            }
+            index::full_index_multi(&conn, &config.project_roots, config.reindex)?;
             graph::pagerank::compute_pagerank(&conn, &Default::default())?;
             graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
             git::cochange::analyze_cochanges(
@@ -102,15 +99,9 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                 };
-                for root in &project_roots {
-                    tracing::info!("Indexing root: {}", root.display());
-                    if let Err(e) = index::full_index(&conn, root, reindex) {
-                        tracing::error!(
-                            "background indexer: full_index failed for {}: {e}",
-                            root.display()
-                        );
-                        return;
-                    }
+                if let Err(e) = index::full_index_multi(&conn, &project_roots, reindex) {
+                    tracing::error!("background indexer: full_index_multi failed: {e}");
+                    return;
                 }
                 if let Err(e) = graph::pagerank::compute_pagerank(&conn, &Default::default()) {
                     tracing::error!("background indexer: pagerank failed: {e}");
@@ -139,7 +130,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("No project detected, starting MCP server with empty index");
     }
 
-    let server = server::QartezServer::new(conn, config.primary_root, config.git_depth);
+    let server = server::QartezServer::with_roots(
+        conn,
+        config.primary_root,
+        config.project_roots.clone(),
+        config.git_depth,
+    );
 
     if !cli.no_watch && config.has_project {
         let db = server.db_arc();

@@ -1,4 +1,3 @@
-<!-- qartez-mcp-instructions -->
 ## Qartez MCP
 
 Qartez is an AST-based code intelligence MCP server. Use its tools instead of built-in file tools for all code exploration. The index is pre-computed and uses 10-50x fewer tokens than raw file reads.
@@ -7,10 +6,10 @@ Qartez is an AST-based code intelligence MCP server. Use its tools instead of bu
 
 | Instead of | Use | When |
 |---|---|---|
-| File search (glob, find, ls) | `qartez_map` | Project structure, finding files |
-| Text search (grep_search, rg) | `qartez_grep` | Searching for symbols, types, functions |
-| Symbol lookup (grep_search) | `qartez_find` | Jump to a specific symbol definition |
-| File reading (read_file, cat) | `qartez_read` | Reading source code with semantic context |
+| File search (Glob, find, ls) | `qartez_map` | Project structure, finding files |
+| Text search (Grep, rg, grep) | `qartez_grep` | Searching for symbols, types, functions |
+| Symbol lookup (Grep, rg) | `qartez_find` | Jump to a specific symbol definition |
+| File reading (Read, cat, head) | `qartez_read` | Reading source code with semantic context |
 
 ### All 21 tools
 
@@ -37,4 +36,3 @@ Qartez is an AST-based code intelligence MCP server. Use its tools instead of bu
 Before editing a file that is central to the codebase, call `qartez_impact` with `file_path=<the file>` first. A file is considered load-bearing when its PageRank >= 0.05 or its transitive blast radius >= 10. Editing without checking impact risks breaking downstream dependents.
 
 Use built-in file tools ONLY for non-code content (config files, plain text search, file patterns qartez cannot handle).
-<!-- /qartez-mcp-instructions -->

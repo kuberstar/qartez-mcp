@@ -9,17 +9,17 @@
   </p>
   <p align="center">
     <a href="#quickstart">Quickstart</a> ·
-    <a href="#the-23-tools">23 Tools</a> ·
+    <a href="#the-27-tools">27 Tools</a> ·
     <a href="#benchmarks">Benchmarks</a> ·
     <a href="#comparison-with-alternatives">Comparison</a> ·
-    <a href="#supported-languages">34 Languages</a> ·
+    <a href="#supported-languages">37 Languages</a> ·
     <a href="#contributing">Contributing</a>
   </p>
   <p align="center">
     <img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg">
     <img alt="Rust" src="https://img.shields.io/badge/rust-2024-orange.svg">
-    <img alt="34 languages" src="https://img.shields.io/badge/languages-34-green.svg">
-    <img alt="23 MCP tools" src="https://img.shields.io/badge/MCP_tools-23-purple.svg">
+    <img alt="37 languages" src="https://img.shields.io/badge/languages-37-green.svg">
+    <img alt="27 MCP tools" src="https://img.shields.io/badge/MCP_tools-27-purple.svg">
     <img alt="Agent-native" src="https://img.shields.io/badge/agent--native-yes-ff69b4.svg">
   </p>
 </p>
@@ -48,9 +48,9 @@ The fix isn't a smarter model. It's a smarter index.
 
 ## Quickstart
 
-**Prerequisites:** macOS or Linux (Windows via [WSL 2](https://learn.microsoft.com/en-us/windows/wsl/install)). Rust toolchain (installed automatically if missing).
+**Prerequisites:** macOS or Linux (Windows via [WSL 2](https://learn.microsoft.com/en-us/windows/wsl/install)). Rust toolchain is installed automatically if missing.
 
-One command. No prerequisites needed.
+One command to install:
 
 ```bash
 curl -sSfL https://qartez.dev/install | sh
@@ -73,7 +73,7 @@ make deploy
 <details>
 <summary>Interactive install, targeted install, and other options</summary>
 
-### Works with 7 editors and agents
+### Works with 19 editors and agents
 
 A single Rust binary (`qartez-setup`) detects and configures every supported editor. No per-editor shell scripts, no copy-paste JSON.
 
@@ -84,7 +84,7 @@ qartez-setup --ide cursor,zed       # Configure specific IDEs only
 make uninstall                       # Remove qartez from every IDE and delete binaries
 ```
 
-Supported out of the box: **Claude Code**, **Cursor**, **Windsurf**, **Zed**, **Continue.dev**, **OpenCode**, **Codex CLI**.
+Supported out of the box: **Claude Code**, **Claude Desktop**, **Gemini**, **Cursor**, **Windsurf**, **Kiro**, **Zed**, **Continue.dev**, **Copilot CLI**, **Amazon Q**, **Amp**, **Cline**, **Roo Code**, **Goose**, **Warp**, **Augment**, **OpenCode**, **Codex CLI**, **Antigravity**.
 
 ### Targeted install
 
@@ -97,12 +97,24 @@ Configure a specific subset of IDEs only. Detected paths:
 | IDE | Config path |
 |---|---|
 | Claude Code | `~/.claude/settings.json` |
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Gemini | `~/.gemini/settings.json` |
 | Cursor | `~/.cursor/mcp.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Kiro | `~/.kiro/settings/mcp.json` |
 | Zed | `~/.config/zed/settings.json` |
 | Continue.dev | `~/.continue/config.yaml` |
+| Copilot CLI | `~/.copilot/mcp-config.json` |
+| Amazon Q | `~/.aws/amazonq/mcp.json` |
+| Amp | `~/.config/amp/settings.json` |
+| Cline | VS Code global storage `saoudrizwan.claude-dev/settings/cline_mcp_settings.json` |
+| Roo Code | VS Code global storage `rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json` |
+| Goose | `~/.config/goose/config.yaml` |
+| Warp | `~/.warp/mcp_settings.json` |
+| Augment | `~/.augment/settings.json` |
 | OpenCode | `~/.config/opencode/opencode.json` |
 | Codex CLI | `~/.codex/config.toml` |
+| Antigravity | `~/.gemini/antigravity/mcp_config.json` |
 
 Every install path is idempotent and backs up the existing config.
 
@@ -166,57 +178,63 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ---
 
-## The 23 tools
+## The 27 tools
 
 Think of these as the **standard library for AI code understanding**. Each one replaces a multi-step human workflow with a single, token-efficient call the agent can reason about.
 
-### Navigate and understand
+Tools are organized into **tiers** with progressive disclosure. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools enable: ["analysis"]` (or `"all"`).
+
+### Core (always available)
 
 | Tool | What it does |
 |---|---|
-| `qartez_map` | **Start here.** Project skeleton ranked by importance - PageRank, exports, blast radii. Boost by files or terms to focus on what you're working on. |
-| `qartez_find` | Jump to a symbol definition by exact name. File, line range, signature, visibility - no scanning. |
+| `qartez_map` | **Start here.** Project skeleton ranked by importance. PageRank, exports, blast radii. Boost by files or terms to focus on what you're working on. |
+| `qartez_find` | Jump to a symbol definition by exact name. File, line range, signature, visibility. No scanning. |
 | `qartez_grep` | FTS5 search across indexed symbols. Prefix matching, regex fallback, optional body search. |
-| `qartez_read` | Read one or more symbols' source code with line numbers. No file scanning - jumps directly to the symbol. |
+| `qartez_read` | Read one or more symbols' source code with line numbers. No file scanning. Jumps directly to the symbol. |
 | `qartez_outline` | Table of contents for any file: every symbol grouped by kind, with signatures. |
+| `qartez_impact` | **Call before editing any important file.** Shows direct importers, transitive dependents, and co-change partners. Everything that could break. |
+| `qartez_deps` | Dependency graph for a file: what it imports, what imports it. |
 | `qartez_stats` | Codebase dashboard: files, symbols, edges by language, most-connected files. |
 
-### Analyze dependencies and risk
+### Analysis (unlock via `qartez_tools`)
 
 | Tool | What it does |
 |---|---|
-| `qartez_impact` | **Call before editing any important file.** Shows direct importers, transitive dependents, and co-change partners - everything that could break. |
-| `qartez_diff_impact` | **Batch impact for a git diff range.** Pass a revspec like `main..HEAD` to get changed files with PageRank, union blast radius, convergence points (files affected by 2+ changes), and co-change omissions. One call replaces N calls to `qartez_impact` + `qartez_cochange`. |
-| `qartez_deps` | Dependency graph for a file: what it imports, what imports it. |
 | `qartez_refs` | Trace every usage of a symbol across the codebase, with optional transitive chains. |
 | `qartez_calls` | Call hierarchy: who calls this function, and what does it call. |
-| `qartez_hierarchy` | Type hierarchy queries: find all types implementing a trait/interface, or all traits/interfaces a type implements. Works across Rust, TypeScript, Java, Python, and Go. |
-| `qartez_cochange` | Files that historically change together in git - logical coupling invisible to the import graph. |
+| `qartez_cochange` | Files that historically change together in git. Logical coupling invisible to the import graph. |
 | `qartez_context` | Smart context builder: given files you plan to modify, returns the optimal set of related files to read first. |
 | `qartez_unused` | Dead-code finder: exported symbols with zero importers, pre-materialized at index time. |
-
-### Find risk and duplication
-
-| Tool | What it does |
-|---|---|
+| `qartez_diff_impact` | **Batch impact for a git diff range.** Pass a revspec like `main..HEAD` to get changed files with PageRank, union blast radius, convergence points, and co-change omissions. One call replaces N calls to `qartez_impact` + `qartez_cochange`. |
 | `qartez_hotspots` | **The refactor radar.** Ranks files and functions by hotspot score = **cyclomatic complexity x PageRank x (1 + churn)**. Points straight at the highest-risk code in the repo. |
 | `qartez_clones` | Structural code-clone detection via AST shape hashing (normalized past identifiers, literals, and comments). Finds duplicate logic the human reviewer would never spot. |
 | `qartez_boundaries` | Architecture-boundary enforcement. Declare "these modules may not import those" in `.qartez/boundaries.toml` and get every violating edge back. `suggest=true` seeds a starter config from the Leiden clustering. |
+| `qartez_hierarchy` | Type hierarchy queries: find all types implementing a trait/interface, or all traits/interfaces a type implements. Works across Rust, TypeScript, Java, Python, and Go. |
+| `qartez_trend` | Complexity trend over git history: tracks how a function's cyclomatic complexity evolved commit by commit. Flags functions that are GROWING, STABLE, or SHRINKING. |
+| `qartez_security` | Security scanner with 13 built-in rules. Regex-based pattern matching scored by PageRank to prioritize high-impact files. Custom rules via `.qartez/security.toml`. Filters by severity (low/medium/high/critical) and category. |
+| `qartez_semantic` | Semantic search using a local embedding model. Natural-language queries ranked by hybrid FTS5 + vector similarity (RRF). Requires the `semantic` cargo feature and a one-time model download (~270 MB). |
 
-### Refactor safely
+### Refactor (unlock via `qartez_tools`)
 
 | Tool | What it does |
 |---|---|
-| `qartez_rename` | Rename a symbol across the entire codebase - definition, imports, all usages. Preview by default, `apply=true` to execute. |
+| `qartez_rename` | Rename a symbol across the entire codebase. Definition, imports, all usages. Preview by default, `apply=true` to execute. |
 | `qartez_move` | Move a symbol to another file and rewrite all import paths. One MCP call. |
 | `qartez_rename_file` | Rename a file and update every import pointing to it. |
 
-### Build, test, document
+### Meta (unlock via `qartez_tools`)
 
 | Tool | What it does |
 |---|---|
 | `qartez_project` | Auto-detects your toolchain (Cargo, npm/bun/yarn, Go, Python, Make, Gradle) and runs test/build/lint/typecheck through a single tool. |
 | `qartez_wiki` | Generates a markdown architecture wiki using Leiden community detection on the import graph. Partitions files into clusters, names each one, and emits `ARCHITECTURE.md` with inter-cluster edges. |
+
+### Tier management
+
+| Tool | What it does |
+|---|---|
+| `qartez_tools` | **Always visible.** Lists all tiers and their tools. Use `enable: ["analysis"]`, `enable: ["all"]`, or `disable: ["refactor"]` to control which tools are exposed to the agent. Core tools cannot be disabled. |
 
 ---
 
@@ -260,9 +278,9 @@ Not claims. Measured. Reproducible. Run `make bench` and verify yourself.
 ### Headline
 
 **Aggregate token savings vs `Glob + Grep + Read + git log`: +91.5%**
-(sum of MCP 8,604 / sum of non-MCP 101,740 tokens across 23 scenarios on the Qartez self-bench.)
+(sum of MCP 8,604 / sum of non-MCP 101,740 tokens across 25 scenarios on the Qartez self-bench.)
 
-**LLM-judge quality (claude-opus-4-6):** **MCP 7.9 / 10** vs non-MCP **5.3 / 10** across five axes (correctness, completeness, usability, groundedness, conciseness), n=23.
+**LLM-judge quality (claude-opus-4-6):** **MCP 7.9 / 10** vs non-MCP **5.3 / 10** across five axes (correctness, completeness, usability, groundedness, conciseness), n=25.
 
 **Session cost context.** A typical Claude Code session starts at ~20,000 tokens of prompt overhead. A single `make bench` run saves ~93,000 tokens - **4.7 empty sessions** worth of budget bought back, just from routing questions through the right tool.
 
@@ -288,12 +306,12 @@ Not claims. Measured. Reproducible. Run `make bench` and verify yourself.
 | `qartez_map` | 92 | 405 | **+77.3%** | 4x |
 | `qartez_rename` | 180 | 327 | **+45.0%** | 16x |
 
-`qartez_hotspots`, `qartez_clones`, `qartez_boundaries`, `qartez_wiki`, `qartez_diff_impact`, and `qartez_hierarchy` are analytical tools with no meaningful grep/read equivalent - they solve problems the non-MCP stack cannot solve at all.
+`qartez_hotspots`, `qartez_clones`, `qartez_boundaries`, `qartez_wiki`, `qartez_diff_impact`, `qartez_hierarchy`, `qartez_trend`, and `qartez_tools` are analytical tools with no meaningful grep/read equivalent. They solve problems the non-MCP stack cannot solve at all.
 
 <details>
 <summary>Multi-language bench</summary>
 
-`make bench-all` runs the same 23-scenario harness against five pinned OSS fixtures - **`colinhacks/zod`** (TypeScript), **`spf13/cobra`** (Go), **`encode/httpx`** (Python), **`FasterXML/jackson-core`** (Java), plus the Qartez self-bench (Rust) - then emits a cross-language summary to `reports/benchmark-<lang>.md` plus a combined matrix. Every tool, every language, every scenario - measured with the `cl100k_base` tokenizer against a faithful `Glob + Grep + Read + git log` simulation.
+`make bench-all` runs the same 25-scenario harness against five pinned OSS fixtures - **`colinhacks/zod`** (TypeScript), **`spf13/cobra`** (Go), **`encode/httpx`** (Python), **`FasterXML/jackson-core`** (Java), plus the Qartez self-bench (Rust) - then emits a cross-language summary to `reports/benchmark-<lang>.md` plus a combined matrix. Every tool, every language, every scenario - measured with the `cl100k_base` tokenizer against a faithful `Glob + Grep + Read + git log` simulation.
 
 ```bash
 make bench          # Rust self-bench only - fresh measurements
@@ -313,7 +331,7 @@ Four layers, computed once, queried from SQLite on every tool call.
 
 ### 1. Tree-sitter parsing
 
-Every source file is parsed by a language-specific tree-sitter grammar. No LSP server, no per-language SDK installs, no cold-start penalty. The parser extracts symbols (functions, methods, types, constants), their signatures, line ranges, export visibility, import relationships, and - for 18 imperative languages - cyclomatic complexity per function.
+Every source file is parsed by a language-specific tree-sitter grammar. No LSP server, no per-language SDK installs, no cold-start penalty. The parser extracts symbols (functions, methods, types, constants), their signatures, line ranges, export visibility, import relationships, and - for 21 imperative languages - cyclomatic complexity per function.
 
 ### 2. Structural shape hashing
 
@@ -341,10 +359,10 @@ Everything lives in `.qartez/index.db` - a single SQLite file with FTS5 full-tex
 
 ## Supported languages
 
-One binary. No per-language setup. All 34 languages parsed by tree-sitter (with regex fallbacks for formats lacking a compatible grammar). 18 imperative languages also get cyclomatic complexity per function, powering `qartez_hotspots`.
+One binary. No per-language setup. All 37 languages parsed by tree-sitter (with regex fallbacks for formats lacking a compatible grammar). 21 imperative languages also get cyclomatic complexity per function, powering `qartez_hotspots`.
 
 <details>
-<summary>Full language table (34 languages)</summary>
+<summary>Full language table (37 languages)</summary>
 
 | Language | Extensions / Filenames |
 |---|---|
@@ -368,6 +386,9 @@ One binary. No per-language setup. All 34 languages parsed by tree-sitter (with 
 | Elixir | `.ex` `.exs` - `defmodule`, `def`/`defp`, `defstruct`, `alias`/`use`/`import` |
 | Zig | `.zig` - `pub fn`, structs, enums, unions, `@import` |
 | Nix | `.nix` - attribute bindings, functions, `import` paths |
+| Haskell | `.hs` `.lhs` - top-level functions, `data`, `newtype`, `type`, typeclasses, `import` |
+| OCaml | `.ml` `.mli` - `let` bindings, `type`, `module`, `class`, `exception`, `open`/`include` |
+| R | `.r` `.R` - function/variable assignments, S4/R6 classes, `library`/`require`/`source` |
 | Protobuf | `.proto` - `message`, `service`, `rpc`, `enum`, `import` |
 | SQL | `.sql` - `CREATE TABLE`/`VIEW`/`FUNCTION`/`PROCEDURE`, `ALTER`, `BEGIN...END` blocks |
 | HCL / Terraform | `.tf` - cross-file `var`/`local`/`module`/`data`/`resource` references |
@@ -385,7 +406,7 @@ One binary. No per-language setup. All 34 languages parsed by tree-sitter (with 
 
 </details>
 
-**Highlights:** TypeScript, Rust, Go, Python, Java, Kotlin, Swift, C#, C/C++, Ruby, PHP, Dart, Scala, Elixir, Zig, Lua, and 18 more. All 18 imperative languages include cyclomatic complexity scoring.
+**Highlights:** TypeScript, Rust, Go, Python, Java, Kotlin, Swift, C#, C/C++, Ruby, PHP, Dart, Scala, Elixir, Zig, Lua, Haskell, OCaml, R, and 17 more. All 21 imperative languages include cyclomatic complexity scoring.
 
 ---
 
@@ -399,13 +420,13 @@ Nine projects share the "MCP server for codebase intelligence" niche, sorted by 
 
 | Project | Stars | Impl. | Indexing approach | Languages | MCP tools |
 |---|---:|---|---|---:|---:|
-| **Qartez** (this repo) | new | **Rust** | tree-sitter + SQLite + PageRank + blast radius + co-change + complexity + clones + boundaries | **34** | **23** |
-| [Serena](https://github.com/oraios/serena) | 22.8k | Python | LSP (per-language language servers) | **46+** | ~35 |
-| [code-review-graph](https://github.com/tirth8205/code-review-graph) | 10.2k | Python | tree-sitter + SQLite + Leiden clustering | 22+ | 22 |
+| **Qartez** (this repo) | new | **Rust** | tree-sitter + SQLite + PageRank + blast radius + co-change + complexity + clones + boundaries | **37** | **27** |
+| [Serena](https://github.com/oraios/serena) | 23k | Python | LSP (per-language language servers) | **46+** | ~35 |
+| [code-review-graph](https://github.com/tirth8205/code-review-graph) | 10.4k | Python | tree-sitter + SQLite + Leiden clustering | 23+ | 28 |
 | [Claude-Context](https://github.com/zilliztech/claude-context) | 5.9k | TypeScript | Embeddings + Milvus/Zilliz vector DB | 14 | 4 |
-| [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) | 2.9k | Python | tree-sitter + KuzuDB / FalkorDB / Neo4j | 14 | 21 |
-| [Codebase-Memory MCP](https://github.com/DeusData/codebase-memory-mcp) | 1.5k | C | tree-sitter + SQLite + hybrid type resolution | **66** | 14 |
-| [Repowise](https://github.com/repowise-dev/repowise) | 1.1k | Python | Dependency graph + git history + LLM-generated docs | - | 7 |
+| [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) | 3k | Python | tree-sitter + KuzuDB / FalkorDB / Neo4j | 14 | 21 |
+| [Codebase-Memory MCP](https://github.com/DeusData/codebase-memory-mcp) | 1.6k | C | tree-sitter + SQLite + hybrid type resolution | **66** | 14 |
+| [Repowise](https://github.com/repowise-dev/repowise) | 1.2k | Python | Dependency graph + git history + LLM-generated docs | 14 | 7 |
 | [Code Index MCP](https://github.com/johnhuang316/code-index-mcp) | 903 | Python | tree-sitter (10 langs) + ripgrep fallback for 50+ | 10 + 50 | 11 |
 | [Codanna](https://github.com/bartolli/codanna) | 651 | **Rust** | tree-sitter + tantivy FTS + fastembed | 15 | ~9 |
 
@@ -418,7 +439,7 @@ Nine projects share the "MCP server for codebase intelligence" niche, sorted by 
 | **PageRank importance ranking** | **Yes** | No | No | No | No | No | No | No | No |
 | **Blast radius (transitive dependents)** | **Yes** | No | Yes | No | No | Yes | No | No | Yes |
 | **Git co-change mining** | **Yes** | No | No | No | No | Yes | Yes | No | No |
-| **Cyclomatic complexity per function** | **Yes (18 langs)** | No | No | No | No | No | No | No | No |
+| **Cyclomatic complexity per function** | **Yes (21 langs)** | No | No | No | No | No | No | No | No |
 | **Hotspot scoring (complexity x PR x churn)** | **Yes** | No | No | No | No | No | No | No | No |
 | **Structural code-clone detection** | **Yes** | No | No | No | No | No | No | No | No |
 | **Architecture-boundary enforcement** | **Yes** | No | No | No | No | No | No | No | No |
@@ -430,12 +451,15 @@ Nine projects share the "MCP server for codebase intelligence" niche, sorted by 
 | **Smart multi-signal context builder** | **Yes** | No | Partial | No | No | No | No | No | No |
 | **Batch diff impact analysis** | **Yes** | No | No | No | No | No | No | No | No |
 | **MCP prompt templates** | **Yes (5)** | No | Yes (5) | No | No | No | No | No | No |
-| **One-command multi-IDE install** | **Yes (7 IDEs, Rust wizard)** | No (manual) | Yes (9 IDEs) | No (manual) | Yes (10 IDEs) | Yes (10 agents) | No | No | No |
-| Semantic / vector search | FTS5 only | No | Optional (FTS5 hybrid) | **Yes (Milvus)** | No | No | No | No | **Yes (fastembed)** |
+| **One-command multi-IDE install** | **Yes (19 IDEs, Rust wizard)** | No (manual) | Yes (9 IDEs) | No (manual) | Yes (10 IDEs) | Yes (10 agents) | No | No | No |
+| **Security scanning (regex + PageRank scoring)** | **Yes** | No | No | No | No | No | No | No | No |
+| **Complexity trend over git history** | **Yes** | No | No | No | No | No | No | No | No |
+| **Progressive tool disclosure (tiers)** | **Yes (4 tiers)** | No | No | No | No | No | No | No | No |
+| Semantic / vector search | **Yes (opt-in, local embedding)** | No | Optional (FTS5 hybrid) | **Yes (Milvus)** | No | No | No | No | **Yes (fastembed)** |
 | Community detection + auto-wiki | **Yes (Leiden + wiki)** | No | Yes (Leiden + wiki) | No | No | Partial (Louvain, no wiki) | No | No | No |
 | Graph visualization | No | No | Yes (D3.js) | No | Yes (Neo4j + HTML) | Yes (3D interactive) | No | No | No |
 | Watch mode (incremental re-index) | **Yes (auto-on)** | Partial | Yes | Partial | Yes | Yes | No | Yes | Yes |
-| **Published per-tool benchmarks with LLM judge** | **Yes (23 scenarios, 7.9/10 vs 5.3/10)** | Third-party only | Yes (6 repos, 8.2x avg) | Limited (~40% claim) | No | Yes (arXiv paper, 10x tokens) | No | No | Partial (criterion) |
+| **Published per-tool benchmarks with LLM judge** | **Yes (25 scenarios, 7.9/10 vs 5.3/10)** | Third-party only | Yes (6 repos, 8.2x avg) | Limited (~40% claim) | No | Yes (arXiv paper, 10x tokens) | No | No | Partial (criterion) |
 | **Modification guard (blocks risky edits)** | **Yes** | No | No | No | No | No | No | No | No |
 | Embedding model / vector DB required | No | No | Optional | **Yes** | No | No | No | No | **Yes** |
 | Cloud dependency | No | No | No | Yes (default) | No | No | No | No | Optional |
@@ -486,15 +510,15 @@ Qartez gives you the same structural intelligence these platforms sell - running
 
 **1. Quad-signal impact analysis.** `qartez_impact`, `qartez_diff_impact`, `qartez_context`, and `qartez_hotspots` fuse PageRank importance, static blast radius, git co-change, and cyclomatic complexity into one ranked answer. No other project combines all four.
 
-**2. Hotspots, clones, and boundaries - all in one server.** `qartez_hotspots` ranks the most dangerous functions in the repo by complexity x coupling x churn. `qartez_clones` finds duplicated logic via AST shape hashing. `qartez_boundaries` enforces architecture rules declared in `.qartez/boundaries.toml`. These are three separate commercial products elsewhere - one MCP call each here.
+**2. Hotspots, clones, boundaries, security, and trends in one server.** `qartez_hotspots` ranks the most dangerous functions in the repo by complexity x coupling x churn. `qartez_clones` finds duplicated logic via AST shape hashing. `qartez_boundaries` enforces architecture rules declared in `.qartez/boundaries.toml`. `qartez_security` scans for vulnerability patterns scored by PageRank. `qartez_trend` tracks how a function's complexity evolved commit by commit. These are five separate commercial products elsewhere, one MCP call each here.
 
 **3. Refactoring through MCP with preview and apply.** `qartez_rename`, `qartez_move`, and `qartez_rename_file` give the assistant atomic, reviewable refactors in a single MCP call. Serena offers rename via LSP (requires per-language server install); the remaining servers ship no refactoring tools at all.
 
 **4. Built-in safety net.** The modification guard blocks your AI from editing high-impact files without reviewing the blast radius first. No other server in the main competitor table ships this.
 
-**5. Measured, not claimed.** 23 scenarios, 7.9/10 vs 5.3/10 LLM-judge quality, per-tool token counts and latency - all reproducible with `make bench` (single-language) or `make bench-all` (5 languages with cross-language summary).
+**5. Measured, not claimed.** 25 scenarios, 7.9/10 vs 5.3/10 LLM-judge quality, per-tool token counts and latency. All reproducible with `make bench` (single-language) or `make bench-all` (5 languages with cross-language summary).
 
-**6. Rust-native, local-first, embedding-free.** Three binaries (`qartez-mcp`, `qartez-guard`, `qartez-setup`). No Python runtime, no embedding model, no vector database, no cloud account. Everything runs on your machine. No code leaves the box.
+**6. Rust-native, local-first, zero cloud dependency.** Three binaries (`qartez-mcp`, `qartez-guard`, `qartez-setup`). No Python runtime, no vector database, no cloud account. Everything runs on your machine. No code leaves the box. An optional `semantic` cargo feature adds local embedding search, but the default build needs no model download.
 
 ---
 
@@ -526,9 +550,11 @@ src/
   toolchain.rs             Toolchain detection (Cargo, npm, Go, etc.)
   watch.rs                 File watcher for incremental re-indexing
   guard.rs                 Guard acknowledgment helpers
+  embeddings.rs            Local embedding model for qartez_semantic (opt-in)
   server/
-    mod.rs                 MCP server - all 23 tool handlers
+    mod.rs                 MCP server - all 27 tool handlers
     prompts.rs             5 workflow prompt templates
+    tiers.rs               Progressive tool disclosure (core/analysis/refactor/meta)
     cache.rs               Response caching
     helpers.rs             Shared handler utilities
     overview.rs            Overview/map generation
@@ -539,24 +565,27 @@ src/
     walker.rs              File discovery (respects .gitignore)
     parser.rs              Tree-sitter parser pool
     symbols.rs             Symbols / imports / references + AST shape hashing
-    languages/             34 language adapters (18 with cyclomatic complexity)
+    languages/             37 language adapters (21 with cyclomatic complexity)
   graph/
+    mod.rs                 Graph module root
     pagerank.rs            PageRank on import graph
     blast.rs               Blast radius BFS
     leiden.rs              Community detection (Leiden clustering)
     boundaries.rs          Architecture-boundary rules engine
+    security.rs            Security rule engine (powers qartez_security)
     wiki.rs                Architecture wiki renderer
   git/
     mod.rs                 Git module root
     cochange.rs            Co-change pair mining
     diff.rs                Diff range analysis (for qartez_diff_impact)
+    trend.rs               Complexity trend over git history
   storage/
     mod.rs                 Storage module root
     schema.rs              SQLite + FTS5 schema
     read.rs / write.rs     Query and mutation helpers
     models.rs              Row structs
   bin/
-    setup.rs               Interactive IDE setup wizard
+    setup.rs               Interactive IDE setup wizard (19 IDEs)
     guard.rs               PreToolUse modification guard
     benchmark.rs           Benchmark harness entry point
   benchmark/               Benchmark internals (cargo feature)

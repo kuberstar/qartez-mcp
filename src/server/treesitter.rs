@@ -22,12 +22,16 @@ pub(super) const IDENTIFIER_NODE_KINDS: &[&str] = &[
 /// Walk the tree once and group every identifier occurrence by its source
 /// text. Used to populate the cross-invocation identifier cache so later
 /// `qartez_rename` calls turn into O(1) HashMap lookups.
+///
+/// Uses iterative depth-first traversal with an explicit stack to avoid
+/// stack overflow on deeply nested ASTs.
 pub(super) fn collect_identifiers_grouped(
     cursor: &mut tree_sitter::TreeCursor,
     source: &[u8],
     results: &mut IdentMap,
 ) {
-    loop {
+    let mut reached_root = false;
+    while !reached_root {
         let node = cursor.node();
         if IDENTIFIER_NODE_KINDS.contains(&node.kind())
             && let Ok(text) = node.utf8_text(source)
@@ -41,12 +45,19 @@ pub(super) fn collect_identifiers_grouped(
         }
 
         if cursor.goto_first_child() {
-            collect_identifiers_grouped(cursor, source, results);
-            cursor.goto_parent();
+            continue;
         }
-
-        if !cursor.goto_next_sibling() {
-            break;
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -60,12 +71,15 @@ pub(super) const CALL_NODE_KINDS: &[&str] = &[
 
 pub(super) const CALLEE_FIELD_NAMES: &[&str] = &["function", "name", "method"];
 
+/// Uses iterative depth-first traversal with an explicit stack to avoid
+/// stack overflow on deeply nested ASTs.
 pub(super) fn collect_call_names(
     cursor: &mut tree_sitter::TreeCursor,
     source: &[u8],
     results: &mut Vec<(String, usize)>,
 ) {
-    loop {
+    let mut reached_root = false;
+    while !reached_root {
         let node = cursor.node();
         if CALL_NODE_KINDS.contains(&node.kind()) {
             for field in CALLEE_FIELD_NAMES {
@@ -93,12 +107,19 @@ pub(super) fn collect_call_names(
         }
 
         if cursor.goto_first_child() {
-            collect_call_names(cursor, source, results);
-            cursor.goto_parent();
+            continue;
         }
-
-        if !cursor.goto_next_sibling() {
-            break;
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

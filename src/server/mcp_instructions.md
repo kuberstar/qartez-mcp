@@ -9,17 +9,55 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 | Grep / rg | `qartez_find` | Looking up a specific symbol definition |
 | Read / cat | `qartez_read` | Reading symbol source code with context |
 
-## All 21 tools
+## Tool tiers
 
-**Navigate:** `qartez_map` (project skeleton), `qartez_find` (jump to symbol), `qartez_grep` (search symbols), `qartez_read` (read source), `qartez_outline` (file symbol table), `qartez_stats` (project metrics).
+Qartez organizes its 27 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
 
-**Analyze:** `qartez_impact` (blast radius before editing), `qartez_deps` (file dependency graph), `qartez_refs` (all usages of a symbol), `qartez_calls` (call hierarchy), `qartez_cochange` (git co-change partners), `qartez_context` (related files for a task), `qartez_unused` (dead exports).
+### Core (always available)
 
-**Risk:** `qartez_hotspots` (complexity x coupling x churn), `qartez_clones` (duplicate code via AST hashing), `qartez_boundaries` (architecture boundary rules).
+Navigate and assess before editing:
+- `qartez_map` -- project skeleton ranked by importance (start here)
+- `qartez_find` -- jump to a symbol definition by name
+- `qartez_grep` -- search indexed symbols by name, kind, or file
+- `qartez_read` -- read symbol source code with line numbers
+- `qartez_outline` -- file symbol table (table of contents)
+- `qartez_impact` -- blast radius before editing (MUST call before modifying load-bearing files)
+- `qartez_deps` -- file dependency graph
+- `qartez_stats` -- project metrics (LOC, languages, symbols)
 
-**Refactor:** `qartez_rename` (rename symbol across codebase), `qartez_move` (move symbol between files), `qartez_rename_file` (rename file, update imports).
+### Analysis (unlock via `qartez_tools enable: ["analysis"]`)
 
-**Build:** `qartez_project` (detected toolchain: test/build/lint), `qartez_wiki` (auto-generate ARCHITECTURE.md).
+Deep investigation for debugging, review, and architecture:
+- `qartez_refs` -- all usages of a symbol across the codebase
+- `qartez_calls` -- call hierarchy (callers and callees)
+- `qartez_cochange` -- files that historically change together in git
+- `qartez_context` -- related files for a task (surfaces files you might miss)
+- `qartez_unused` -- dead exports and unreferenced symbols
+- `qartez_diff_impact` -- blast radius of a git diff
+- `qartez_hotspots` -- complexity x coupling x churn ranking
+- `qartez_clones` -- duplicate code via AST hashing
+- `qartez_boundaries` -- architecture boundary rule violations
+- `qartez_hierarchy` -- type/trait inheritance hierarchy
+- `qartez_trend` -- symbol complexity trend over git history
+- `qartez_security` -- scan for OWASP-style vulnerabilities and insecure patterns
+- `qartez_semantic` -- semantic code search via embedding similarity (requires `semantic` feature)
+
+### Refactor (unlock via `qartez_tools enable: ["refactor"]`)
+
+Codebase-wide rename and move operations:
+- `qartez_rename` -- rename a symbol across all files
+- `qartez_move` -- move a symbol between files
+- `qartez_rename_file` -- rename a file and update all imports
+
+### Meta (unlock via `qartez_tools enable: ["meta"]`)
+
+Build toolchain and documentation:
+- `qartez_project` -- detected toolchain (test/build/lint commands)
+- `qartez_wiki` -- auto-generate ARCHITECTURE.md
+
+### Discovery tool
+
+- `qartez_tools` -- list available tiers, enable or disable tools on demand. Call with no arguments to see what is available. Use `enable: ["all"]` to unlock everything at once.
 
 ## Workflow
 
@@ -28,6 +66,7 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 3. `qartez_read` to read code with semantic context
 4. `qartez_impact` BEFORE modifying any heavily-imported file
 5. `qartez_context` before multi-file changes to surface files you might miss
+6. Unlock `analysis` or `refactor` tiers when you need deeper capabilities
 
 ## Modification guard
 

@@ -1685,3 +1685,101 @@ impl T for B { fn t(&self) {} }
         "incremental reindex should pick up new implementor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Security scanner
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_security_scan_detects_hardcoded_secret() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("config.rs"),
+        "pub fn load_config() {\n    let password = \"hunter2\";\n}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name("qartez_security", json!({}))
+        .expect("qartez_security dispatch");
+
+    assert!(
+        result.contains("hardcoded-secret"),
+        "expected hardcoded-secret finding, got: {result}"
+    );
+    assert!(
+        result.contains("Security Scan"),
+        "expected scan header, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_security_scan_empty_when_clean() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn safe_fn() -> i32 { 42 }\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name("qartez_security", json!({}))
+        .expect("qartez_security dispatch");
+
+    assert!(
+        result.contains("No security findings"),
+        "clean code should have no findings, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_security_scan_severity_filter() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    // unwrap() is Low severity, hardcoded secret is Critical.
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn risky() {\n    let x = Some(1).unwrap();\n    let password = \"s3cret!!\";\n}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    // With severity=critical, only the hardcoded secret should appear.
+    let result = server
+        .call_tool_by_name("qartez_security", json!({"severity": "critical"}))
+        .expect("qartez_security dispatch");
+
+    assert!(
+        result.contains("hardcoded-secret"),
+        "critical filter should include SEC001, got: {result}"
+    );
+    assert!(
+        !result.contains("unwrap-in-exported"),
+        "critical filter should exclude Low-severity unwrap, got: {result}"
+    );
+}

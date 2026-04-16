@@ -15,6 +15,7 @@ pub struct FileRow {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct SymbolRow {
     pub id: i64,
     pub file_id: i64,

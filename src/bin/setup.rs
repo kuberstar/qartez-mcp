@@ -26,6 +26,15 @@ const AGENTS_MD_SNIPPET: &str = include_str!("../../scripts/AGENTS.md.snippet");
 const CURSOR_RULE_MDC: &str = include_str!("../../scripts/cursor-rule.mdc");
 const GEMINI_MD_SNIPPET: &str = include_str!("../../scripts/GEMINI.md.snippet");
 
+/// Full instructions template for IDEs without a skill mechanism.
+/// Claude Code gets a minimal snippet instead (the skill covers everything).
+const INSTRUCTIONS_MD: &str = include_str!("../../scripts/instructions.md");
+
+// Skill files installed into ~/.claude/skills/qartez/ during setup.
+const SKILL_MD: &str = include_str!("../../scripts/skill/SKILL.md");
+const SKILL_TOOLS_MD: &str = include_str!("../../scripts/skill/references/tools.md");
+const SKILL_GUARD_MD: &str = include_str!("../../scripts/skill/references/guard.md");
+
 // -- CLI ---------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
@@ -68,18 +77,40 @@ enum Ide {
     Continue,
     OpenCode,
     Codex,
+    Kiro,
+    ClaudeDesktop,
+    CopilotCli,
+    AmazonQ,
+    Amp,
+    Goose,
+    Cline,
+    RooCode,
+    Warp,
+    Augment,
+    Antigravity,
 }
 
 impl Ide {
     const ALL: &'static [Ide] = &[
         Ide::ClaudeCode,
+        Ide::ClaudeDesktop,
         Ide::Gemini,
         Ide::Cursor,
         Ide::Windsurf,
+        Ide::Kiro,
         Ide::Zed,
         Ide::Continue,
+        Ide::CopilotCli,
+        Ide::AmazonQ,
+        Ide::Amp,
+        Ide::Cline,
+        Ide::RooCode,
+        Ide::Goose,
+        Ide::Warp,
+        Ide::Augment,
         Ide::OpenCode,
         Ide::Codex,
+        Ide::Antigravity,
     ];
 
     fn slug(self) -> &'static str {
@@ -92,12 +123,24 @@ impl Ide {
             Self::Continue => "continue",
             Self::OpenCode => "opencode",
             Self::Codex => "codex",
+            Self::Kiro => "kiro",
+            Self::ClaudeDesktop => "claude-desktop",
+            Self::CopilotCli => "copilot",
+            Self::AmazonQ => "amazonq",
+            Self::Amp => "amp",
+            Self::Goose => "goose",
+            Self::Cline => "cline",
+            Self::RooCode => "roo",
+            Self::Warp => "warp",
+            Self::Augment => "augment",
+            Self::Antigravity => "antigravity",
         }
     }
 
     fn from_slug(s: &str) -> Option<Self> {
         match s {
             "claude" | "claude-code" | "claudecode" => Some(Self::ClaudeCode),
+            "claude-desktop" | "claudedesktop" => Some(Self::ClaudeDesktop),
             "gemini" | "gemini-cli" | "geminicli" => Some(Self::Gemini),
             "cursor" => Some(Self::Cursor),
             "windsurf" => Some(Self::Windsurf),
@@ -105,6 +148,16 @@ impl Ide {
             "continue" => Some(Self::Continue),
             "opencode" => Some(Self::OpenCode),
             "codex" => Some(Self::Codex),
+            "kiro" => Some(Self::Kiro),
+            "copilot" | "copilot-cli" | "copilotcli" => Some(Self::CopilotCli),
+            "amazonq" | "amazon-q" | "q" => Some(Self::AmazonQ),
+            "amp" => Some(Self::Amp),
+            "goose" => Some(Self::Goose),
+            "cline" => Some(Self::Cline),
+            "roo" | "roo-code" | "roocode" => Some(Self::RooCode),
+            "warp" => Some(Self::Warp),
+            "augment" => Some(Self::Augment),
+            "antigravity" | "google-antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }
@@ -120,6 +173,17 @@ impl Ide {
             Self::Continue => home.join(".continue"),
             Self::OpenCode => home.join(".config").join("opencode"),
             Self::Codex => home.join(".codex"),
+            Self::Kiro => home.join(".kiro"),
+            Self::ClaudeDesktop => claude_desktop_dir(),
+            Self::CopilotCli => home.join(".copilot"),
+            Self::AmazonQ => home.join(".aws").join("amazonq"),
+            Self::Amp => home.join(".config").join("amp"),
+            Self::Goose => home.join(".config").join("goose"),
+            Self::Cline => vscode_global_storage().join("saoudrizwan.claude-dev"),
+            Self::RooCode => vscode_global_storage().join("rooveterinaryinc.roo-cline"),
+            Self::Warp => home.join(".warp"),
+            Self::Augment => home.join(".augment"),
+            Self::Antigravity => home.join(".gemini").join("antigravity"),
         }
     }
 
@@ -137,15 +201,99 @@ impl Ide {
             Self::Continue => home.join(".continue").join("config.yaml"),
             Self::OpenCode => home.join(".config").join("opencode").join("opencode.json"),
             Self::Codex => home.join(".codex").join("config.toml"),
+            Self::Kiro => home.join(".kiro").join("settings").join("mcp.json"),
+            Self::ClaudeDesktop => claude_desktop_dir().join("claude_desktop_config.json"),
+            Self::CopilotCli => home.join(".copilot").join("mcp-config.json"),
+            Self::AmazonQ => home.join(".aws").join("amazonq").join("mcp.json"),
+            Self::Amp => home.join(".config").join("amp").join("settings.json"),
+            Self::Goose => home.join(".config").join("goose").join("config.yaml"),
+            Self::Cline => vscode_global_storage()
+                .join("saoudrizwan.claude-dev")
+                .join("settings")
+                .join("cline_mcp_settings.json"),
+            Self::RooCode => vscode_global_storage()
+                .join("rooveterinaryinc.roo-cline")
+                .join("settings")
+                .join("cline_mcp_settings.json"),
+            Self::Warp => home.join(".warp").join("mcp_settings.json"),
+            Self::Augment => home.join(".augment").join("settings.json"),
+            Self::Antigravity => home
+                .join(".gemini")
+                .join("antigravity")
+                .join("mcp_config.json"),
+        }
+    }
+
+    /// CLI binary names to look for on `$PATH`. Empty means the IDE is a
+    /// GUI-only app detected via its `.app` bundle or config directory alone.
+    fn cli_binary_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &["claude"],
+            Self::Gemini => &["gemini"],
+            Self::Cursor => &["cursor"],
+            Self::Windsurf => &["windsurf"],
+            Self::Zed => &["zed", "zed-editor"],
+            Self::Continue => &[],
+            Self::OpenCode => &["opencode"],
+            Self::Codex => &["codex"],
+            Self::Kiro => &["kiro"],
+            Self::ClaudeDesktop => &[],
+            Self::CopilotCli => &["github-copilot"],
+            Self::AmazonQ => &["q"],
+            Self::Amp => &["amp"],
+            Self::Goose => &["goose"],
+            Self::Cline => &[],
+            Self::RooCode => &[],
+            Self::Warp => &["warp"],
+            Self::Augment => &[],
+            Self::Antigravity => &[],
+        }
+    }
+
+    /// macOS `.app` bundle names (checked in `/Applications`).
+    #[cfg(target_os = "macos")]
+    fn app_bundle_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeDesktop => &["Claude.app"],
+            Self::Cursor => &["Cursor.app"],
+            Self::Windsurf => &["Windsurf.app"],
+            Self::Zed => &["Zed.app"],
+            Self::Kiro => &["Kiro.app"],
+            Self::Warp => &["Warp.app"],
+            Self::Antigravity => &["Antigravity.app"],
+            _ => &[],
         }
     }
 
     fn is_detected(self) -> bool {
-        match self {
+        let has_config = match self {
             Self::ClaudeCode => !discover_claude_dirs().is_empty(),
             Self::Gemini => !discover_gemini_dirs().is_empty(),
             _ => self.detection_dir().is_dir(),
+        };
+        if !has_config {
+            return false;
         }
+        // Config dir exists; verify the IDE is actually installed by checking
+        // for a CLI binary on PATH or a macOS .app bundle.
+        let bins = self.cli_binary_names();
+        if bins.iter().any(|name| which_in_path(name).is_some()) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let apps = self.app_bundle_names();
+            let app_dir = PathBuf::from("/Applications");
+            if apps.iter().any(|name| app_dir.join(name).is_dir()) {
+                return true;
+            }
+        }
+        // VS Code extensions (Cline, RooCode, Continue, Augment): if the
+        // config dir exists the extension is installed, no separate binary.
+        matches!(
+            self,
+            Self::Cline | Self::RooCode | Self::Continue | Self::Augment
+        )
     }
 }
 
@@ -153,13 +301,24 @@ impl fmt::Display for Ide {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ClaudeCode => write!(f, "Claude Code"),
+            Self::ClaudeDesktop => write!(f, "Claude Desktop"),
             Self::Gemini => write!(f, "Gemini CLI"),
             Self::Cursor => write!(f, "Cursor"),
             Self::Windsurf => write!(f, "Windsurf"),
+            Self::Kiro => write!(f, "Kiro"),
             Self::Zed => write!(f, "Zed"),
             Self::Continue => write!(f, "Continue"),
+            Self::CopilotCli => write!(f, "Copilot CLI"),
+            Self::AmazonQ => write!(f, "Amazon Q"),
+            Self::Amp => write!(f, "Amp"),
+            Self::Cline => write!(f, "Cline"),
+            Self::RooCode => write!(f, "Roo Code"),
+            Self::Goose => write!(f, "Goose"),
+            Self::Warp => write!(f, "Warp"),
+            Self::Augment => write!(f, "Augment"),
             Self::OpenCode => write!(f, "OpenCode"),
             Self::Codex => write!(f, "Codex"),
+            Self::Antigravity => write!(f, "Antigravity"),
         }
     }
 }
@@ -175,6 +334,62 @@ fn dirs_replacement() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .expect("$HOME is not set")
+}
+
+/// Claude Desktop's config directory varies by platform.
+fn claude_desktop_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".config"))
+            .join("Claude")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+            .join("Claude")
+    }
+}
+
+/// VS Code stores extension data in a platform-specific global storage path.
+fn vscode_global_storage() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("globalStorage")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".config"))
+            .join("Code")
+            .join("User")
+            .join("globalStorage")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+            .join("Code")
+            .join("User")
+            .join("globalStorage")
+    }
 }
 
 fn discover_claude_dirs() -> Vec<PathBuf> {
@@ -399,7 +614,35 @@ fn install_ide(ide: Ide, bin: &str, guard_bin: Option<&str>) -> anyhow::Result<(
             install_json_mcp_servers(ide, bin)?;
             install_cursor_rule(&ide.detection_dir())?;
         }
-        Ide::Windsurf => install_json_mcp_servers(ide, bin)?,
+        Ide::Windsurf => {
+            install_json_mcp_servers(ide, bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Kiro => {
+            install_json_mcp_servers(ide, bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Warp => {
+            install_json_mcp_servers(ide, bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::ClaudeDesktop | Ide::AmazonQ | Ide::Antigravity => {
+            install_json_mcp_servers(ide, bin)?;
+        }
+        Ide::Cline | Ide::RooCode => {
+            install_json_mcp_servers(ide, bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Augment => {
+            install_augment(bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::CopilotCli => install_copilot_cli(bin)?,
+        Ide::Amp => {
+            install_amp(bin)?;
+            install_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Goose => install_goose(bin)?,
         Ide::Zed => install_zed(bin)?,
         Ide::Continue => install_continue(bin)?,
         Ide::OpenCode => {
@@ -427,7 +670,27 @@ fn uninstall_ide(ide: Ide) -> anyhow::Result<()> {
             uninstall_json_mcp_servers(ide)?;
             remove_cursor_rule(&ide.detection_dir())?;
         }
-        Ide::Windsurf => uninstall_json_mcp_servers(ide)?,
+        Ide::Windsurf | Ide::Kiro | Ide::Warp => {
+            uninstall_json_mcp_servers(ide)?;
+            remove_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::ClaudeDesktop | Ide::AmazonQ | Ide::Antigravity => {
+            uninstall_json_mcp_servers(ide)?;
+        }
+        Ide::Cline | Ide::RooCode => {
+            uninstall_json_mcp_servers(ide)?;
+            remove_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Augment => {
+            uninstall_augment()?;
+            remove_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::CopilotCli => uninstall_copilot_cli()?,
+        Ide::Amp => {
+            uninstall_amp()?;
+            remove_rules_file(&ide.detection_dir().join("rules"))?;
+        }
+        Ide::Goose => uninstall_goose()?,
         Ide::Zed => uninstall_zed()?,
         Ide::Continue => uninstall_continue()?,
         Ide::OpenCode => {
@@ -457,6 +720,7 @@ fn install_claude(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
         let fallback = home_dir().join(".claude");
         install_claude_one(&fallback, bin, guard_bin)?;
         install_claude_md_snippet(&fallback.join("CLAUDE.md"))?;
+        install_skill(&fallback)?;
         return Ok(());
     }
 
@@ -471,6 +735,9 @@ fn install_claude(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
     // CLAUDE.md snippet goes only into ~/.claude, not into variant dirs
     let primary = home_dir().join(".claude");
     install_claude_md_snippet(&primary.join("CLAUDE.md"))?;
+
+    // Install skill into ~/.claude/skills/qartez/ (all variants share it)
+    install_skill(&primary)?;
 
     Ok(())
 }
@@ -659,7 +926,23 @@ fn ensure_hook_entry_no_matcher(
             })
     });
 
-    if !already {
+    if already {
+        // Refresh command path (mirrors ensure_hook_entry behavior)
+        let mut updated = hooks_arr;
+        for entry in &mut updated {
+            if let Some(arr) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                for h in arr.iter_mut() {
+                    if h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(search_term))
+                    {
+                        h["command"] = serde_json::Value::String(command.to_string());
+                    }
+                }
+            }
+        }
+        settings["hooks"][hook_type] = serde_json::Value::Array(updated);
+    } else {
         let new_entry = serde_json::json!({
             "hooks": [{
                 "type": "command",
@@ -674,62 +957,12 @@ fn ensure_hook_entry_no_matcher(
 }
 
 fn install_claude_md_snippet(target: &Path) -> anyhow::Result<()> {
-    let begin = "<!-- qartez-mcp-instructions -->";
-    let end = "<!-- /qartez-mcp-instructions -->";
-
-    ensure_parent(target)?;
-
-    if !target.is_file() {
-        fs::write(target, CLAUDE_MD_SNIPPET)?;
-        info(&format!("Created {} with qartez snippet", target.display()));
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(target)?;
-    if !content.contains(begin) {
-        let mut out = content;
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(CLAUDE_MD_SNIPPET);
-        fs::write(target, out)?;
-        info(&format!("Appended qartez snippet to {}", target.display()));
-        return Ok(());
-    }
-
-    // Replace existing snippet between markers
-    let mut result = String::new();
-    let mut skipping = false;
-    for line in content.lines() {
-        if line == begin {
-            skipping = true;
-            result.push_str(CLAUDE_MD_SNIPPET);
-            if !CLAUDE_MD_SNIPPET.ends_with('\n') {
-                result.push('\n');
-            }
-            continue;
-        }
-        if line == end && skipping {
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-
-    if result.trim() == content.trim() {
-        info(&format!(
-            "Qartez snippet already up to date in {}",
-            target.display()
-        ));
-    } else {
-        fs::write(target, result)?;
-        info(&format!("Qartez snippet updated in {}", target.display()));
-    }
-    Ok(())
+    install_snippet(
+        target,
+        CLAUDE_MD_SNIPPET,
+        "<!-- qartez-mcp-instructions -->",
+        "<!-- /qartez-mcp-instructions -->",
+    )
 }
 
 fn remove_claude_md_snippet(target: &Path) -> anyhow::Result<()> {
@@ -1000,96 +1233,53 @@ fn remove_snippet(target: &Path, begin: &str, end: &str) -> anyhow::Result<()> {
 }
 
 /// Install or update the AGENTS.md snippet (for Codex and OpenCode).
-///
-/// Uses the same marker-based replacement logic as `install_claude_md_snippet`.
 fn install_agents_md_snippet(target: &Path) -> anyhow::Result<()> {
-    let begin = "<!-- qartez-mcp-instructions -->";
-    let end = "<!-- /qartez-mcp-instructions -->";
-
-    ensure_parent(target)?;
-
-    if !target.is_file() {
-        fs::write(target, AGENTS_MD_SNIPPET)?;
-        info(&format!("Created {} with qartez snippet", target.display()));
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(target)?;
-    if !content.contains(begin) {
-        let mut out = content;
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(AGENTS_MD_SNIPPET);
-        fs::write(target, out)?;
-        info(&format!("Appended qartez snippet to {}", target.display()));
-        return Ok(());
-    }
-
-    let mut result = String::new();
-    let mut skipping = false;
-    for line in content.lines() {
-        if line == begin {
-            skipping = true;
-            result.push_str(AGENTS_MD_SNIPPET);
-            if !AGENTS_MD_SNIPPET.ends_with('\n') {
-                result.push('\n');
-            }
-            continue;
-        }
-        if line == end && skipping {
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-
-    if result.trim() == content.trim() {
-        info(&format!(
-            "Qartez snippet already up to date in {}",
-            target.display()
-        ));
-    } else {
-        fs::write(target, result)?;
-        info(&format!("Qartez snippet updated in {}", target.display()));
-    }
-    Ok(())
+    install_snippet(
+        target,
+        AGENTS_MD_SNIPPET,
+        "<!-- qartez-mcp-instructions -->",
+        "<!-- /qartez-mcp-instructions -->",
+    )
 }
 
 fn remove_agents_md_snippet(target: &Path) -> anyhow::Result<()> {
-    let begin = "<!-- qartez-mcp-instructions -->";
-    let end = "<!-- /qartez-mcp-instructions -->";
+    remove_snippet(
+        target,
+        "<!-- qartez-mcp-instructions -->",
+        "<!-- /qartez-mcp-instructions -->",
+    )
+}
 
-    if !target.is_file() {
-        return Ok(());
-    }
-    let content = fs::read_to_string(target)?;
-    if !content.contains(begin) {
-        return Ok(());
-    }
+/// Install the qartez skill into `~/.claude/skills/qartez/`.
+///
+/// The skill provides on-demand workflow orchestration for qartez MCP tools,
+/// replacing the detailed instructions that previously lived in CLAUDE.md.
+/// Only the minimal tool-mapping table remains always-loaded; the full
+/// workflow guidance loads when the skill triggers.
+fn install_skill(claude_dir: &Path) -> anyhow::Result<()> {
+    let skill_dir = claude_dir.join("skills").join("qartez");
+    let refs_dir = skill_dir.join("references");
+    fs::create_dir_all(&refs_dir)?;
 
-    let mut result = String::new();
-    let mut skipping = false;
-    for line in content.lines() {
-        if line == begin {
-            skipping = true;
-            continue;
-        }
-        if line == end && skipping {
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            result.push_str(line);
-            result.push('\n');
-        }
+    let skill_path = skill_dir.join("SKILL.md");
+    let tools_path = refs_dir.join("tools.md");
+    let guard_path = refs_dir.join("guard.md");
+
+    fs::write(&skill_path, SKILL_MD)?;
+    fs::write(&tools_path, SKILL_TOOLS_MD)?;
+    fs::write(&guard_path, SKILL_GUARD_MD)?;
+
+    info(&format!("Skill installed: {}", skill_dir.display()));
+    Ok(())
+}
+
+/// Remove the qartez skill from `~/.claude/skills/qartez/`.
+fn remove_skill(claude_dir: &Path) -> anyhow::Result<()> {
+    let skill_dir = claude_dir.join("skills").join("qartez");
+    if skill_dir.is_dir() {
+        fs::remove_dir_all(&skill_dir)?;
+        info(&format!("Skill removed: {}", skill_dir.display()));
     }
-    fs::write(target, result)?;
-    info(&format!("Qartez snippet removed from {}", target.display()));
     Ok(())
 }
 
@@ -1121,6 +1311,39 @@ fn remove_cursor_rule(cursor_dir: &Path) -> anyhow::Result<()> {
     if target.is_file() {
         fs::remove_file(&target)?;
         info(&format!("Cursor rule removed: {}", target.display()));
+    }
+    Ok(())
+}
+
+/// Install the full instructions as a standalone markdown rules file.
+/// Used for IDEs that support a `rules/` directory (Kiro, Windsurf, etc.)
+/// but lack a skill mechanism.
+fn install_rules_file(rules_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(rules_dir)?;
+    let target = rules_dir.join("qartez.md");
+
+    if target.is_file() {
+        let current = fs::read_to_string(&target)?;
+        if current.trim() == INSTRUCTIONS_MD.trim() {
+            info(&format!(
+                "Rules file already up to date: {}",
+                target.display()
+            ));
+            return Ok(());
+        }
+        backup_file(&target)?;
+    }
+
+    fs::write(&target, INSTRUCTIONS_MD)?;
+    info(&format!("Rules file installed: {}", target.display()));
+    Ok(())
+}
+
+fn remove_rules_file(rules_dir: &Path) -> anyhow::Result<()> {
+    let target = rules_dir.join("qartez.md");
+    if target.is_file() {
+        fs::remove_file(&target)?;
+        info(&format!("Rules file removed: {}", target.display()));
     }
     Ok(())
 }
@@ -1192,9 +1415,10 @@ fn uninstall_claude() -> anyhow::Result<()> {
         }
     }
 
-    // CLAUDE.md snippet lives only in ~/.claude
+    // CLAUDE.md snippet and skill live only in ~/.claude
     let primary = home_dir().join(".claude");
     remove_claude_md_snippet(&primary.join("CLAUDE.md"))?;
+    remove_skill(&primary)?;
 
     info("Uninstall complete");
     Ok(())
@@ -1492,7 +1716,7 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
 
     let mapping = data
         .as_mapping_mut()
-        .expect("YAML config must be a mapping");
+        .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
     // Ensure mcpServers is a sequence
     let servers_key = serde_yaml::Value::String("mcpServers".into());
@@ -1562,7 +1786,7 @@ fn uninstall_continue() -> anyhow::Result<()> {
     let mut data: serde_yaml::Value = serde_yaml::from_str(&text)?;
     let mapping = data
         .as_mapping_mut()
-        .expect("YAML config must be a mapping");
+        .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
     let servers_key = serde_yaml::Value::String("mcpServers".into());
     let Some(servers) = mapping
@@ -1662,6 +1886,332 @@ fn uninstall_opencode() -> anyhow::Result<()> {
         mcp.remove("qartez");
     }
     write_json(&config_path, &data)?;
+    info(&format!("Removed qartez from {}", config_path.display()));
+    Ok(())
+}
+
+// -- Copilot CLI (JSON with `servers` key instead of `mcpServers`) -----------
+
+fn install_copilot_cli(bin: &str) -> anyhow::Result<()> {
+    let config_path = Ide::CopilotCli.config_path();
+    ensure_parent(&config_path)?;
+
+    let mut data = read_json(&config_path)?;
+    if data.get("servers").is_none() {
+        data["servers"] = serde_json::json!({});
+    }
+
+    let current = data["servers"]["qartez"]["command"]
+        .as_str()
+        .map(str::to_string);
+    if current.as_deref() == Some(bin) {
+        info(&format!(
+            "Copilot CLI already has qartez pointing at {bin} (no changes)."
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    data["servers"]["qartez"] = serde_json::json!({
+        "type": "stdio",
+        "command": bin,
+        "args": []
+    });
+    write_json(&config_path, &data)?;
+
+    if current.is_none() {
+        info(&format!(
+            "Added qartez to Copilot CLI config: {}",
+            config_path.display()
+        ));
+    } else {
+        info(&format!(
+            "Updated qartez in Copilot CLI config: {} -> {bin}",
+            current.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+fn uninstall_copilot_cli() -> anyhow::Result<()> {
+    let config_path = Ide::CopilotCli.config_path();
+    if !config_path.is_file() {
+        info(&format!(
+            "No Copilot CLI config found at {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    let mut data = read_json(&config_path)?;
+    let present = data.get("servers").and_then(|s| s.get("qartez")).is_some();
+    if !present {
+        info(&format!(
+            "qartez not present in {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    if let Some(servers) = data.get_mut("servers").and_then(|s| s.as_object_mut()) {
+        servers.remove("qartez");
+    }
+    write_json(&config_path, &data)?;
+    info(&format!("Removed qartez from {}", config_path.display()));
+    Ok(())
+}
+
+// -- Amp (JSON with `amp.mcpServers` key) ------------------------------------
+
+fn install_amp(bin: &str) -> anyhow::Result<()> {
+    let config_path = Ide::Amp.config_path();
+    ensure_parent(&config_path)?;
+
+    let mut data = read_json(&config_path)?;
+    if data.get("amp.mcpServers").is_none() {
+        data["amp.mcpServers"] = serde_json::json!({});
+    }
+
+    let current = data["amp.mcpServers"]["qartez"]["command"]
+        .as_str()
+        .map(str::to_string);
+    if current.as_deref() == Some(bin) {
+        info(&format!(
+            "Amp already has qartez pointing at {bin} (no changes)."
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    data["amp.mcpServers"]["qartez"] = serde_json::json!({
+        "command": bin,
+        "args": []
+    });
+    write_json(&config_path, &data)?;
+
+    if current.is_none() {
+        info(&format!(
+            "Added qartez to Amp config: {}",
+            config_path.display()
+        ));
+    } else {
+        info(&format!(
+            "Updated qartez in Amp config: {} -> {bin}",
+            current.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+fn uninstall_amp() -> anyhow::Result<()> {
+    let config_path = Ide::Amp.config_path();
+    if !config_path.is_file() {
+        info(&format!(
+            "No Amp config found at {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    let mut data = read_json(&config_path)?;
+    let present = data
+        .get("amp.mcpServers")
+        .and_then(|s| s.get("qartez"))
+        .is_some();
+    if !present {
+        info(&format!(
+            "qartez not present in {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    if let Some(servers) = data
+        .get_mut("amp.mcpServers")
+        .and_then(|s| s.as_object_mut())
+    {
+        servers.remove("qartez");
+    }
+    write_json(&config_path, &data)?;
+    info(&format!("Removed qartez from {}", config_path.display()));
+    Ok(())
+}
+
+// -- Augment (JSON with `mcpServers` in settings.json) -----------------------
+
+fn install_augment(bin: &str) -> anyhow::Result<()> {
+    let config_path = Ide::Augment.config_path();
+    ensure_parent(&config_path)?;
+
+    let mut data = read_json(&config_path)?;
+    if data.get("mcpServers").is_none() {
+        data["mcpServers"] = serde_json::json!({});
+    }
+
+    let current = data["mcpServers"]["qartez"]["command"]
+        .as_str()
+        .map(str::to_string);
+    if current.as_deref() == Some(bin) {
+        info(&format!(
+            "Augment already has qartez pointing at {bin} (no changes)."
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    data["mcpServers"]["qartez"] = serde_json::json!({
+        "command": bin,
+        "args": []
+    });
+    write_json(&config_path, &data)?;
+
+    if current.is_none() {
+        info(&format!(
+            "Added qartez to Augment config: {}",
+            config_path.display()
+        ));
+    } else {
+        info(&format!(
+            "Updated qartez in Augment config: {} -> {bin}",
+            current.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+fn uninstall_augment() -> anyhow::Result<()> {
+    let config_path = Ide::Augment.config_path();
+    if !config_path.is_file() {
+        info(&format!(
+            "No Augment config found at {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    let mut data = read_json(&config_path)?;
+    let present = data
+        .get("mcpServers")
+        .and_then(|s| s.get("qartez"))
+        .is_some();
+    if !present {
+        info(&format!(
+            "qartez not present in {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    if let Some(servers) = data.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+        servers.remove("qartez");
+    }
+    write_json(&config_path, &data)?;
+    info(&format!("Removed qartez from {}", config_path.display()));
+    Ok(())
+}
+
+// -- Goose (YAML with `extensions` key) --------------------------------------
+
+fn install_goose(bin: &str) -> anyhow::Result<()> {
+    let config_path = Ide::Goose.config_path();
+    ensure_parent(&config_path)?;
+
+    let mut data: serde_yaml::Value = if config_path.is_file() {
+        let text = fs::read_to_string(&config_path)?;
+        serde_yaml::from_str(&text).unwrap_or(serde_yaml::Value::Mapping(Default::default()))
+    } else {
+        serde_yaml::Value::Mapping(Default::default())
+    };
+
+    let mapping = data
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
+
+    let ext_key = serde_yaml::Value::String("extensions".into());
+    if !mapping.contains_key(&ext_key) || !mapping[&ext_key].is_mapping() {
+        mapping.insert(
+            ext_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+
+    let extensions = mapping[&ext_key]
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("Goose 'extensions' field is not a mapping"))?;
+
+    let qartez_key = serde_yaml::Value::String("qartez".into());
+
+    let desired = {
+        let mut m = serde_yaml::Mapping::new();
+        m.insert("command".into(), serde_yaml::Value::String(bin.into()));
+        m.insert("args".into(), serde_yaml::Value::Sequence(vec![]));
+        serde_yaml::Value::Mapping(m)
+    };
+
+    if extensions.get(&qartez_key) == Some(&desired) {
+        info(&format!(
+            "Goose already has qartez pointing at {bin} (no changes)."
+        ));
+        return Ok(());
+    }
+
+    let existed = extensions.contains_key(&qartez_key);
+    backup_file(&config_path)?;
+    extensions.insert(qartez_key, desired);
+
+    let out = serde_yaml::to_string(&data)?;
+    fs::write(&config_path, out)?;
+
+    if existed {
+        info(&format!(
+            "Updated qartez in Goose config: {}",
+            config_path.display()
+        ));
+    } else {
+        info(&format!(
+            "Added qartez to Goose config: {}",
+            config_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn uninstall_goose() -> anyhow::Result<()> {
+    let config_path = Ide::Goose.config_path();
+    if !config_path.is_file() {
+        info(&format!(
+            "No Goose config found at {}. Nothing to uninstall.",
+            config_path.display()
+        ));
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(&config_path)?;
+    let mut data: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    let mapping = data
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
+
+    let ext_key = serde_yaml::Value::String("extensions".into());
+    let qartez_key = serde_yaml::Value::String("qartez".into());
+
+    let Some(extensions) = mapping.get_mut(&ext_key).and_then(|v| v.as_mapping_mut()) else {
+        info("qartez not present in Goose config. Nothing to uninstall.");
+        return Ok(());
+    };
+
+    if !extensions.contains_key(&qartez_key) {
+        info("qartez not present in Goose config. Nothing to uninstall.");
+        return Ok(());
+    }
+
+    backup_file(&config_path)?;
+    extensions.remove(&qartez_key);
+    let out = serde_yaml::to_string(&data)?;
+    fs::write(&config_path, out)?;
     info(&format!("Removed qartez from {}", config_path.display()));
     Ok(())
 }
@@ -1910,6 +2460,15 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Download the semantic search model when compiled with the feature.
+    #[cfg(feature = "semantic")]
+    if let Err(e) = download_semantic_model() {
+        eprintln!(
+            "  {} Failed to download semantic model: {e:#}",
+            style("[!]").yellow()
+        );
+    }
+
     eprintln!();
     if any_error {
         eprintln!(
@@ -1922,6 +2481,65 @@ fn run() -> anyhow::Result<()> {
             style("✓").green().bold()
         );
     }
+    Ok(())
+}
+
+// -- Semantic model download --------------------------------------------------
+
+/// Download the Jina Code v2 ONNX model and tokenizer for semantic search.
+///
+/// Files are stored in `~/.qartez/models/jina-embeddings-v2-base-code/`.
+/// Skips the download if the files already exist.
+#[cfg(feature = "semantic")]
+fn download_semantic_model() -> anyhow::Result<()> {
+    let model_dir = home_dir()
+        .join(".qartez")
+        .join("models")
+        .join("jina-embeddings-v2-base-code");
+
+    let model_path = model_dir.join("model.onnx");
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if model_path.exists() && tokenizer_path.exists() {
+        eprintln!(
+            "  {} Semantic model already downloaded at {}",
+            style("[=]").cyan(),
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    fs::create_dir_all(&model_dir)?;
+
+    let base_url = "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/main";
+
+    let files = [
+        ("model.onnx", &model_path),
+        ("tokenizer.json", &tokenizer_path),
+    ];
+
+    for (filename, dest) in &files {
+        if dest.exists() {
+            continue;
+        }
+        let url = format!("{base_url}/{filename}");
+        eprintln!("  {} Downloading {filename}...", style("[>]").cyan(),);
+        let status = Command::new("curl")
+            .args(["-fSL", "--progress-bar", "-o"])
+            .arg(dest.as_os_str())
+            .arg(&url)
+            .stdin(Stdio::null())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("curl failed to download {url}");
+        }
+    }
+
+    eprintln!(
+        "  {} Semantic model ready at {}",
+        style("[=]").green(),
+        model_dir.display()
+    );
     Ok(())
 }
 

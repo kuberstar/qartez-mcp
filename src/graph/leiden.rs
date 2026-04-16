@@ -349,6 +349,7 @@ pub fn compute_clusters(conn: &Connection, config: &LeidenConfig) -> Result<Clus
         upsert_file_cluster(&tx, file_id, cluster_id, computed_at)?;
     }
     tx.commit()?;
+    crate::storage::verify_foreign_keys(conn)?;
 
     let cluster_count = (next - 1) as usize;
     let misc_count = final_assignments

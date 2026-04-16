@@ -4,33 +4,41 @@ globs:
 alwaysApply: true
 ---
 
-# Qartez MCP -- Tool Priority
+## Qartez MCP
 
-When the `qartez` MCP server is available, use its tools INSTEAD OF built-in file tools for code exploration.
+Qartez is an AST-based code intelligence MCP server. Use its tools instead of built-in file tools for all code exploration. The index is pre-computed and uses 10-50x fewer tokens than raw file reads.
 
-## Tool mapping
+### Tool mapping
 
 | Instead of | Use | When |
 |---|---|---|
-| Glob / find | `qartez_map` | Project structure, finding files |
-| Grep / rg | `qartez_grep` | Searching for symbols, types, functions |
-| Grep / rg | `qartez_find` | Looking up a specific symbol definition |
-| Read / cat | `qartez_read` | Reading symbol source code with context |
+| File search (Glob, find, ls) | `qartez_map` | Project structure, finding files |
+| Text search (Grep, rg, grep) | `qartez_grep` | Searching for symbols, types, functions |
+| Symbol lookup (Grep, rg) | `qartez_find` | Jump to a specific symbol definition |
+| File reading (Read, cat, head) | `qartez_read` | Reading source code with semantic context |
 
-## All 21 tools
+### All 21 tools
 
-**Navigate:** `qartez_map`, `qartez_find`, `qartez_grep`, `qartez_read`, `qartez_outline`, `qartez_stats`
-**Analyze:** `qartez_impact`, `qartez_deps`, `qartez_refs`, `qartez_calls`, `qartez_cochange`, `qartez_context`, `qartez_unused`
-**Risk:** `qartez_hotspots`, `qartez_clones`, `qartez_boundaries`
-**Refactor:** `qartez_rename`, `qartez_move`, `qartez_rename_file`
-**Build:** `qartez_project`, `qartez_wiki`
+**Navigate:** `qartez_map` (project skeleton), `qartez_find` (jump to symbol), `qartez_grep` (search symbols), `qartez_read` (read source), `qartez_outline` (file symbol table), `qartez_stats` (project metrics).
 
-## Workflow
+**Analyze:** `qartez_impact` (blast radius before editing), `qartez_deps` (file dependency graph), `qartez_refs` (all usages of a symbol), `qartez_calls` (call hierarchy), `qartez_cochange` (git co-change partners), `qartez_context` (related files for a task), `qartez_unused` (dead exports).
 
-1. `qartez_map` -- understand project structure first
-2. `qartez_find` / `qartez_grep` -- locate symbols
-3. `qartez_read` -- read code with semantic context
-4. `qartez_impact` -- check before modifying exports
-5. `qartez_context` -- before multi-file changes, surface files you might miss
+**Risk:** `qartez_hotspots` (complexity x coupling x churn), `qartez_clones` (duplicate code via AST hashing), `qartez_boundaries` (architecture boundary rules).
 
-Use built-in file tools ONLY for non-code content (config files, text search, file patterns qartez cannot handle).
+**Refactor:** `qartez_rename` (rename symbol across codebase), `qartez_move` (move symbol between files), `qartez_rename_file` (rename file, update imports).
+
+**Build:** `qartez_project` (detected toolchain: test/build/lint), `qartez_wiki` (auto-generate ARCHITECTURE.md).
+
+### Workflow
+
+1. **`qartez_map`** first to understand project structure
+2. **`qartez_find`** / **`qartez_grep`** to locate symbols
+3. **`qartez_read`** to read code with semantic context
+4. **`qartez_impact`** BEFORE modifying any heavily-imported file
+5. **`qartez_context`** before multi-file changes to surface files you might miss
+
+### Modification guard
+
+Before editing a file that is central to the codebase, call `qartez_impact` with `file_path=<the file>` first. A file is considered load-bearing when its PageRank >= 0.05 or its transitive blast radius >= 10. Editing without checking impact risks breaking downstream dependents.
+
+Use built-in file tools ONLY for non-code content (config files, plain text search, file patterns qartez cannot handle).

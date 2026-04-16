@@ -8,6 +8,7 @@ pub mod dart;
 pub mod dockerfile;
 pub mod elixir;
 pub mod go;
+pub mod haskell;
 pub mod hcl;
 pub mod helm;
 pub mod java;
@@ -18,9 +19,11 @@ pub mod lua;
 pub mod makefile;
 pub mod nginx;
 pub mod nix;
+pub mod ocaml;
 pub mod php;
 pub mod protobuf;
 pub mod python;
+pub mod r;
 pub mod ruby;
 pub mod rust_lang;
 pub mod scala;
@@ -109,7 +112,7 @@ static PREFIX_REGISTRY: LazyLock<Vec<PrefixEntry>> = LazyLock::new(|| {
     entries
 });
 
-const ALL_LANGUAGES: [&dyn LanguageSupport; 34] = [
+const ALL_LANGUAGES: [&dyn LanguageSupport; 37] = [
     &typescript::TypeScriptSupport,
     &rust_lang::RustSupport,
     &go::GoSupport,
@@ -144,6 +147,9 @@ const ALL_LANGUAGES: [&dyn LanguageSupport; 34] = [
     &caddyfile::CaddyfileSupport,
     &systemd::SystemdSupport,
     &zig::ZigSupport,
+    &haskell::HaskellSupport,
+    &ocaml::OCamlSupport,
+    &r::RSupport,
 ];
 
 pub fn get_language_for_ext(ext: &str) -> Option<&'static dyn LanguageSupport> {

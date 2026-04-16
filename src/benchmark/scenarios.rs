@@ -524,7 +524,38 @@ fn impact_nonexistent_steps(_targets: &ResolvedTargets, profile: &LanguageProfil
     }]
 }
 
-/// The full per-tool scenario matrix. 17 tier-1 entries + 6 tier-2 entries.
+// T1-18. qartez_security
+fn security_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "severity": "medium" })
+}
+fn security_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // A non-MCP agent would run multiple greps for each vulnerability
+    // pattern and then manually correlate results across files.
+    vec![
+        SimStep::GrepContent {
+            regex: r#"(?i)(password|secret|api_key|token)\s*="#.to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"-----BEGIN .* PRIVATE KEY-----".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"(?i)(format!|\.format).*(?:SELECT|INSERT|DELETE|DROP)".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"\bunsafe\b".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"\.unwrap\(\)".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+    ]
+}
+
+/// The full per-tool scenario matrix. 18 tier-1 entries + 6 tier-2 entries.
 ///
 /// Pros/cons/verdicts are authored by hand — they encode judgment the
 /// harness can't infer from raw bytes, and they're what makes the final
@@ -948,7 +979,62 @@ pub const SCENARIOS: &[Scenario] = &[
         reference_answer: None,
         tier: 2,
     },
+    Scenario {
+        tool: "qartez_security",
+        id: "qartez_security_medium_severity",
+        description: "Scan for security vulnerabilities at medium+ severity. Consolidates 5+ grep passes into one scored report.",
+        mcp_args: security_args,
+        non_mcp_steps: security_steps,
+        pros: &[
+            "13 built-in rules in a single call vs 5+ separate greps",
+            "Risk scoring by PageRank prioritizes high-impact files",
+            "Custom rules via .qartez/security.toml",
+            "Category and severity filters reduce noise",
+        ],
+        cons: &[
+            "Regex patterns may produce false positives",
+            "Cannot detect logic-level vulnerabilities (auth bypass, IDOR)",
+        ],
+        verdict_summary: "MCP wins on consolidation and prioritization: non-MCP path requires one grep per pattern with no scoring or cross-referencing.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    #[cfg(feature = "semantic")]
+    Scenario {
+        tool: "qartez_semantic",
+        id: "qartez_semantic_auth_handler",
+        description: "Semantic search for authentication-related code.",
+        mcp_args: semantic_auth_args,
+        non_mcp_steps: semantic_auth_steps,
+        pros: &[
+            "Natural language query (no keyword guessing)",
+            "Hybrid FTS + vector ranking via RRF",
+            "Returns ranked symbols with relevance scores",
+        ],
+        cons: &[
+            "Requires model download (~270MB)",
+            "First query loads the model (~200ms cold start)",
+        ],
+        verdict_summary: "MCP wins: non-MCP path must grep for multiple keyword variants and manually rank; MCP captures semantic intent in a single query.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 2,
+    },
 ];
+
+// T2-7. qartez_semantic
+#[cfg(feature = "semantic")]
+fn semantic_auth_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "query": "authentication handler", "limit": 5 })
+}
+#[cfg(feature = "semantic")]
+fn semantic_auth_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    vec![SimStep::GrepContent {
+        regex: r"(?i)(auth|login|session|credential|token)".to_string(),
+        ext_filter: ext_filter_of(profile),
+    }]
+}
 
 #[cfg(test)]
 mod tests {
@@ -956,8 +1042,12 @@ mod tests {
 
     #[test]
     fn scenario_reference_answer_field_present() {
-        // 17 tier-1 + 6 tier-2 = 23 total scenarios.
-        assert_eq!(SCENARIOS.len(), 23);
+        // 18 tier-1 + 6 tier-2 = 24 without semantic, +1 with semantic = 25.
+        #[cfg(not(feature = "semantic"))]
+        let expected = 24;
+        #[cfg(feature = "semantic")]
+        let expected = 25;
+        assert_eq!(SCENARIOS.len(), expected);
         assert!(SCENARIOS[0].reference_answer.is_none());
         assert!(SCENARIOS.iter().all(|s| s.reference_answer.is_none()));
     }
@@ -965,13 +1055,17 @@ mod tests {
     #[test]
     fn tier_1_scenarios_count() {
         let tier1 = SCENARIOS.iter().filter(|s| s.tier == 1).count();
-        assert_eq!(tier1, 17);
+        assert_eq!(tier1, 18);
     }
 
     #[test]
     fn tier_2_scenarios_count() {
         let tier2 = SCENARIOS.iter().filter(|s| s.tier == 2).count();
-        assert_eq!(tier2, 6);
+        #[cfg(not(feature = "semantic"))]
+        let expected = 6;
+        #[cfg(feature = "semantic")]
+        let expected = 7;
+        assert_eq!(tier2, expected);
     }
 
     #[test]

@@ -12,3 +12,6 @@ pub mod watch;
 
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
+
+#[cfg(feature = "semantic")]
+pub mod embeddings;

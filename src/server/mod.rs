@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, ErrorData, GetPromptRequestParams, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourcesResult, PaginatedRequestParams, RawResource,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-    ServerInfo,
+    Annotated, CallToolResult, Content, ErrorData, GetPromptRequestParams, GetPromptResult,
+    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, RawResource, ReadResourceRequestParams, ReadResourceResult,
+    ResourceContents, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, prompt_handler, tool, tool_handler, tool_router};
@@ -18,6 +18,7 @@ mod helpers;
 mod overview;
 mod params;
 mod prompts;
+mod tiers;
 mod treesitter;
 
 use cache::ParseCache;
@@ -36,14 +37,26 @@ use crate::toolchain;
 pub struct QartezServer {
     db: Arc<Mutex<Connection>>,
     project_root: PathBuf,
+    project_roots: Vec<PathBuf>,
     git_depth: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     parse_cache: Arc<Mutex<ParseCache>>,
+    enabled_tools: tiers::EnabledTools,
 }
 
 impl QartezServer {
     pub fn new(conn: Connection, project_root: PathBuf, git_depth: u32) -> Self {
+        let project_roots = vec![project_root.clone()];
+        Self::with_roots(conn, project_root, project_roots, git_depth)
+    }
+
+    pub fn with_roots(
+        conn: Connection,
+        project_root: PathBuf,
+        project_roots: Vec<PathBuf>,
+        git_depth: u32,
+    ) -> Self {
         // Self-heal the body FTS index. Existing `.qartez/index.db` files
         // built before the schema-migration fix have an empty
         // `symbols_body_fts` because the old migration wiped it on every
@@ -63,22 +76,39 @@ impl QartezServer {
             .unwrap_or(0);
         if body_count == 0
             && symbol_count > 0
-            && let Err(e) = crate::storage::write::rebuild_symbol_bodies(&conn, &project_root)
+            && let Err(e) =
+                crate::storage::write::rebuild_symbol_bodies_multi(&conn, &project_roots)
         {
             tracing::warn!("failed to rebuild symbols_body_fts on server start: {e}");
         }
 
+        let router = Self::tool_router();
+        let all_names: Vec<String> = router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let enabled_tools = tiers::initial_enabled_tools(&all_names);
+
         Self {
             db: Arc::new(Mutex::new(conn)),
             project_root,
+            project_roots,
             git_depth,
-            tool_router: Self::tool_router(),
+            tool_router: router,
             parse_cache: Arc::new(Mutex::new(ParseCache::default())),
+            enabled_tools,
         }
     }
 
-    /// Resolve a user-supplied relative path against the project root,
+    /// Resolve a user-supplied relative path against the project root(s),
     /// rejecting absolute paths and directory traversal beyond the root.
+    ///
+    /// In multi-root mode, if the path starts with a prefix matching a
+    /// root's directory name (e.g. `repo-a/src/main.rs`), the prefix is
+    /// stripped and the remainder is resolved against that specific root.
+    /// This matches the path format produced by `full_index_root` when
+    /// `path_prefix` is set.
     ///
     /// Returns the joined absolute path on success. Returns an error if
     /// the path is absolute or if `..` components would escape the
@@ -112,6 +142,25 @@ impl QartezServer {
                 }
             }
         }
+
+        // Multi-root: check if the path's first component matches a root name.
+        // In that case, strip the prefix and resolve against that root.
+        if self.project_roots.len() > 1
+            && let Some(std::path::Component::Normal(first)) = path.components().next()
+        {
+            let first_str = first.to_string_lossy();
+            for root in &self.project_roots {
+                let root_name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                if first_str == root_name {
+                    let remainder: PathBuf = path.components().skip(1).collect();
+                    return Ok(root.join(remainder));
+                }
+            }
+        }
+
         Ok(self.project_root.join(user_path))
     }
 
@@ -207,15 +256,15 @@ impl QartezServer {
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let use_regex = params.regex.unwrap_or(false);
+        let regex_limit = params.limit.unwrap_or(100) as usize;
         let results: Vec<(
             crate::storage::models::SymbolRow,
             crate::storage::models::FileRow,
         )> = if use_regex {
             let re = regex::Regex::new(&params.name).map_err(|e| format!("regex error: {e}"))?;
             // Walk every indexed symbol once and keep regex hits. Scales
-            // linearly with corpus size — acceptable for the typical code
-            // base range (≤100k symbols) since the match itself is cheap,
-            // and exact-name lookups keep using the index.
+            // linearly with corpus size. The limit parameter caps the result
+            // set so callers do not accidentally pull back thousands of hits.
             let all_paths: std::collections::HashMap<String, crate::storage::models::FileRow> =
                 read::get_all_files(&conn)
                     .map_err(|e| format!("DB error: {e}"))?
@@ -224,9 +273,16 @@ impl QartezServer {
                     .collect();
             let all =
                 read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?;
+            if all.len() > 100_000 {
+                tracing::warn!(
+                    "regex scan over {} symbols; consider exact-name lookup for large indexes",
+                    all.len()
+                );
+            }
             all.into_iter()
                 .filter(|(s, _)| re.is_match(&s.name))
                 .filter_map(|(s, p)| all_paths.get(&p).cloned().map(|f| (s, f)))
+                .take(regex_limit)
                 .collect()
         } else {
             read::find_symbol_by_name(&conn, &params.name).map_err(|e| format!("DB error: {e}"))?
@@ -2924,7 +2980,7 @@ impl QartezServer {
 
     #[tool(
         name = "qartez_hotspots",
-        description = "Find hotspot files or functions — code that is simultaneously complex, highly-coupled, and frequently changed. Hotspot score = avg_complexity × pagerank × (1 + change_count). Use before refactoring to identify the highest-risk areas. Requires a prior index with git depth > 0.",
+        description = "Find hotspot files or functions with a normalized 0-10 health score. Combines complexity, coupling (PageRank), and churn (git change frequency) into both a raw hotspot score and a health rating (10 = healthiest, 0 = worst). Use sort_by to rank by any individual factor; use threshold to filter unhealthy code (e.g. threshold=4 shows only files scoring 4 or below). Requires a prior index with git depth > 0.",
         annotations(
             title = "Hotspot Analysis",
             read_only_hint = true,
@@ -2941,13 +2997,29 @@ impl QartezServer {
         let limit = params.limit.unwrap_or(20) as usize;
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(HotspotLevel::File);
+        let sort_by = params.sort_by.unwrap_or_default();
+        let threshold = params.threshold.map(|t| t.min(10) as f64);
+
+        // Health score per factor: 10 / (1 + value / halflife).
+        // The halflife is the value at which the factor score drops to 5.0.
+        //   Complexity: halflife = 10 (CC 10 is the conventional warning threshold)
+        //   Coupling:   halflife = 0.02 (top ~5% of files in a typical project)
+        //   Churn:      halflife = 8 (moderate activity over the indexed git window)
+        // Overall health = mean of the three factor scores, range [0, 10].
+        let health_of = |max_cc: f64, coupling: f64, churn: i64| -> f64 {
+            let cc_h = 10.0 / (1.0 + max_cc / 10.0);
+            let coupling_h = 10.0 / (1.0 + coupling * 50.0);
+            let churn_h = 10.0 / (1.0 + churn as f64 / 8.0);
+            (cc_h + coupling_h + churn_h) / 3.0
+        };
 
         match level {
             HotspotLevel::File => {
                 let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
 
                 // For each file, compute avg complexity of its functions.
-                let mut scored: Vec<(String, f64, f64, f64, i64, f64)> = Vec::new();
+                // Tuple: (path, score, avg_cc, max_cc, churn, coupling, health)
+                let mut scored: Vec<(String, f64, f64, f64, i64, f64, f64)> = Vec::new();
                 for file in &all_files {
                     let symbols = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
                     let complexities: Vec<u32> =
@@ -2964,12 +3036,33 @@ impl QartezServer {
                     // file), weighted by coupling and change frequency. Adding
                     // 1 to churn avoids zeroing out files with no git history.
                     let score = max_cc * coupling * (1.0 + churn as f64);
+                    let health = health_of(max_cc, coupling, churn);
                     if score > 0.0 {
-                        scored.push((file.path.clone(), score, avg_cc, max_cc, churn, coupling));
+                        scored.push((
+                            file.path.clone(),
+                            score,
+                            avg_cc,
+                            max_cc,
+                            churn,
+                            coupling,
+                            health,
+                        ));
                     }
                 }
 
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(max_health) = threshold {
+                    scored.retain(|entry| entry.6 <= max_health);
+                }
+
+                let cmp_f64 =
+                    |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                match sort_by {
+                    HotspotSortBy::Score => scored.sort_by(|a, b| cmp_f64(&b.1, &a.1)),
+                    HotspotSortBy::Health => scored.sort_by(|a, b| cmp_f64(&a.6, &b.6)),
+                    HotspotSortBy::Complexity => scored.sort_by(|a, b| cmp_f64(&b.3, &a.3)),
+                    HotspotSortBy::Coupling => scored.sort_by(|a, b| cmp_f64(&b.5, &a.5)),
+                    HotspotSortBy::Churn => scored.sort_by(|a, b| b.4.cmp(&a.4)),
+                }
                 scored.truncate(limit);
 
                 if scored.is_empty() {
@@ -2978,12 +3071,14 @@ impl QartezServer {
 
                 let mut out = String::new();
                 if concise {
-                    out.push_str("# score file avg_cc max_cc churn pagerank\n");
-                    for (i, (path, score, avg, max, churn, pr)) in scored.iter().enumerate() {
+                    out.push_str("# score health file avg_cc max_cc churn pagerank\n");
+                    for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
+                    {
                         out.push_str(&format!(
-                            "{} {:.2} {} {:.1} {:.0} {} {:.4}\n",
+                            "{} {:.2} {:.1} {} {:.1} {:.0} {} {:.4}\n",
                             i + 1,
                             score,
+                            health,
                             path,
                             avg,
                             max,
@@ -2994,15 +3089,20 @@ impl QartezServer {
                 } else {
                     out.push_str("# Hotspot Analysis (file level)\n\n");
                     out.push_str(
-                        "Hotspot score = max_complexity × pagerank × (1 + change_count)\n\n",
+                        "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
                     );
-                    out.push_str("  # | Score     | File                               | AvgCC | MaxCC | Churn | PageRank\n");
-                    out.push_str("----+-----------+------------------------------------+-------+-------+-------+---------\n");
-                    for (i, (path, score, avg, max, churn, pr)) in scored.iter().enumerate() {
+                    out.push_str(
+                        "Hotspot score = max_complexity x pagerank x (1 + change_count)\n\n",
+                    );
+                    out.push_str("  # | Score     | Health | File                               | AvgCC | MaxCC | Churn | PageRank\n");
+                    out.push_str("----+-----------+--------+------------------------------------+-------+-------+-------+---------\n");
+                    for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
+                    {
                         out.push_str(&format!(
-                            "{:>3} | {:>9.2} | {:<34} | {:>5.1} | {:>5.0} | {:>5} | {:>8.4}\n",
+                            "{:>3} | {:>9.2} | {:>6.1} | {:<34} | {:>5.1} | {:>5.0} | {:>5} | {:>8.4}\n",
                             i + 1,
                             score,
+                            health,
                             truncate_path(path, 34),
                             avg,
                             max,
@@ -3022,7 +3122,8 @@ impl QartezServer {
                 let file_churn: HashMap<i64, i64> =
                     all_files.iter().map(|f| (f.id, f.change_count)).collect();
 
-                let mut scored: Vec<(String, String, String, f64, u32, f64, i64)> = Vec::new();
+                // Tuple: (name, kind, path, score, cc, pagerank, churn, health)
+                let mut scored = Vec::<(String, String, String, f64, u32, f64, i64, f64)>::new();
                 for (sym, file_path) in &all_symbols {
                     let cc = match sym.complexity {
                         Some(c) if c > 0 => c,
@@ -3030,6 +3131,7 @@ impl QartezServer {
                     };
                     let churn = file_churn.get(&sym.file_id).copied().unwrap_or(0);
                     let score = cc as f64 * sym.pagerank * (1.0 + churn as f64);
+                    let health = health_of(cc as f64, sym.pagerank, churn);
                     if score > 0.0 {
                         scored.push((
                             sym.name.clone(),
@@ -3039,11 +3141,26 @@ impl QartezServer {
                             cc,
                             sym.pagerank,
                             churn,
+                            health,
                         ));
                     }
                 }
 
-                scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(max_health) = threshold {
+                    scored.retain(|entry| entry.7 <= max_health);
+                }
+
+                let cmp_f64 =
+                    |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                match sort_by {
+                    HotspotSortBy::Score => scored.sort_by(|a, b| cmp_f64(&b.3, &a.3)),
+                    HotspotSortBy::Health => scored.sort_by(|a, b| cmp_f64(&a.7, &b.7)),
+                    HotspotSortBy::Complexity => {
+                        scored.sort_by(|a, b| b.4.cmp(&a.4));
+                    }
+                    HotspotSortBy::Coupling => scored.sort_by(|a, b| cmp_f64(&b.5, &a.5)),
+                    HotspotSortBy::Churn => scored.sort_by(|a, b| b.6.cmp(&a.6)),
+                }
                 scored.truncate(limit);
 
                 if scored.is_empty() {
@@ -3052,12 +3169,15 @@ impl QartezServer {
 
                 let mut out = String::new();
                 if concise {
-                    out.push_str("# score name kind file cc pagerank churn\n");
-                    for (i, (name, kind, path, score, cc, pr, churn)) in scored.iter().enumerate() {
+                    out.push_str("# score health name kind file cc pagerank churn\n");
+                    for (i, (name, kind, path, score, cc, pr, churn, health)) in
+                        scored.iter().enumerate()
+                    {
                         out.push_str(&format!(
-                            "{} {:.4} {} {} {} {} {:.4} {}\n",
+                            "{} {:.4} {:.1} {} {} {} {} {:.4} {}\n",
                             i + 1,
                             score,
+                            health,
                             name,
                             kind,
                             path,
@@ -3068,14 +3188,20 @@ impl QartezServer {
                     }
                 } else {
                     out.push_str("# Hotspot Analysis (symbol level)\n\n");
-                    out.push_str("Hotspot score = complexity × symbol_pagerank × (1 + file_change_count)\n\n");
-                    out.push_str("  # | Score    | Symbol                    | Kind     | File                          | CC | PageRank | Churn\n");
-                    out.push_str("----+----------+---------------------------+----------+-------------------------------+----+----------+------\n");
-                    for (i, (name, kind, path, score, cc, pr, churn)) in scored.iter().enumerate() {
+                    out.push_str(
+                        "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
+                    );
+                    out.push_str("Hotspot score = complexity x symbol_pagerank x (1 + file_change_count)\n\n");
+                    out.push_str("  # | Score    | Health | Symbol                    | Kind     | File                          | CC | PageRank | Churn\n");
+                    out.push_str("----+----------+--------+---------------------------+----------+-------------------------------+----+----------+------\n");
+                    for (i, (name, kind, path, score, cc, pr, churn, health)) in
+                        scored.iter().enumerate()
+                    {
                         out.push_str(&format!(
-                            "{:>3} | {:>8.4} | {:<25} | {:<8} | {:<29} | {:>2} | {:>8.4} | {:>5}\n",
+                            "{:>3} | {:>8.4} | {:>6.1} | {:<25} | {:<8} | {:<29} | {:>2} | {:>8.4} | {:>5}\n",
                             i + 1,
                             score,
+                            health,
                             truncate_path(name, 25),
                             truncate_path(kind, 8),
                             truncate_path(path, 29),
@@ -3406,6 +3532,8 @@ impl QartezServer {
         let concise = is_concise(&params.format);
         let direction = params.direction.as_deref().unwrap_or("sub").to_lowercase();
         let transitive = params.transitive.unwrap_or(false);
+        const DEFAULT_MAX_DEPTH: u32 = 20;
+        let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
@@ -3450,6 +3578,9 @@ impl QartezServer {
                     }
                     let mut transitive_rows = Vec::new();
                     while let Some((name, depth)) = queue.pop_front() {
+                        if depth > max_depth {
+                            break;
+                        }
                         let sub_rows = read::get_subtypes(&conn, &name)
                             .map_err(|e| format!("DB error: {e}"))?;
                         for (rel, file) in sub_rows {
@@ -3508,6 +3639,9 @@ impl QartezServer {
                     }
                     let mut transitive_rows = Vec::new();
                     while let Some((name, depth)) = queue.pop_front() {
+                        if depth > max_depth {
+                            break;
+                        }
                         let sup_rows = read::get_supertypes(&conn, &name)
                             .map_err(|e| format!("DB error: {e}"))?;
                         for (rel, file) in sup_rows {
@@ -3541,6 +3675,498 @@ impl QartezServer {
 
         Ok(out)
     }
+
+    #[tool(
+        name = "qartez_trend",
+        description = "Show how a symbol's cyclomatic complexity changed over recent commits. Unlike qartez_hotspots (point-in-time), this reveals whether code is actively getting more complex (e.g. 'function grew from CC 8 to CC 39 over 5 commits'). Pass a file_path and optionally a symbol_name to focus on one function.",
+        annotations(
+            title = "Complexity Trend",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_trend(
+        &self,
+        Parameters(params): Parameters<SoulTrendParams>,
+    ) -> Result<String, String> {
+        if self.git_depth == 0 {
+            return Err(
+                "Complexity trend requires git history. Re-index with --git-depth > 0.".into(),
+            );
+        }
+
+        let limit = params.limit.unwrap_or(10);
+        let concise = matches!(params.format, Some(Format::Concise));
+
+        let trends = crate::git::trend::complexity_trend(
+            &self.project_root,
+            &params.file_path,
+            params.symbol_name.as_deref(),
+            limit,
+        )
+        .map_err(|e| format!("trend analysis failed: {e}"))?;
+
+        if trends.is_empty() {
+            return Ok(format!(
+                "No complexity trend data for `{}`. Possible reasons: file has fewer than 2 commits, no functions with measurable complexity, or symbol not found.",
+                params.file_path
+            ));
+        }
+
+        let mut out = String::new();
+
+        if concise {
+            out.push_str("# symbol commits first_cc last_cc delta% file\n");
+            for t in &trends {
+                let first_cc = t.points.first().map(|p| p.complexity).unwrap_or(0);
+                let last_cc = t.points.last().map(|p| p.complexity).unwrap_or(0);
+                let delta = if first_cc > 0 {
+                    ((last_cc as f64 - first_cc as f64) / first_cc as f64 * 100.0) as i64
+                } else {
+                    0
+                };
+                out.push_str(&format!(
+                    "{} {} {} {} {}% {}\n",
+                    t.symbol_name,
+                    t.points.len(),
+                    first_cc,
+                    last_cc,
+                    delta,
+                    t.file_path,
+                ));
+            }
+        } else {
+            out.push_str(&format!("# Complexity Trend: {}\n\n", params.file_path));
+
+            for t in &trends {
+                let first_cc = t.points.first().map(|p| p.complexity).unwrap_or(0);
+                let last_cc = t.points.last().map(|p| p.complexity).unwrap_or(0);
+                let delta = if first_cc > 0 {
+                    (last_cc as f64 - first_cc as f64) / first_cc as f64 * 100.0
+                } else {
+                    0.0
+                };
+
+                let direction = if delta > 10.0 {
+                    "GROWING"
+                } else if delta < -10.0 {
+                    "SHRINKING"
+                } else {
+                    "STABLE"
+                };
+
+                out.push_str(&format!(
+                    "## {} ({}) CC {} -> {} ({:+.0}% {})\n\n",
+                    t.symbol_name,
+                    t.points.len(),
+                    first_cc,
+                    last_cc,
+                    delta,
+                    direction,
+                ));
+
+                out.push_str("  Commit  | CC | Lines | Summary\n");
+                out.push_str("  --------+----+-------+--------\n");
+
+                for (i, p) in t.points.iter().enumerate() {
+                    let marker = if i > 0 {
+                        let prev = t.points[i - 1].complexity;
+                        if p.complexity > prev {
+                            " (+)"
+                        } else if p.complexity < prev {
+                            " (-)"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        ""
+                    };
+
+                    out.push_str(&format!(
+                        "  {} | {:>2}{:<4} | {:>5} | {}\n",
+                        p.commit_sha, p.complexity, marker, p.line_count, p.commit_summary,
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+
+        Ok(out)
+    }
+
+    #[tool(
+        name = "qartez_security",
+        description = "Scan indexed code for security vulnerability patterns (OWASP top-10, hardcoded secrets, injection, unsafe code). Findings are scored by severity x PageRank so vulnerabilities in high-impact files surface first. Supports custom rules via `.qartez/security.toml`.",
+        annotations(
+            title = "Security Scanner",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_security(
+        &self,
+        Parameters(params): Parameters<SoulSecurityParams>,
+    ) -> Result<String, String> {
+        use crate::graph::security::{
+            ScanOptions, Severity, apply_config, builtin_rules, load_custom_config, scan,
+        };
+
+        let concise = is_concise(&params.format);
+        let limit = params.limit.unwrap_or(50) as usize;
+        let offset = params.offset.unwrap_or(0) as usize;
+        let include_tests = params.include_tests.unwrap_or(false);
+
+        let min_severity = match params.severity.as_deref() {
+            Some("critical") => Severity::Critical,
+            Some("high") => Severity::High,
+            Some("medium") => Severity::Medium,
+            Some("low") | None => Severity::Low,
+            Some(other) => {
+                return Err(format!(
+                    "Unknown severity '{other}'. Use: low, medium, high, critical"
+                ));
+            }
+        };
+
+        let mut rules = builtin_rules();
+
+        // Load custom config if available.
+        let config_rel = params
+            .config_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".qartez/security.toml");
+        let config_abs = self.safe_resolve(config_rel)?;
+        if config_abs.exists() {
+            let config = load_custom_config(&config_abs)?;
+            apply_config(&mut rules, &config)?;
+        }
+
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+
+        let opts = ScanOptions {
+            include_tests,
+            category_filter: params.category.clone(),
+            min_severity,
+            file_path_filter: params.file_path.clone(),
+            project_roots: self.project_roots.clone(),
+        };
+
+        let findings = scan(&conn, &rules, &opts);
+        drop(conn);
+
+        if findings.is_empty() {
+            return Ok(
+                "No security findings. All scanned symbols passed the active rule set.".to_string(),
+            );
+        }
+
+        let total = findings.len();
+        let unique_files: HashSet<&str> = findings.iter().map(|f| f.file_path.as_str()).collect();
+        let file_count = unique_files.len();
+
+        let page: Vec<_> = findings.into_iter().skip(offset).take(limit).collect();
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# Security Scan: {} finding(s) across {} file(s)\n\n",
+            total, file_count,
+        ));
+
+        if concise {
+            out.push_str("# risk severity rule file symbol line\n");
+            for (i, f) in page.iter().enumerate() {
+                out.push_str(&format!(
+                    "{} {:.4} {} {} {} {} {}\n",
+                    offset + i + 1,
+                    f.risk_score,
+                    f.severity.label(),
+                    f.rule_name,
+                    f.file_path,
+                    f.symbol_name,
+                    f.line_start,
+                ));
+            }
+        } else {
+            out.push_str("  # | Risk   | Sev      | Rule              | File                          | Symbol          | Line\n");
+            out.push_str("----+--------+----------+-------------------+-------------------------------+-----------------+-----\n");
+            for (i, f) in page.iter().enumerate() {
+                out.push_str(&format!(
+                    "{:>3} | {:>6.4} | {:<8} | {:<17} | {:<29} | {:<15} | {}\n",
+                    offset + i + 1,
+                    f.risk_score,
+                    f.severity.label(),
+                    truncate_path(&f.rule_name, 17),
+                    truncate_path(&f.file_path, 29),
+                    truncate_path(&f.symbol_name, 15),
+                    f.line_start,
+                ));
+            }
+
+            // Append snippets for detailed mode.
+            let with_snippets: Vec<_> = page
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| f.snippet.as_ref().map(|s| (i, f, s)))
+                .collect();
+            if !with_snippets.is_empty() {
+                out.push_str("\n## Snippets\n\n");
+                for (i, f, snippet) in with_snippets {
+                    out.push_str(&format!(
+                        "  #{} [{}] {}:{} -- {}\n    {}\n",
+                        offset + i + 1,
+                        f.rule_id,
+                        f.file_path,
+                        f.line_start,
+                        f.description,
+                        snippet,
+                    ));
+                }
+            }
+        }
+
+        if total > offset + limit {
+            out.push_str(&format!(
+                "\nShowing {}-{} of {}. Use offset={} to see more.\n",
+                offset + 1,
+                offset + page.len(),
+                total,
+                offset + limit,
+            ));
+        }
+
+        Ok(out)
+    }
+
+    #[tool(
+        name = "qartez_tools",
+        description = "Discover and enable additional Qartez tools. Call with no arguments to see all available tiers and tools. Use enable/disable to dynamically add or remove tool tiers or individual tools. Tier names: 'core' (always on), 'analysis', 'refactor', 'meta'. Pass 'all' to enable everything.",
+        annotations(
+            title = "Tool Discovery",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn qartez_tools(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ToolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let is_listing = params.enable.is_none() && params.disable.is_none();
+
+        if is_listing {
+            let enabled = self
+                .enabled_tools
+                .read()
+                .expect("enabled_tools lock poisoned");
+            let mut out = String::from("# Qartez Tool Tiers\n\n");
+            for &tier_name in tiers::ALL_TIER_NAMES {
+                let tools = tiers::tier_tools(tier_name).unwrap_or_default();
+                let all_enabled = tools.iter().all(|t| enabled.contains(*t));
+                let status = if all_enabled { "enabled" } else { "disabled" };
+                out.push_str(&format!("## {tier_name} ({status})\n"));
+                for &tool_name in tools {
+                    let mark = if enabled.contains(tool_name) {
+                        "x"
+                    } else {
+                        " "
+                    };
+                    let desc = self
+                        .tool_router
+                        .get(tool_name)
+                        .map(|t| t.description.as_deref().unwrap_or(""))
+                        .unwrap_or("");
+                    let short = desc.split('.').next().unwrap_or(desc);
+                    out.push_str(&format!("- [{mark}] `{tool_name}` -- {short}\n"));
+                }
+                out.push('\n');
+            }
+            out.push_str("Use `enable: [\"analysis\"]` or `enable: [\"all\"]` to unlock tiers.\n");
+            out.push_str("Use `disable: [\"refactor\"]` to hide tiers.\n");
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
+        }
+
+        let mut changed = false;
+        {
+            let mut enabled = self
+                .enabled_tools
+                .write()
+                .expect("enabled_tools lock poisoned");
+
+            if let Some(ref targets) = params.enable {
+                for target in targets {
+                    if target == "all" {
+                        let all_tools = self.tool_router.list_all();
+                        for tool in &all_tools {
+                            if enabled.insert(tool.name.to_string()) {
+                                changed = true;
+                            }
+                        }
+                    } else if let Some(tools) = tiers::tier_tools(target) {
+                        for &name in tools {
+                            if enabled.insert(name.to_owned()) {
+                                changed = true;
+                            }
+                        }
+                    } else if self.tool_router.get(target).is_some()
+                        && enabled.insert(target.clone())
+                    {
+                        changed = true;
+                    }
+                }
+            }
+
+            if let Some(ref targets) = params.disable {
+                for target in targets {
+                    if target == "core" || target == tiers::META_TOOL_NAME {
+                        continue;
+                    }
+                    if let Some(tools) = tiers::tier_tools(target) {
+                        for &name in tools {
+                            if enabled.remove(name) {
+                                changed = true;
+                            }
+                        }
+                    } else if target != tiers::META_TOOL_NAME && enabled.remove(target.as_str()) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if changed {
+            let _ = context.peer.notify_tool_list_changed().await;
+        }
+
+        let enabled = self
+            .enabled_tools
+            .read()
+            .expect("enabled_tools lock poisoned");
+        let count = enabled.len();
+        let msg = if changed {
+            format!("Tool list updated. {count} tools now enabled.")
+        } else {
+            format!("No changes. {count} tools currently enabled.")
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        name = "qartez_semantic",
+        description = "Natural language code search. Finds symbols by meaning rather than exact keywords (e.g. 'authentication handler', 'database retry logic'). Combines vector similarity with keyword search via hybrid ranking. Requires `qartez-setup` to download the embedding model first.",
+        annotations(
+            title = "Semantic Search",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_semantic(
+        &self,
+        Parameters(params): Parameters<SemanticParams>,
+    ) -> Result<String, String> {
+        qartez_semantic_dispatch(self, params)
+    }
+}
+
+#[cfg(feature = "semantic")]
+fn qartez_semantic_dispatch(
+    server: &QartezServer,
+    params: SemanticParams,
+) -> Result<String, String> {
+    use std::sync::OnceLock;
+
+    // OnceLock caches the first result (success or failure) for the process
+    // lifetime. If model loading fails (e.g., missing files), subsequent
+    // calls return the cached error until the server is restarted.
+    static MODEL: OnceLock<std::result::Result<crate::embeddings::EmbeddingModel, String>> =
+        OnceLock::new();
+    let result = MODEL.get_or_init(|| {
+        let model_dir = match crate::embeddings::default_model_dir() {
+            Some(d) => d,
+            None => return Err("cannot determine home directory for model path".to_string()),
+        };
+        crate::embeddings::EmbeddingModel::load(&model_dir)
+            .map_err(|e| format!("failed to load embedding model (run `qartez-setup`): {e}"))
+    });
+    let model = result.as_ref().map_err(|e| e.clone())?;
+
+    let query_vec = model
+        .encode_one(&params.query)
+        .map_err(|e| format!("embedding encode failed: {e}"))?;
+
+    let conn = server
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {e}"))?;
+    let limit = params.limit.unwrap_or(10) as i64;
+    let concise = is_concise(&params.format);
+
+    let results = read::hybrid_search(&conn, &params.query, &query_vec, limit)
+        .map_err(|e| format!("search error: {e}"))?;
+
+    if results.is_empty() {
+        return Ok(format!(
+            "No semantic matches for '{}'. Ensure embeddings are built (re-index with `semantic` feature).",
+            params.query
+        ));
+    }
+
+    let mut out = format!(
+        "Found {} semantic match(es) for '{}':\n\n",
+        results.len(),
+        params.query,
+    );
+
+    for (rank, (sym, path, score)) in results.iter().enumerate() {
+        if concise {
+            let marker = if sym.is_exported { "+" } else { " " };
+            out.push_str(&format!(
+                " {marker} {} -- {} [L{}-L{}] score={:.3}\n",
+                sym.name, path, sym.line_start, sym.line_end, score,
+            ));
+        } else {
+            let sig = sym.signature.as_deref().unwrap_or("-");
+            let exported = if sym.is_exported {
+                "exported"
+            } else {
+                "private"
+            };
+            out.push_str(&format!(
+                "  #{} {} ({}) -- score={:.3}\n  File: {} [L{}-L{}]\n  Signature: {}\n  Status: {}\n\n",
+                rank + 1,
+                sym.name,
+                sym.kind,
+                score,
+                path,
+                sym.line_start,
+                sym.line_end,
+                sig,
+                exported,
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn qartez_semantic_dispatch(
+    _server: &QartezServer,
+    _params: SemanticParams,
+) -> Result<String, String> {
+    Err(
+        "Semantic search requires the `semantic` feature. Rebuild with: cargo install qartez-mcp --features semantic"
+            .to_string(),
+    )
 }
 
 #[cfg(feature = "benchmark")]
@@ -3676,6 +4302,22 @@ impl QartezServer {
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
                 self.qartez_hierarchy(Parameters(p))
             }
+            "qartez_trend" => {
+                let p: SoulTrendParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_trend(Parameters(p))
+            }
+            "qartez_security" => {
+                let p: SoulSecurityParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_security(Parameters(p))
+            }
+            "qartez_semantic" => {
+                let p: SemanticParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_semantic(Parameters(p))
+            }
+            "qartez_tools" => {
+                Err("qartez_tools is async-only (not available in benchmark mode)".to_owned())
+            }
             _ => Err(format!("unknown tool: {name}")),
         }
     }
@@ -3685,15 +4327,36 @@ impl QartezServer {
 #[prompt_handler]
 impl ServerHandler for QartezServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .enable_resources()
-                .build(),
-        )
-        .with_server_info(Implementation::new("qartez-mcp", env!("CARGO_PKG_VERSION")))
-        .with_instructions(include_str!("mcp_instructions.md"))
+        let mut caps = ServerCapabilities::builder().enable_tools();
+        if tiers::is_progressive_mode() {
+            caps = caps.enable_tool_list_changed();
+        }
+        let caps = caps.enable_prompts().enable_resources().build();
+        ServerInfo::new(caps)
+            .with_server_info(Implementation::new("qartez-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(include_str!("mcp_instructions.md"))
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        let enabled = self
+            .enabled_tools
+            .read()
+            .expect("enabled_tools lock poisoned");
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| enabled.contains(t.name.as_ref()))
+            .collect();
+        std::future::ready(Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        }))
     }
 
     fn list_resources(
@@ -3774,6 +4437,7 @@ impl ServerHandler for QartezServer {
                     limit: Some(15),
                     level: Some(HotspotLevel::File),
                     format: Some(Format::Concise),
+                    ..Default::default()
                 };
                 let text = self
                     .qartez_hotspots(Parameters(params))
@@ -3799,6 +4463,110 @@ impl ServerHandler for QartezServer {
             )),
         };
         std::future::ready(result)
+    }
+}
+
+#[cfg(test)]
+mod progressive_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_server() -> QartezServer {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::schema::create_schema(&conn).unwrap();
+        QartezServer::new(conn, std::path::PathBuf::from("/tmp/test"), 0)
+    }
+
+    #[test]
+    fn tool_router_includes_qartez_tools() {
+        let server = test_server();
+        let all = server.tool_router.list_all();
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"qartez_tools"),
+            "qartez_tools not in router: {names:?}"
+        );
+    }
+
+    #[test]
+    fn default_mode_enables_all_tools() {
+        let server = test_server();
+        let enabled = server.enabled_tools.read().unwrap();
+        let all = server.tool_router.list_all();
+        for tool in &all {
+            assert!(
+                enabled.contains(tool.name.as_ref()),
+                "{} not enabled in default mode",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_tools_always_include_meta_tool() {
+        let server = test_server();
+        let enabled = server.enabled_tools.read().unwrap();
+        assert!(enabled.contains("qartez_tools"));
+    }
+
+    #[test]
+    fn tier_constants_cover_all_router_tools() {
+        let server = test_server();
+        let all = server.tool_router.list_all();
+        let all_names: HashSet<&str> = all.iter().map(|t| t.name.as_ref()).collect();
+
+        let mut tiered: HashSet<&str> = HashSet::new();
+        for &name in tiers::TIER_CORE {
+            tiered.insert(name);
+        }
+        for &name in tiers::TIER_ANALYSIS {
+            tiered.insert(name);
+        }
+        for &name in tiers::TIER_REFACTOR {
+            tiered.insert(name);
+        }
+        for &name in tiers::TIER_META {
+            tiered.insert(name);
+        }
+        tiered.insert(tiers::META_TOOL_NAME);
+
+        for name in &all_names {
+            assert!(tiered.contains(name), "tool {name} is not in any tier");
+        }
+        for name in &tiered {
+            assert!(
+                all_names.contains(name),
+                "tiered tool {name} is not in router"
+            );
+        }
+    }
+
+    #[test]
+    fn total_tool_count_is_27() {
+        let server = test_server();
+        let all = server.tool_router.list_all();
+        assert_eq!(all.len(), 27, "expected 27 tools, got {}", all.len());
+    }
+
+    #[test]
+    fn tier_sizes_are_correct() {
+        assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 13, "analysis tier");
+        assert_eq!(tiers::TIER_REFACTOR.len(), 3, "refactor tier");
+        assert_eq!(tiers::TIER_META.len(), 2, "meta tier");
+        // 8 + 13 + 3 + 2 + 1 (qartez_tools) = 27
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[test]
+    fn call_tool_by_name_knows_qartez_tools() {
+        let server = test_server();
+        let result = server.call_tool_by_name("qartez_tools", serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("async-only"),
+            "should return async-only error, not unknown-tool"
+        );
     }
 }
 

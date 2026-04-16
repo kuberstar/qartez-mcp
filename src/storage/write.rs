@@ -6,6 +6,10 @@ use crate::error::Result;
 use crate::storage::models::SymbolInsert;
 use crate::storage::read::get_file_by_path;
 
+/// Maximum lines stored per symbol body in `symbols_body_fts`. Caps FTS
+/// storage at a bounded size — very large functions are truncated.
+const MAX_BODY_LINES: usize = 500;
+
 pub fn upsert_file(
     conn: &Connection,
     path: &str,
@@ -114,6 +118,16 @@ pub fn delete_file_data(conn: &Connection, file_id: i64) -> Result<()> {
         "DELETE FROM symbols_body_fts WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
         [file_id],
     )?;
+    // Embedding vectors are likewise standalone (FK ON DELETE CASCADE only
+    // fires for regular tables, not when the parent is deleted via cascade
+    // from files). Clean up before the symbol rows vanish.
+    #[cfg(feature = "semantic")]
+    {
+        conn.execute(
+            "DELETE FROM symbol_embeddings WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
+            [file_id],
+        )?;
+    }
     conn.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
     Ok(())
 }
@@ -134,6 +148,13 @@ pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
         "DELETE FROM symbols_body_fts WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
         [file_id],
     )?;
+    #[cfg(feature = "semantic")]
+    {
+        conn.execute(
+            "DELETE FROM symbol_embeddings WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
+            [file_id],
+        )?;
+    }
     conn.execute("DELETE FROM unused_exports WHERE file_id = ?1", [file_id])?;
     // symbol_refs cascade from symbols(id) ON DELETE CASCADE.
     conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
@@ -219,7 +240,23 @@ pub fn sync_fts(conn: &Connection) -> Result<()> {
 /// instead of streaming files at query time. Bounded by the per-symbol
 /// line range, so the extra storage is ~1-2× the codebase size.
 pub fn rebuild_symbol_bodies(conn: &Connection, project_root: &std::path::Path) -> Result<()> {
+    rebuild_symbol_bodies_multi(conn, &[project_root.to_path_buf()])
+}
+
+pub fn rebuild_symbol_bodies_multi(
+    conn: &Connection,
+    project_roots: &[std::path::PathBuf],
+) -> Result<()> {
     conn.execute("DELETE FROM symbols_body_fts", [])?;
+
+    // Build a map from root directory name to root path for prefix lookup.
+    let root_map: std::collections::HashMap<String, &std::path::Path> = project_roots
+        .iter()
+        .filter_map(|r| {
+            r.file_name()
+                .map(|n| (n.to_string_lossy().into_owned(), r.as_path()))
+        })
+        .collect();
 
     let mut select = conn.prepare(
         "SELECT s.id, s.line_start, s.line_end, f.path
@@ -242,20 +279,96 @@ pub fn rebuild_symbol_bodies(conn: &Connection, project_root: &std::path::Path) 
 
     let mut insert = conn.prepare("INSERT INTO symbols_body_fts (rowid, body) VALUES (?1, ?2)")?;
     for (rel_path, syms) in by_path {
-        let abs = project_root.join(&rel_path);
+        // Try multi-root prefix resolution: if the first path component
+        // matches a known root name, resolve against that root.
+        let abs = if project_roots.len() > 1 {
+            let p = std::path::Path::new(&rel_path);
+            if let Some(std::path::Component::Normal(first)) = p.components().next() {
+                let first_str = first.to_string_lossy();
+                if let Some(root) = root_map.get(first_str.as_ref()) {
+                    let remainder: std::path::PathBuf = p.components().skip(1).collect();
+                    root.join(remainder)
+                } else {
+                    project_roots[0].join(&rel_path)
+                }
+            } else {
+                project_roots[0].join(&rel_path)
+            }
+        } else {
+            project_roots[0].join(&rel_path)
+        };
+
         let Ok(text) = std::fs::read_to_string(&abs) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
         for (id, line_start, line_end) in syms {
             let start = (line_start as usize).saturating_sub(1);
-            let end = (line_end as usize).min(lines.len());
+            let end = (line_end as usize)
+                .min(lines.len())
+                .min(start + MAX_BODY_LINES);
             if start >= lines.len() || start >= end {
                 continue;
             }
             let body = lines[start..end].join("\n");
             insert.execute(rusqlite::params![id, body])?;
         }
+    }
+    Ok(())
+}
+
+/// Insert `symbols_fts` entries for all symbols belonging to `file_id`.
+/// Called after `insert_symbols` during an incremental re-index so that only
+/// the affected file's entries are (re-)written rather than the whole table.
+/// `clear_file_content` must have already removed the old FTS rows for this
+/// file before this function is called.
+pub fn insert_fts_for_file(conn: &Connection, file_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO symbols_fts (rowid, name, kind, file_path)
+         SELECT s.id, s.name, s.kind, f.path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE s.file_id = ?1",
+        [file_id],
+    )?;
+    Ok(())
+}
+
+/// Insert `symbols_body_fts` entries for the symbols in a single file.
+/// Called during incremental re-indexing instead of `rebuild_symbol_bodies`
+/// (which rebuilds every file) to avoid unbounded WAL growth on large
+/// codebases. `clear_file_content` must have already removed the old body
+/// FTS rows for this file before this function is called.
+pub fn rebuild_symbol_bodies_for_file(
+    conn: &Connection,
+    project_root: &Path,
+    file_id: i64,
+    rel_path: &str,
+) -> Result<()> {
+    let abs = project_root.join(rel_path);
+    let Ok(text) = std::fs::read_to_string(&abs) else {
+        return Ok(());
+    };
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut select =
+        conn.prepare("SELECT id, line_start, line_end FROM symbols WHERE file_id = ?1")?;
+    let syms: Vec<(i64, u32, u32)> = select
+        .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(select);
+
+    let mut insert = conn.prepare("INSERT INTO symbols_body_fts (rowid, body) VALUES (?1, ?2)")?;
+    for (id, line_start, line_end) in syms {
+        let start = (line_start as usize).saturating_sub(1);
+        let end = (line_end as usize)
+            .min(lines.len())
+            .min(start + MAX_BODY_LINES);
+        if start >= lines.len() || start >= end {
+            continue;
+        }
+        let body = lines[start..end].join("\n");
+        insert.execute(rusqlite::params![id, body])?;
     }
     Ok(())
 }
@@ -308,6 +421,218 @@ pub fn upsert_file_cluster(
         rusqlite::params![file_id, cluster_id, computed_at],
     )?;
     Ok(())
+}
+
+/// Symbols grouped by file path: (symbol_id, line_start, line_end, name, kind).
+#[cfg(feature = "semantic")]
+type SymbolsByPath = std::collections::HashMap<String, Vec<(i64, u32, u32, String, String)>>;
+
+/// Wipe and rebuild the `symbol_embeddings` table by encoding every
+/// symbol's source body with the provided embedding model.
+///
+/// Follows the same multi-root path-resolution strategy as
+/// `rebuild_symbol_bodies_multi`: reads each source file once, slices
+/// by the symbol's line range, and batch-encodes the text.
+#[cfg(feature = "semantic")]
+pub fn rebuild_embeddings(
+    conn: &Connection,
+    model: &crate::embeddings::EmbeddingModel,
+    project_roots: &[std::path::PathBuf],
+) -> Result<()> {
+    conn.execute("DELETE FROM symbol_embeddings", [])?;
+
+    let root_map: std::collections::HashMap<String, &std::path::Path> = project_roots
+        .iter()
+        .filter_map(|r| {
+            r.file_name()
+                .map(|n| (n.to_string_lossy().into_owned(), r.as_path()))
+        })
+        .collect();
+
+    let mut select = conn.prepare(
+        "SELECT s.id, s.line_start, s.line_end, s.name, s.kind, f.path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id",
+    )?;
+    let rows: Vec<(i64, u32, u32, String, String, String)> = select
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(select);
+
+    // Group by file path so we read each source file once.
+    let mut by_path: SymbolsByPath = std::collections::HashMap::new();
+    for (id, s, e, name, kind, p) in rows {
+        by_path.entry(p).or_default().push((id, s, e, name, kind));
+    }
+
+    let mut insert =
+        conn.prepare("INSERT INTO symbol_embeddings (rowid, embedding) VALUES (?1, ?2)")?;
+
+    // Collect (id, text) pairs, then batch-encode.
+    let mut pending: Vec<(i64, String)> = Vec::new();
+
+    for (rel_path, syms) in &by_path {
+        let abs = resolve_abs_path(rel_path, project_roots, &root_map);
+        let Ok(text) = std::fs::read_to_string(&abs) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+
+        for &(id, line_start, line_end, ref name, ref kind) in syms {
+            let start = (line_start as usize).saturating_sub(1);
+            let end = (line_end as usize).min(lines.len());
+            if start >= lines.len() || start >= end {
+                continue;
+            }
+            let body = lines[start..end].join("\n");
+            // Prepend symbol metadata so the embedding captures the intent.
+            let embed_text = format!("{kind} {name}\n{body}");
+            pending.push((id, embed_text));
+        }
+    }
+
+    // Batch encode in chunks of 64.
+    for chunk in pending.chunks(64) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+        let embeddings = model
+            .encode_batch(&texts)
+            .map_err(|e| crate::error::QartezError::Integrity(format!("embedding encode: {e}")))?;
+        for ((id, _), vec) in chunk.iter().zip(embeddings.iter()) {
+            let blob = crate::embeddings::vec_to_blob(vec);
+            insert.execute(rusqlite::params![id, blob])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Incrementally embed symbols for a set of changed file IDs.
+///
+/// Deletes existing embeddings for symbols in those files, then encodes
+/// and inserts fresh vectors. Called during incremental re-indexing so only
+/// touched files pay the ONNX inference cost.
+#[cfg(feature = "semantic")]
+pub fn embed_symbols_incremental(
+    conn: &Connection,
+    model: &crate::embeddings::EmbeddingModel,
+    file_ids: &[i64],
+    project_roots: &[std::path::PathBuf],
+) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
+    let root_map: std::collections::HashMap<String, &std::path::Path> = project_roots
+        .iter()
+        .filter_map(|r| {
+            r.file_name()
+                .map(|n| (n.to_string_lossy().into_owned(), r.as_path()))
+        })
+        .collect();
+
+    // Delete stale embeddings for symbols in changed files.
+    for &fid in file_ids {
+        conn.execute(
+            "DELETE FROM symbol_embeddings WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
+            [fid],
+        )?;
+    }
+
+    // Collect symbol data for changed files.
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT s.id, s.line_start, s.line_end, s.name, s.kind, f.path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE s.file_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = file_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows: Vec<(i64, u32, u32, String, String, String)> = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut pending: Vec<(i64, String)> = Vec::new();
+    let mut by_path: SymbolsByPath = std::collections::HashMap::new();
+    for (id, s, e, name, kind, p) in rows {
+        by_path.entry(p).or_default().push((id, s, e, name, kind));
+    }
+
+    for (rel_path, syms) in &by_path {
+        let abs = resolve_abs_path(rel_path, project_roots, &root_map);
+        let Ok(text) = std::fs::read_to_string(&abs) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for &(id, line_start, line_end, ref name, ref kind) in syms {
+            let start = (line_start as usize).saturating_sub(1);
+            let end = (line_end as usize).min(lines.len());
+            if start >= lines.len() || start >= end {
+                continue;
+            }
+            let body = lines[start..end].join("\n");
+            let embed_text = format!("{kind} {name}\n{body}");
+            pending.push((id, embed_text));
+        }
+    }
+
+    let mut insert =
+        conn.prepare("INSERT INTO symbol_embeddings (rowid, embedding) VALUES (?1, ?2)")?;
+    for chunk in pending.chunks(64) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+        let embeddings = model
+            .encode_batch(&texts)
+            .map_err(|e| crate::error::QartezError::Integrity(format!("embedding encode: {e}")))?;
+        for ((id, _), vec) in chunk.iter().zip(embeddings.iter()) {
+            let blob = crate::embeddings::vec_to_blob(vec);
+            insert.execute(rusqlite::params![id, blob])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a relative DB path to an absolute filesystem path, handling
+/// multi-root prefix resolution.
+#[cfg(feature = "semantic")]
+fn resolve_abs_path(
+    rel_path: &str,
+    project_roots: &[std::path::PathBuf],
+    root_map: &std::collections::HashMap<String, &std::path::Path>,
+) -> std::path::PathBuf {
+    if project_roots.len() > 1 {
+        let p = std::path::Path::new(rel_path);
+        if let Some(std::path::Component::Normal(first)) = p.components().next() {
+            let first_str = first.to_string_lossy();
+            if let Some(root) = root_map.get(first_str.as_ref()) {
+                let remainder: std::path::PathBuf = p.components().skip(1).collect();
+                return root.join(remainder);
+            }
+        }
+    }
+    project_roots[0].join(rel_path)
 }
 
 pub fn insert_type_relations(

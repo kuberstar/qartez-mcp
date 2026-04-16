@@ -1,6 +1,6 @@
 [package]
 name = "qartez-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "MCP server for codebase intelligence — tree-sitter indexing, PageRank, blast radius"
 license-file = "LICENSE"
@@ -14,6 +14,7 @@ categories = ["development-tools", "command-line-utilities"]
 [features]
 default = []
 benchmark = ["dep:tiktoken-rs", "dep:glob"]
+semantic = ["dep:ort", "dep:tokenizers"]
 
 [[bin]]
 name = "qartez-mcp"
@@ -85,9 +86,18 @@ tree-sitter-zig = "1.1"
 tree-sitter-nix = "0.3"
 tree-sitter-groovy = "0.1"
 tree-sitter-dart = "0.1"
+tree-sitter-haskell = "0.23.1"
+tree-sitter-ocaml = "0.24.2"
+tree-sitter-r = "1.2.0"
+
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints.rust]
+unreachable_pub = "warn"
 
 [profile.release]
 opt-level = 3

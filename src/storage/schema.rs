@@ -144,6 +144,18 @@ const CREATE_IDX_TYPE_HIERARCHY_SUB: &str =
 const CREATE_IDX_TYPE_HIERARCHY_SUPER: &str =
     "CREATE INDEX IF NOT EXISTS idx_type_hierarchy_super ON type_hierarchy(super_name)";
 
+/// Pre-computed embedding vectors for semantic code search. Each row stores
+/// one 768-dimensional f32 vector as a raw little-endian BLOB (3072 bytes).
+/// The rowid matches `symbols.id` so a JOIN retrieves the symbol metadata
+/// without an extra lookup. Only populated when the `semantic` feature is
+/// active and a model has been downloaded via `qartez-setup`.
+#[cfg(feature = "semantic")]
+const CREATE_SYMBOL_EMBEDDINGS: &str = "
+CREATE TABLE IF NOT EXISTS symbol_embeddings (
+    rowid     INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    embedding BLOB    NOT NULL
+)";
+
 pub fn create_schema(conn: &Connection) -> Result<()> {
     // Phase 1: create tables (IF NOT EXISTS). Idempotent on existing DBs.
     conn.execute_batch(
@@ -162,6 +174,10 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         ]
         .join(";\n"),
     )?;
+
+    // Semantic embeddings table (feature-gated, additive).
+    #[cfg(feature = "semantic")]
+    conn.execute(CREATE_SYMBOL_EMBEDDINGS, [])?;
 
     // Phase 2: apply ALTER TABLE migrations BEFORE we touch indexes. Legacy
     // DBs missing the new `symbols.pagerank` column would otherwise break

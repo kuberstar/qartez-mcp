@@ -137,6 +137,23 @@ pub(super) enum HotspotLevel {
     Symbol,
 }
 
+/// Sorting axis for hotspot results.
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HotspotSortBy {
+    /// Composite hotspot score (default).
+    #[default]
+    Score,
+    /// Normalized 0-10 health rating (ascending: worst first).
+    Health,
+    /// Maximum cyclomatic complexity.
+    Complexity,
+    /// PageRank coupling weight.
+    Coupling,
+    /// Git change count.
+    Churn,
+}
+
 pub(super) fn is_concise(format: &Option<Format>) -> bool {
     matches!(format, Some(Format::Concise))
 }
@@ -192,6 +209,11 @@ pub(super) struct SoulFindParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub regex: Option<bool>,
+    #[schemars(
+        description = "Maximum number of results to return in regex mode. Default 100. Ignored for exact-name lookups."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -505,6 +527,15 @@ pub(super) struct SoulHotspotsParams {
         description = "'concise' = compact table, 'detailed' (default) = full breakdown with per-metric scores"
     )]
     pub format: Option<Format>,
+    #[schemars(
+        description = "Sort results by a specific factor instead of the default composite score. One of: 'score' (default), 'health', 'complexity', 'coupling', 'churn'."
+    )]
+    pub sort_by: Option<HotspotSortBy>,
+    #[schemars(
+        description = "Only show results with health score at or below this threshold (0-10 scale, 10 = healthiest). For example, threshold=4 shows only unhealthy code."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub threshold: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -578,8 +609,31 @@ pub(super) struct SoulBoundariesParams {
     pub format: Option<Format>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulTrendParams {
+    #[schemars(
+        description = "Relative file path to analyze complexity trend for. Aliases: `file`, `path`."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: String,
+    #[schemars(
+        description = "Optional symbol name to filter (e.g. a function name). When omitted, shows trends for all symbols in the file. Aliases: `name`, `symbol`."
+    )]
+    #[serde(alias = "name", alias = "symbol")]
+    pub symbol_name: Option<String>,
+    #[schemars(
+        description = "Max number of commits to analyze (default: 10, max: 50). Only commits that actually changed the file are counted."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact table, 'detailed' (default) = full breakdown with delta percentages"
+    )]
+    pub format: Option<Format>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SoulHierarchyParams {
+pub(super) struct SoulHierarchyParams {
     #[schemars(
         description = "Type or trait name to query (e.g. 'Display', 'LanguageSupport', 'Serializable'). Aliases: `name`, `type`, `trait`."
     )]
@@ -595,7 +649,79 @@ pub struct SoulHierarchyParams {
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub transitive: Option<bool>,
     #[schemars(
+        description = "Max depth for transitive traversal (default: 20). Only applies when transitive=true."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub max_depth: Option<u32>,
+    #[schemars(
         description = "'concise' = names only, 'detailed' (default) = full info with file paths and line numbers."
     )]
     pub format: Option<Format>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulSecurityParams {
+    #[schemars(
+        description = "Max number of findings to return (default: 50). Findings are sorted by risk score (severity x pagerank x export status)."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(description = "Skip the first N findings (for pagination). Combine with limit.")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub offset: Option<u32>,
+    #[schemars(
+        description = "Filter by vulnerability category: 'secrets', 'injection', 'crypto', 'unsafe', 'info-leak', 'review'."
+    )]
+    pub category: Option<String>,
+    #[schemars(
+        description = "Minimum severity threshold: 'low' (default), 'medium', 'high', 'critical'. Findings below this level are excluded."
+    )]
+    pub severity: Option<String>,
+    #[schemars(
+        description = "Scan only files whose path contains this substring. Omit to scan the entire project."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(description = "If true, include test/spec files in the scan (default: false).")]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_tests: Option<bool>,
+    #[schemars(
+        description = "Path to a custom rules TOML file, relative to the project root. Defaults to `.qartez/security.toml` if it exists."
+    )]
+    pub config_path: Option<String>,
+    #[schemars(
+        description = "'concise' = compact table, 'detailed' (default) = full table with snippets."
+    )]
+    pub format: Option<Format>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[allow(
+    dead_code,
+    reason = "fields read only when `semantic` feature is active"
+)]
+pub(super) struct SemanticParams {
+    #[schemars(
+        description = "Natural language query describing what you are looking for (e.g. 'authentication handler', 'database connection pooling', 'error retry logic')."
+    )]
+    pub query: String,
+    #[schemars(description = "Max number of results (default: 10)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "'concise' = symbol + file only, 'detailed' (default) = full info with scores and snippets"
+    )]
+    pub format: Option<Format>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ToolsParams {
+    #[schemars(
+        description = "Tiers or tool names to enable. Use tier names ('analysis', 'refactor', 'meta') or individual tool names ('qartez_refs', 'qartez_calls'). Pass 'all' to enable everything."
+    )]
+    pub enable: Option<Vec<String>>,
+    #[schemars(
+        description = "Tiers or tool names to disable. Same format as enable. 'core' and 'qartez_tools' cannot be disabled."
+    )]
+    pub disable: Option<Vec<String>>,
 }

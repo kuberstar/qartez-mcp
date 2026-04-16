@@ -4,6 +4,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::storage::read::{get_all_edges, get_all_files, get_all_symbol_refs, get_all_symbols};
+use crate::storage::verify_foreign_keys;
 use crate::storage::write::{update_pagerank, update_symbol_pagerank};
 
 pub struct PageRankConfig {
@@ -43,6 +44,8 @@ pub fn compute_pagerank(conn: &Connection, config: &PageRankConfig) -> Result<()
 
     let ranks = pagerank_inner(&nodes, &edges, config, &prev_ranks);
 
+    // unchecked_transaction skips per-row FK enforcement for bulk-write
+    // performance. PRAGMA foreign_key_check after commit catches violations.
     let tx = conn.unchecked_transaction()?;
     for (&node_id, &rank) in &ranks {
         let changed = prev_ranks
@@ -53,6 +56,7 @@ pub fn compute_pagerank(conn: &Connection, config: &PageRankConfig) -> Result<()
         }
     }
     tx.commit()?;
+    verify_foreign_keys(conn)?;
 
     Ok(())
 }
@@ -91,6 +95,7 @@ pub fn compute_symbol_pagerank(conn: &Connection, config: &PageRankConfig) -> Re
         }
     }
     tx.commit()?;
+    verify_foreign_keys(conn)?;
 
     Ok(())
 }

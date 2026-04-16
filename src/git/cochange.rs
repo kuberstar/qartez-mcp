@@ -149,6 +149,7 @@ pub fn analyze_cochanges(conn: &Connection, root: &Path, config: &CoChangeConfig
     }
 
     tx.commit()?;
+    crate::storage::verify_foreign_keys(conn)?;
 
     info!(
         "Co-change analysis complete: {} pairs written ({} skipped: historical-only paths), {} file change counts written",

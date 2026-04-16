@@ -24,10 +24,12 @@ pub fn count_tokens(text: &str) -> usize {
     tokenizer().encode_with_special_tokens(text).len()
 }
 
-/// Naive `bytes/4` estimator matching `server::estimate_tokens`.
+/// Naive `bytes/4` estimator for benchmark comparison.
 ///
 /// Not suitable as a primary metric but reported alongside the BPE count for
-/// cross-verification of the savings ratio.
+/// cross-verification of the savings ratio. Note: `server::estimate_tokens`
+/// uses `chars/3` for tighter accuracy; this keeps the legacy formula for
+/// benchmark stability.
 pub fn naive_count(text: &str) -> usize {
     text.len() / 4
 }

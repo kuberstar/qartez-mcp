@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.4.0] -- 2026-04-16
+
+### Added
+
+- **`qartez_security` tool** -- OWASP-style vulnerability scanning with 14 built-in rules (hardcoded secrets, SQL injection, path traversal, insecure HTTP, etc.) and user-extensible patterns via `.qartez/security.toml`
+- **`qartez_semantic` tool** -- hybrid FTS + vector search for semantic code queries (requires `semantic` feature flag)
+- **`qartez_tools` meta-tool** -- progressive tool discovery with tier-based enable/disable (core, analysis, refactor)
+- **`qartez_trend` tool** -- symbol complexity trend over git history with configurable commit depth
+- **Haskell, OCaml, R language parsers** -- language count increased from 34 to 37
+- **Hotspot health score** -- normalized 0-10 score combining complexity, coupling, and churn with half-life decay; threshold filtering and sort_by parameter
+- **19 IDE/CLI integrations** -- added Kiro, Claude Desktop, Copilot CLI, Amazon Q, Amp, Goose, Cline, Roo Code, Warp, Augment, and Google Antigravity
+- **Qartez skill for Claude Code** -- replaces CLAUDE.md instructions with a reusable skill containing tool reference and workflows
+- **CLA with GitHub Action** -- contributor license agreement with automated checking
+- **Unified setup instructions** -- IDE rules files generated for all supported editors
+
+### Changed
+
+- **Token estimator** -- `estimate_tokens` now uses char count / 3 (was byte length / 4), producing ~33% higher estimates for ASCII. Tools may truncate output earlier as a result.
+- **MCP instructions updated** -- tool count corrected from 25 to 27, added `qartez_security` and `qartez_semantic` to analysis tier
+- **README corrected** -- tool count, IDE count, complexity count, and comparison table updated to match reality
+
+### Fixed
+
+- **Unbounded database growth** -- prevented excessive DB size on large codebases (#9)
+- **UTF-8 panic in security scanner** -- snippet truncation no longer slices on byte boundaries; uses char-safe truncation instead
+- **Silenced embedding deletion errors** -- `delete_file_data` and `clear_file_content` now propagate `symbol_embeddings` DELETE errors instead of discarding them
+- **Regex DoS via security.toml** -- user-supplied regex patterns are now compiled with a 1 MiB size limit to prevent pathological backtracking
+- **install_goose panics on malformed YAML** -- replaced `expect()` with error-returning `.ok_or_else()` in Goose/Continue YAML handling
+- **SEC007 false positives** -- `http://localhost`, `http://127.*`, and other loopback URLs are now excluded from insecure-HTTP findings
+- **Dead code in trend.rs** -- removed unused language detection that could reject files `parse_file` handles fine
+- **Hierarchy max_depth** -- added depth limit to transitive traversal; BFS now exits early when depth exceeded
+- **Multi-root path collision** -- fixed cross-root imports and workspace detection
+- **Semantic tool restored** -- fixed parallel merge conflict that broke `qartez_semantic`
+- **MCP client compatibility** -- `limit` param uses `flexible::u32_opt` for broader client support
+- **Setup skip uninstalled IDEs** -- no longer errors on IDEs that are not present
+
+### Contributors
+
+- **Matt** ([@corbym](https://github.com/corbym)) -- fix for unbounded database growth on large codebases
+
 ## [0.3.0] — 2026-04-15
 
 ### Added

@@ -18,7 +18,13 @@ use symbols::{ExtractedImport, ExtractedReference, ReferenceKind, compute_shape_
 
 struct IndexedFile {
     file_id: i64,
+    /// DB-stored path (may include a root-name prefix in multi-root mode).
+    /// Retained for debugging; import resolvers use `raw_rel` instead.
+    #[allow(dead_code)]
     rel_path: String,
+    /// Path relative to its own root, without any multi-root prefix.
+    /// Used by import resolvers that compute parent directories on disk.
+    raw_rel: String,
     language: String,
     imports: Vec<ExtractedImport>,
     /// DB rowids for the symbols this file contributed, in the same order
@@ -29,25 +35,118 @@ struct IndexedFile {
     references: Vec<ExtractedReference>,
 }
 
+/// Maximum file size to index (bytes). Files larger than this are skipped
+/// because they are typically generated and inflate the index without
+/// meaningful signal. Override via `QARTEZ_MAX_FILE_BYTES`.
+fn max_file_bytes() -> u64 {
+    std::env::var("QARTEZ_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000) // 1 MB default
+}
+
+/// Single-root convenience: indexes one root with no path prefix and no
+/// cross-root known paths. This is the common case and preserves the
+/// original call signature so all existing callers and tests work unchanged.
 pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
+    full_index_root(conn, root, force, "", &HashSet::new())
+}
+
+/// Index all project roots into the shared database.
+///
+/// For multi-root mode (more than one root), uses a two-pass approach:
+///   1. First pass walks all roots to build a merged `known_paths` set
+///   2. Second pass indexes each root with the full cross-root path set
+///      so import resolution can find targets in sibling roots.
+///
+/// File paths are prefixed with the root's directory name to prevent
+/// collision on the UNIQUE `files.path` column.
+///
+/// For single-root mode, delegates to `full_index` with no prefix.
+pub fn full_index_multi(conn: &Connection, roots: &[PathBuf], force: bool) -> Result<()> {
+    if roots.len() <= 1 {
+        if let Some(root) = roots.first() {
+            return full_index(conn, root, force);
+        }
+        return Ok(());
+    }
+
+    // Two-pass: first pass collects all file paths across every root, then
+    // second pass indexes each root with the full cross-root path set so
+    // import resolution can find targets in sibling roots.
+    //
+    // We insert BOTH the prefixed form (for DB lookups and stale-file
+    // detection) and the unprefixed raw form (for import resolvers, which
+    // generate candidates relative to a single root).
+    let mut all_known: HashSet<String> = HashSet::new();
+    for root in roots {
+        let prefix = root_prefix(root);
+        for file_path in walker::walk_source_files(root) {
+            let raw_rel = match file_path.strip_prefix(root) {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => file_path.to_string_lossy().to_string(),
+            };
+            all_known.insert(format!("{prefix}/{raw_rel}"));
+            all_known.insert(raw_rel);
+        }
+    }
+    for root in roots {
+        let prefix = root_prefix(root);
+        tracing::info!("Indexing root: {} (prefix: {prefix})", root.display());
+        full_index_root(conn, root, force, &prefix, &all_known)?;
+    }
+    Ok(())
+}
+
+/// Extract the directory name of a root, used as the path prefix in
+/// multi-root mode (e.g. `/home/user/repo-a` -> `"repo-a"`).
+fn root_prefix(root: &Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".to_string())
+}
+
+/// Index a single project root into the shared database.
+///
+/// `path_prefix` is prepended to every relative path stored in the DB. For
+/// single-root mode pass `""` so behavior is unchanged. For multi-root mode
+/// pass the root's directory name (e.g. `"repo-a"`) so that files from
+/// different roots never collide on the UNIQUE `files.path` column.
+///
+/// `extra_known` is a pre-populated set of paths from other roots. It is
+/// merged into the local `known_paths` before import resolution so that
+/// cross-root imports can find their targets.
+pub fn full_index_root(
+    conn: &Connection,
+    root: &Path,
+    force: bool,
+    path_prefix: &str,
+    extra_known: &HashSet<String>,
+) -> Result<()> {
     let files = walker::walk_source_files(root);
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
+    let max_bytes = max_file_bytes();
 
     tracing::info!("found {} source files on disk", files.len());
 
     let tx = conn.unchecked_transaction()?;
 
     let mut indexed: Vec<IndexedFile> = Vec::new();
-    let mut known_paths: HashSet<String> = HashSet::new();
+    let mut known_paths: HashSet<String> = extra_known.clone();
     let mut skipped: usize = 0;
     let mut updated: usize = 0;
 
     for file_path in &files {
-        let rel_path = match file_path.strip_prefix(root) {
+        let raw_rel = match file_path.strip_prefix(root) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => file_path.to_string_lossy().to_string(),
+        };
+        let rel_path = if path_prefix.is_empty() {
+            raw_rel.clone()
+        } else {
+            format!("{path_prefix}/{raw_rel}")
         };
 
         let metadata = match std::fs::metadata(file_path) {
@@ -60,11 +159,23 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
         let mtime_ns = file_mtime_ns(&metadata);
         let size_bytes = metadata.len() as i64;
 
+        if metadata.len() > max_bytes {
+            tracing::debug!(
+                "skipping oversized file {} ({} bytes)",
+                file_path.display(),
+                metadata.len()
+            );
+            continue;
+        }
+
         if !force
             && let Some(existing) = read::get_file_by_path(&tx, &rel_path)?
             && existing.mtime_ns == mtime_ns
         {
             known_paths.insert(rel_path.clone());
+            if !path_prefix.is_empty() {
+                known_paths.insert(raw_rel);
+            }
             skipped += 1;
             continue;
         }
@@ -136,11 +247,15 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
         }
 
         known_paths.insert(rel_path.clone());
+        if !path_prefix.is_empty() {
+            known_paths.insert(raw_rel.clone());
+        }
         updated += 1;
 
         indexed.push(IndexedFile {
             file_id,
             rel_path,
+            raw_rel,
             language,
             imports: parse_result.imports,
             symbol_ids,
@@ -157,8 +272,17 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     let db_files = read::get_all_files(&tx)?;
     let mut deleted: usize = 0;
     for db_file in &db_files {
+        // Only consider files belonging to this root (matching our prefix).
+        if !path_prefix.is_empty() && !db_file.path.starts_with(&format!("{path_prefix}/")) {
+            continue;
+        }
         if !known_paths.contains(&db_file.path) {
-            let full_path = root.join(&db_file.path);
+            let disk_rel = if path_prefix.is_empty() {
+                db_file.path.clone()
+            } else {
+                db_file.path[path_prefix.len() + 1..].to_string()
+            };
+            let full_path = root.join(&disk_rel);
             if !full_path.exists() {
                 write::delete_file_data(&tx, db_file.id)?;
                 deleted += 1;
@@ -182,7 +306,7 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
         for import in &entry.imports {
             let targets = resolve_targets(
                 &entry.language,
-                &entry.rel_path,
+                &entry.raw_rel,
                 &import.source,
                 root,
                 &known_paths,
@@ -210,6 +334,30 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     write::rebuild_symbol_bodies(&tx, root)?;
     write::populate_unused_exports(&tx)?;
 
+    // Rebuild semantic embeddings when the model is available on disk.
+    // Best-effort: if the model hasn't been downloaded yet, indexing
+    // succeeds without embeddings and semantic search returns empty results.
+    #[cfg(feature = "semantic")]
+    {
+        if let Some(model_dir) = crate::embeddings::default_model_dir()
+            && model_dir.join(crate::embeddings::MODEL_FILENAME).exists()
+        {
+            match crate::embeddings::EmbeddingModel::load(&model_dir) {
+                Ok(model) => {
+                    let roots = vec![root.to_path_buf()];
+                    if let Err(e) = write::rebuild_embeddings(&tx, &model, &roots) {
+                        tracing::warn!("failed to rebuild embeddings: {e}");
+                    } else {
+                        tracing::info!("semantic embeddings rebuilt");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to load embedding model: {e}");
+                }
+            }
+        }
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -218,6 +366,14 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
     write::set_meta(&tx, "last_index", &timestamp)?;
 
     tx.commit()?;
+    crate::storage::verify_foreign_keys(conn)?;
+
+    // Checkpoint the WAL so it doesn't grow unboundedly across indexing runs.
+    // Failure is non-fatal — the next run or SQLite's auto-checkpoint will
+    // eventually flush it.
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::debug!("WAL checkpoint after full_index failed (non-fatal): {e}");
+    }
 
     tracing::info!("indexing complete: {updated} updated, {skipped} skipped, {deleted} deleted");
     Ok(())
@@ -980,6 +1136,7 @@ pub fn incremental_index(
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
+    let max_bytes = max_file_bytes();
 
     let tx = conn.unchecked_transaction()?;
 
@@ -1015,6 +1172,15 @@ pub fn incremental_index(
         };
         let mtime_ns = file_mtime_ns(&metadata);
         let size_bytes = metadata.len() as i64;
+
+        if metadata.len() > max_bytes {
+            tracing::debug!(
+                "incremental: skipping oversized file {} ({} bytes)",
+                file_path.display(),
+                metadata.len()
+            );
+            continue;
+        }
 
         let source = match std::fs::read(file_path) {
             Ok(s) => s,
@@ -1088,7 +1254,8 @@ pub fn incremental_index(
 
         indexed.push(IndexedFile {
             file_id,
-            rel_path,
+            rel_path: rel_path.clone(),
+            raw_rel: rel_path,
             language,
             imports: parse_result.imports,
             symbol_ids,
@@ -1110,7 +1277,7 @@ pub fn incremental_index(
         for import in &entry.imports {
             let targets = resolve_targets(
                 &entry.language,
-                &entry.rel_path,
+                &entry.raw_rel,
                 &import.source,
                 root,
                 &known_paths,
@@ -1134,9 +1301,17 @@ pub fn incremental_index(
 
     resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
 
-    // --- Phase 4: rebuild global derived tables ---
-    write::sync_fts(&tx)?;
-    write::rebuild_symbol_bodies(&tx, root)?;
+    // --- Phase 4: update derived tables ---
+    // Update FTS and body index only for the files that actually changed.
+    // This avoids the O(whole-codebase) full-table DELETE+re-insert that
+    // sync_fts / rebuild_symbol_bodies would trigger on every file-save
+    // event — the primary cause of unbounded WAL growth on large codebases.
+    // clear_file_content (called above per file) already removed the old
+    // FTS rows, so here we only need to insert the new ones.
+    for entry in &indexed {
+        write::insert_fts_for_file(&tx, entry.file_id)?;
+        write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.rel_path)?;
+    }
     write::populate_unused_exports(&tx)?;
 
     let timestamp = std::time::SystemTime::now()
@@ -1147,6 +1322,13 @@ pub fn incremental_index(
     write::set_meta(&tx, "last_index", &timestamp)?;
 
     tx.commit()?;
+    crate::storage::verify_foreign_keys(conn)?;
+
+    // Checkpoint the WAL after each incremental index to prevent unbounded
+    // growth on large codebases with an active file watcher.
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        tracing::debug!("WAL checkpoint after incremental_index failed (non-fatal): {e}");
+    }
 
     tracing::info!(
         "incremental index: {updated} updated, {removed} removed ({} changed, {} deleted input)",

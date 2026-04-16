@@ -91,8 +91,11 @@ pub(super) fn truncate_path(path: &str, max_len: usize) -> String {
     }
 }
 
+// Approximate Claude token count: ~3 characters per token for code.
+// Uses char count (not byte length) so multibyte Unicode does not inflate
+// the estimate. This is a soft budget hint, not a hard limit.
 pub(super) fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+    text.chars().count() / 3
 }
 
 pub(super) fn human_bytes(bytes: i64) -> String {

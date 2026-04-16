@@ -23,6 +23,9 @@ pub enum QartezError {
 
     #[error("Project root not detected from {0}")]
     NoProjectRoot(String),
+
+    #[error("Integrity violation: {0}")]
+    Integrity(String),
 }
 
 pub type Result<T> = std::result::Result<T, QartezError>;
