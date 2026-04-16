@@ -7,15 +7,15 @@
 //! `doc/` sub-package for the man-page / markdown / rest / yaml doc
 //! generators. There is no `vendor/` tree in this commit.
 //!
-//! Go has no `pub` keyword — package visibility is driven entirely by
-//! identifier capitalization — so the qartez language backend owns the
+//! Go has no `pub` keyword - package visibility is driven entirely by
+//! identifier capitalization - so the qartez language backend owns the
 //! `is_exported` decision and this profile does not need any
 //! Go-specific visibility wiring. The non-MCP sim, however, still uses
 //! the `use crate::`-style regex that the Rust scenarios baked into
 //! `scenarios::deps_steps` / `context_steps` / `impact_steps`; those
 //! will produce empty or near-empty output on a Go fixture. This is an
-//! intentional asymmetry — patching `scenarios.rs` would drift the Rust
-//! baseline — and the gotcha is documented in `reports/benchmark-go.md`.
+//! intentional asymmetry - patching `scenarios.rs` would drift the Rust
+//! baseline - and the gotcha is documented in `reports/benchmark-go.md`.
 //!
 //! Targets are resolved live against `.qartez/index.db` via
 //! [`super::super::targets::resolve`]; no `target_override` is needed.

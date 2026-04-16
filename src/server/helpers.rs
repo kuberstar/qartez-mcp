@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use crate::str_utils::floor_char_boundary;
+
 pub(super) fn elide_file_source(
     project_root: &std::path::Path,
     file_path: &str,
@@ -84,9 +86,9 @@ pub(super) fn truncate_path(path: &str, max_len: usize) -> String {
     if path.len() <= max_len {
         path.to_string()
     } else if max_len <= 3 {
-        path[..path.floor_char_boundary(max_len)].to_string()
+        path[..floor_char_boundary(path, max_len)].to_string()
     } else {
-        let start = path.floor_char_boundary(path.len() - (max_len - 3));
+        let start = floor_char_boundary(path, path.len() - (max_len - 3));
         format!("...{}", &path[start..])
     }
 }
@@ -206,7 +208,7 @@ pub(super) fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
 /// Walk up to `commit_limit` recent commits from HEAD, count co-change pairs
 /// involving `target_path`, and return the top `limit` partners descending.
 ///
-/// Commits touching more than `max_commit_size` files are skipped -- they are
+/// Commits touching more than `max_commit_size` files are skipped - they are
 /// typically format passes, bulk renames, or lockfile bumps whose pair counts
 /// drown the signal from real feature work.
 ///
@@ -218,7 +220,7 @@ pub(super) fn compute_cochange_pairs(
     commit_limit: usize,
     limit: usize,
 ) -> Option<Vec<(String, u32)>> {
-    let repo = git2::Repository::open(project_root).ok()?;
+    let repo = git2::Repository::discover(project_root).ok()?;
     let head_oid = repo.head().ok()?.target()?;
     let mut revwalk = repo.revwalk().ok()?;
     revwalk.set_sorting(git2::Sort::TIME).ok()?;
@@ -331,4 +333,34 @@ pub(super) fn is_test_path(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Convert a file path or symbol name into a valid Mermaid node ID.
+///
+/// Mermaid node IDs must be alphanumeric (plus underscores). Characters like
+/// `/`, `.`, `-`, and `::` are replaced with `_`. Leading digits get a prefix.
+pub(super) fn mermaid_node_id(name: &str) -> String {
+    let mut id = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            id.push(ch);
+        } else {
+            id.push('_');
+        }
+    }
+    if id.starts_with(|c: char| c.is_ascii_digit()) {
+        id.insert(0, 'n');
+    }
+    if id.is_empty() {
+        id.push_str("node");
+    }
+    id
+}
+
+/// Escape a label for Mermaid quoted node labels (`["..."]`).
+///
+/// Mermaid interprets `"` and `]` inside bracket labels, so they must be
+/// replaced with safe alternatives.
+pub(super) fn mermaid_label(label: &str) -> String {
+    label.replace('"', "'").replace(']', ")")
 }

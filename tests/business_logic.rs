@@ -65,7 +65,7 @@ fn test_unused_exports_fallback_must_respect_symbol_refs() {
     // Symbol-level reference but NO file-level import edge.
     write::insert_symbol_refs(&conn, &[(consumer_ids[0], lib_ids[0], "type")]).unwrap();
 
-    // Do NOT call populate_unused_exports — force the fallback path in both
+    // Do NOT call populate_unused_exports - force the fallback path in both
     // count_unused_exports and get_unused_exports_page.
 
     let count = read::count_unused_exports(&conn).unwrap();
@@ -77,7 +77,7 @@ fn test_unused_exports_fallback_must_respect_symbol_refs() {
     assert_eq!(
         count as usize,
         page.len(),
-        "count_unused_exports ({count}) disagrees with get_unused_exports_page ({}) — \
+        "count_unused_exports ({count}) disagrees with get_unused_exports_page ({}) - \
          the fallback query in get_unused_exports_page is missing the symbol_refs check",
         page.len()
     );
@@ -259,7 +259,7 @@ fn test_fts_search_empty_query_does_not_panic() {
     write::insert_symbols(&conn, f, &[sym("hello", "function", 1, 3, true)]).unwrap();
     write::sync_fts(&conn).unwrap();
 
-    // Empty string sanitized to "" — should not panic, may return empty.
+    // Empty string sanitized to "" - should not panic, may return empty.
     let sanitized = read::sanitize_fts_query("");
     let result = read::search_symbols_fts(&conn, &sanitized, 10);
     // The important thing is it doesn't panic.
@@ -287,7 +287,7 @@ fn test_insert_symbols_forward_parent_idx_drops_silently() {
                 signature: None,
                 is_exported: false,
                 shape_hash: None,
-                parent_idx: Some(1), // forward reference — not yet inserted
+                parent_idx: Some(1), // forward reference - not yet inserted
                 unused_excluded: false,
                 complexity: None,
                 owner_type: None,
@@ -386,7 +386,7 @@ fn test_cochange_canonical_ordering() {
     let a = insert_file(&conn, "a.rs");
     let b = insert_file(&conn, "b.rs");
 
-    // Insert in both orders — should merge into one canonical pair.
+    // Insert in both orders - should merge into one canonical pair.
     write::upsert_cochange(&conn, a, b).unwrap();
     write::upsert_cochange(&conn, b, a).unwrap();
 
@@ -417,7 +417,7 @@ fn test_cochange_self_reference() {
     write::upsert_cochange(&conn, a, a).unwrap();
 
     let cochanges = read::get_cochanges(&conn, a, 10).unwrap();
-    // A self-referencing co-change is stored — the CASE in the query will
+    // A self-referencing co-change is stored - the CASE in the query will
     // join on the same file. This documents the current behavior.
     assert_eq!(cochanges.len(), 1);
 }
@@ -1500,7 +1500,7 @@ fn test_rebuild_bodies_missing_file_skipped() {
     let f = write::upsert_file(&conn, "src/gone.rs", 1000, 100, "rust", 10).unwrap();
     write::insert_symbols(&conn, f, &[sym("ghost", "function", 1, 5, true)]).unwrap();
 
-    // File does not exist on disk — should not panic.
+    // File does not exist on disk - should not panic.
     write::rebuild_symbol_bodies(&conn, dir.path()).unwrap();
 
     let results = read::search_symbol_bodies_fts(&conn, "ghost", 10).unwrap();
@@ -1801,7 +1801,7 @@ fn test_analyze_cochanges_file_count_filtering() {
 
     assert!(a.is_some(), "a.rs should exist from the qualifying commit");
     assert!(b.is_some(), "b.rs should exist from the qualifying commit");
-    // c.rs may or may not exist as a file row — but it should NOT have cochanges.
+    // c.rs may or may not exist as a file row - but it should NOT have cochanges.
     if let Some(c_row) = c {
         let cochanges = read::get_cochanges(&conn, c_row.id, 10).unwrap();
         assert!(
@@ -1905,12 +1905,12 @@ fn test_analyze_cochanges_subdirectory_dotfile_not_filtered() {
             .unwrap();
     };
 
-    // ".github/ci.yml" — the filename is "ci.yml" (not dotfile), but
+    // ".github/ci.yml" - the filename is "ci.yml" (not dotfile), but
     // the DIRECTORY starts with dot. Only the filename is checked.
     make_commit(&repo, &[".github/ci.yml", "src/main.rs"], "github ci");
 
     let conn = setup();
-    // Pre-register files as `full_index` would — co-change now skips paths
+    // Pre-register files as `full_index` would - co-change now skips paths
     // that aren't in the files table.
     write::get_or_create_file(&conn, ".github/ci.yml").unwrap();
     write::get_or_create_file(&conn, "src/main.rs").unwrap();
@@ -1966,7 +1966,7 @@ fn test_leiden_star_topology() {
     let (assignments, _) = leiden::leiden_raw(&nodes, &edges, &leiden::LeidenConfig::default());
 
     assert_eq!(assignments.len(), 5);
-    // Star graph — Louvain tends to put everything in one cluster.
+    // Star graph - Louvain tends to put everything in one cluster.
     // At minimum, check it doesn't panic and produces valid output.
     let unique_clusters: HashSet<i64> = assignments.values().copied().collect();
     assert!(!unique_clusters.is_empty());
@@ -2072,7 +2072,7 @@ fn test_wiki_same_directory_files() {
     let (output, _) = wiki::render_wiki(&conn, &config).unwrap();
 
     assert!(output.contains("SameDir"));
-    // All files share the "src/storage" prefix — the cluster label should
+    // All files share the "src/storage" prefix - the cluster label should
     // reflect that.
     assert!(
         output.contains("src/storage") || output.contains("storage"),
@@ -2444,7 +2444,7 @@ fn test_reindex_unchanged_file_skipped() {
     index::full_index(&conn, dir.path(), false).unwrap();
     let count1 = read::get_symbol_count(&conn).unwrap();
 
-    // Re-index without changes — symbols should not be duplicated.
+    // Re-index without changes - symbols should not be duplicated.
     index::full_index(&conn, dir.path(), false).unwrap();
     let count2 = read::get_symbol_count(&conn).unwrap();
 
@@ -2540,7 +2540,7 @@ fn test_symbols_for_file_ordered_by_line() {
     let symbols = read::get_symbols_for_file(&conn, f).unwrap();
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
 
-    // The DB returns them in insertion order or by ID — verify the function
+    // The DB returns them in insertion order or by ID - verify the function
     // provides consistent results.
     assert_eq!(symbols.len(), 3);
     // At minimum check all 3 are present.
@@ -2863,7 +2863,7 @@ mod benchmark_tests {
         let pairs: Vec<(u8, u8)> = vec![(0, 0), (1, 1), (0, 1), (1, 0)];
         let kappa = judge::cohens_weighted_kappa(&pairs, 2);
         // With k=2, denom = 1, so weight(0,1) = 1 - 1/1 = 0.
-        // This means disagreements have zero weight — kappa should still
+        // This means disagreements have zero weight - kappa should still
         // be computable without NaN.
         assert!(!kappa.is_nan(), "k=2 should not produce NaN");
     }

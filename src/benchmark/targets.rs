@@ -24,8 +24,8 @@ use crate::storage::read::{
 /// are fully qualified package paths that the tree-sitter walker does not
 /// resolve to local files) produce a degenerate PageRank distribution
 /// where every file lands at `1/N`. The auto-resolver needs a way to
-/// break that tie deterministically — see the symbol-count fallback
-/// below — and this epsilon decides how close two ranks need to be for
+/// break that tie deterministically - see the symbol-count fallback
+/// below - and this epsilon decides how close two ranks need to be for
 /// the tie-break to kick in.
 const PAGERANK_TIE_EPSILON: f64 = 1e-9;
 
@@ -52,7 +52,7 @@ const MOVE_DEST_BASENAME: &str = "helpers_benchmark_tmp";
 /// down to callable units.
 ///
 /// Must stay in lockstep with [`crate::index::symbols::SymbolKind::as_str`]
-/// — kinds are stored as lowercase strings in the database, so comparing
+/// - kinds are stored as lowercase strings in the database, so comparing
 /// against `"Function"` (capital F) silently matches zero rows. The
 /// bug used to be hidden by the Rust profile's `target_override`, which
 /// bypassed this resolver entirely; it surfaced on the Python fixture
@@ -95,7 +95,7 @@ pub struct ResolvedTargets {
     pub outline_target_file: String,
     /// Alias for `top_pagerank_file` used by the `qartez_deps` scenario.
     pub deps_target_file: String,
-    /// File used as the `qartez_impact` target — a heavily-imported utility
+    /// File used as the `qartez_impact` target - a heavily-imported utility
     /// file so the blast radius and git co-change output have something
     /// meaningful to measure.
     pub impact_target_file: String,
@@ -122,6 +122,10 @@ pub struct ResolvedTargets {
     /// `smallest_exported_fn` so the Rust override can reproduce the
     /// historic `truncate_path → trunc_path` pair byte-for-byte.
     pub rename_new_name: String,
+    /// Trait or interface name used by the `qartez_hierarchy` scenario.
+    /// For Rust this is `LanguageSupport`; for auto-resolved profiles it
+    /// is the first trait/interface symbol found in the index.
+    pub hierarchy_target_symbol: String,
 }
 
 /// Resolves scenario targets against the live qartez database.
@@ -131,7 +135,7 @@ pub struct ResolvedTargets {
 /// harness produces a runnable benchmark even on a mostly-empty fixture.
 pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedTargets> {
     // Compile the profile's exclude globs once so we can filter the
-    // indexed files table — the qartez indexer happily walks everything
+    // indexed files table - the qartez indexer happily walks everything
     // under the project root (tests, generated code, docs, etc.),
     // whereas the benchmark scenarios should operate on library code.
     // Without this filter the Java fixture picks `NumberParsingTest`
@@ -154,10 +158,10 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
     //       filter every downstream scenario that needs a symbol list
     //       falls over on the phantom row.
     //
-    //    b. When PageRank is flat across the top tier — the Java
+    //    b. When PageRank is flat across the top tier - the Java
     //       indexer cannot resolve `import tools.jackson.core.*` to a
     //       local file and therefore emits zero cross-file edges, so
-    //       every file lands at `1/N` — we pick the file with the
+    //       every file lands at `1/N` - we pick the file with the
     //       most symbols instead of relying on SQLite's insertion
     //       order. On jackson-core this promotes `ParserMinimalBase`
     //       (140 symbols) over `create-test-report.sh` (zero symbols).
@@ -262,7 +266,7 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
     //
     //    The prior iteration of this picker walked the materialized
     //    `unused_exports` table and kept the first-seen candidate,
-    //    which meant the "smallest" label was a lie — it was whichever
+    //    which meant the "smallest" label was a lie - it was whichever
     //    function happened to be inserted first. On Python's httpx
     //    fixture this picked `main` (60+ lines) and `qartez_read` ran up
     //    a -485% "regression" because the non-MCP sim reads a fixed
@@ -302,7 +306,7 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
         })
         .map(|(s, path)| (s.name.clone(), path.clone()));
     // Picks the smallest exported function with a unique name that
-    // also has no importers — guarantees `qartez_move` can extract it
+    // also has no importers - guarantees `qartez_move` can extract it
     // without touching any caller site. Falls through to `smallest_fn`
     // below when every unused function has an ambiguous name.
     let smallest_unused_fn: Option<(String, String)> = {
@@ -366,7 +370,7 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
     //   a. `is_primary_ext` enforces the profile's first extension so
     //      the rename/impact scenarios operate on real source code.
     //      Cobra's `.github/workflows/stale.yml` is the concrete
-    //      offender — picking a YAML file as `rename_file_source`
+    //      offender - picking a YAML file as `rename_file_source`
     //      makes `qartez_rename_file` fail with "Source file does not
     //      exist" because the tool enforces the profile's extension.
     //
@@ -429,6 +433,19 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
     //     profile overrides this with the historic `trunc_path` value.
     let rename_new_name = format!("{smallest_exported_fn}_renamed");
 
+    // 11. Hierarchy target: find a trait or interface symbol for the
+    //     `qartez_hierarchy` scenario. Prefers exported traits/interfaces;
+    //     falls back to the top symbol name when none exist.
+    let hierarchy_kinds = &["trait", "interface"];
+    let hierarchy_target_symbol = all_symbols
+        .iter()
+        .filter(|(s, path)| {
+            s.is_exported && hierarchy_kinds.contains(&s.kind.as_str()) && !is_excluded(path)
+        })
+        .max_by_key(|(s, _)| s.line_end.saturating_sub(s.line_start))
+        .map(|(s, _)| s.name.clone())
+        .unwrap_or_else(|| top_symbol_name.clone());
+
     Ok(ResolvedTargets {
         top_pagerank_file: top_file_path.clone(),
         top_pagerank_symbol: top_symbol_name,
@@ -446,6 +463,7 @@ pub fn resolve(conn: &Connection, profile: &LanguageProfile) -> Result<ResolvedT
         rename_file_destination,
         calls_target_symbol,
         rename_new_name,
+        hierarchy_target_symbol,
     })
 }
 

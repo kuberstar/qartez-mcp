@@ -38,11 +38,14 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
     "qartez_diff_impact",
     "qartez_hotspots",
     "qartez_clones",
+    "qartez_smells",
     "qartez_boundaries",
     "qartez_hierarchy",
     "qartez_trend",
     "qartez_security",
     "qartez_semantic",
+    "qartez_test_gaps",
+    "qartez_knowledge",
 ];
 
 /// Destructive refactoring tools unlocked on demand.

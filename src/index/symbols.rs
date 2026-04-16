@@ -98,7 +98,7 @@ pub struct ExtractedSymbol {
     pub signature: Option<String>,
     pub is_exported: bool,
     /// True when this symbol sits inside a `impl Trait for Type` block or a
-    /// macro invocation's token tree. `qartez_unused` should skip these — trait
+    /// macro invocation's token tree. `qartez_unused` should skip these - trait
     /// impl methods are called via dynamic dispatch, macro-generated items
     /// are invisible to file-level imports. Extractors set this eagerly so
     /// the server never has to re-walk the AST.
@@ -109,7 +109,7 @@ pub struct ExtractedSymbol {
     /// knowing the DB rowid, which only exists after insertion.
     pub parent_idx: Option<usize>,
     /// Cyclomatic complexity of this symbol. Only meaningful for functions
-    /// and methods — `None` for types, fields, and declarative constructs.
+    /// and methods - `None` for types, fields, and declarative constructs.
     /// Starts at 1 (one linear path) and increments for each branching
     /// point (if, match arm, loop, &&, ||, catch).
     pub complexity: Option<u32>,

@@ -5,6 +5,7 @@ use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
     ReferenceKind, RelationKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct GoSupport;
 
@@ -492,7 +493,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     }
 
     let truncated = if sig.len() > 200 {
-        &sig[..sig.floor_char_boundary(200)]
+        &sig[..floor_char_boundary(sig, 200)]
     } else {
         sig
     };

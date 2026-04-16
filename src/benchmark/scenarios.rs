@@ -153,7 +153,7 @@ pub struct Scenario {
     /// Golden reference answer for the judge rubric. When `Some`, the
     /// text is injected under `GOLDEN ANSWER` in `build_prompt` per
     /// `docs/benchmark/judge-core.md` §3; when `None`, the prompt
-    /// falls back to "no golden answer was provided — judge against the
+    /// falls back to "no golden answer was provided - judge against the
     /// rubric alone". Prometheus-style references lift judge-to-human
     /// Pearson correlation from 0.392 to 0.897 (research.md §6), which
     /// makes them the single biggest lever in rubric accuracy. Phase 4
@@ -327,7 +327,7 @@ fn unused_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value 
 fn unused_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
     // Step 1 of the real non-MCP workflow: find all pub declarations.
     // A faithful emulation would then grep each name across the
-    // codebase, which would amount to hundreds more tool calls —
+    // codebase, which would amount to hundreds more tool calls -
     // represented by a BashOutput padding line in the verdict commentary
     // but not here, because inflating the baseline would be unfair. The
     // single grep is already the honest lower bound for a non-MCP
@@ -349,7 +349,7 @@ fn stats_steps(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Vec<Si
 // 12. qartez_calls --------------------------------------------------------
 fn calls_args(targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
     // Default depth is now 1 (post-2026-04 compaction). depth=2 remains
-    // opt-in and can still explode on hub functions — measuring default
+    // opt-in and can still explode on hub functions - measuring default
     // behavior gives the honest steady-state cost.
     json!({ "name": targets.calls_target_symbol })
 }
@@ -555,9 +555,205 @@ fn security_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<
     ]
 }
 
-/// The full per-tool scenario matrix. 18 tier-1 entries + 6 tier-2 entries.
+// 19. qartez_hotspots -----------------------------------------------------
+fn hotspots_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "limit": 10 })
+}
+fn hotspots_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // A non-MCP agent would need to: glob all files, read each to estimate
+    // complexity, mine git log for churn, then correlate.
+    vec![
+        SimStep::Glob {
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"fn |class |def |func ".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GitLog {
+            file: ".".to_string(),
+            limit: 200,
+        },
+    ]
+}
+
+// 20. qartez_clones -------------------------------------------------------
+fn clones_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "limit": 10 })
+}
+fn clones_steps(targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // No non-MCP equivalent short of reading every function body and
+    // comparing them manually. A real agent would need to read the
+    // largest source files to identify duplicate code patterns.
+    vec![
+        SimStep::Glob {
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::Read {
+            path: targets.outline_target_file.clone(),
+            range: None,
+        },
+        SimStep::Read {
+            path: targets.impact_target_file.clone(),
+            range: None,
+        },
+        SimStep::BashOutput { bytes: 12000 },
+    ]
+}
+
+// 21. qartez_smells --------------------------------------------------------
+fn smells_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({})
+}
+fn smells_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // A non-MCP agent would grep for long functions, then read each to
+    // count parameters and estimate complexity manually.
+    vec![
+        SimStep::GrepContent {
+            regex: r"fn |class |def |func ".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::BashOutput { bytes: 4000 },
+    ]
+}
+
+// 22. qartez_test_gaps ----------------------------------------------------
+fn test_gaps_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "mode": "gaps", "limit": 10 })
+}
+fn test_gaps_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: glob test files, grep their imports, diff against source
+    // file list to find untested files.
+    vec![
+        SimStep::Glob {
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"#\[cfg\(test\)\]|#\[test\]|@Test|describe\(|it\(|def test_".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"^use crate::|^import |^from .* import".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+    ]
+}
+
+// 23. qartez_wiki ---------------------------------------------------------
+fn wiki_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({})
+}
+fn wiki_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: read all files, manually cluster by import relationships.
+    vec![
+        SimStep::Glob {
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"^use crate::|^import |^from .* import|^mod ".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+    ]
+}
+
+// 24. qartez_boundaries ---------------------------------------------------
+fn boundaries_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "suggest": true })
+}
+fn boundaries_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: read all imports, manually draw module boundaries,
+    // check for violations by cross-referencing every import path.
+    vec![
+        SimStep::Glob {
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: r"^use crate::|^import |^from .* import".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+    ]
+}
+
+// 25. qartez_hierarchy ----------------------------------------------------
+fn hierarchy_args(targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "symbol": targets.hierarchy_target_symbol })
+}
+fn hierarchy_steps(targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: grep for `impl Trait` or `extends/implements` patterns,
+    // then read matched files to extract the implementing type names
+    // and full impl blocks. A real agent needs more than grep hit lines
+    // to understand what each implementor provides.
+    vec![
+        SimStep::GrepContent {
+            regex: format!(r"impl {}", targets.hierarchy_target_symbol),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::GrepContent {
+            regex: format!(
+                r"(extends|implements)\s+{}",
+                targets.hierarchy_target_symbol
+            ),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::Read {
+            path: targets.deps_target_file.clone(),
+            range: Some((1, 120)),
+        },
+    ]
+}
+
+// 26. qartez_trend --------------------------------------------------------
+fn trend_args(targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "file_path": targets.outline_target_file, "limit": 10 })
+}
+fn trend_steps(targets: &ResolvedTargets, _profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: git log the file, then check out each historic version
+    // and re-parse to measure complexity changes.
+    vec![
+        SimStep::GitLog {
+            file: targets.outline_target_file.clone(),
+            limit: 10,
+        },
+        SimStep::BashOutput { bytes: 6000 },
+    ]
+}
+
+// 27. qartez_knowledge ----------------------------------------------------
+fn knowledge_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "limit": 10 })
+}
+fn knowledge_steps(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: git shortlog + git log --format to mine author stats,
+    // then aggregate per file manually.
+    vec![
+        SimStep::GitLog {
+            file: ".".to_string(),
+            limit: 500,
+        },
+        SimStep::BashOutput { bytes: 2000 },
+    ]
+}
+
+// 28. qartez_diff_impact --------------------------------------------------
+fn diff_impact_args(_targets: &ResolvedTargets, _profile: &LanguageProfile) -> Value {
+    json!({ "base": "HEAD~3" })
+}
+fn diff_impact_steps(_targets: &ResolvedTargets, profile: &LanguageProfile) -> Vec<SimStep> {
+    // Non-MCP: git diff to find changed files, then chase imports for
+    // each changed file to estimate blast radius.
+    vec![
+        SimStep::GrepContent {
+            regex: r"^use crate::|^import |^from .* import".to_string(),
+            ext_filter: ext_filter_of(profile),
+        },
+        SimStep::BashOutput { bytes: 3000 },
+    ]
+}
+
+/// The full per-tool scenario matrix. 28 tier-1 entries + 6 tier-2 entries
+/// (+ 1 conditional semantic entry).
 ///
-/// Pros/cons/verdicts are authored by hand — they encode judgment the
+/// Pros/cons/verdicts are authored by hand - they encode judgment the
 /// harness can't infer from raw bytes, and they're what makes the final
 /// report useful beyond a numeric matrix.
 pub const SCENARIOS: &[Scenario] = &[
@@ -597,7 +793,7 @@ pub const SCENARIOS: &[Scenario] = &[
         ],
         cons: &[
             "Only the definition site, not usages",
-            "Misses macro-synthesized symbols — tree-sitter opaque-tokens the macro body, so `lazy_static! { pub static ref FOO }` doesn't surface `FOO` in the index",
+            "Misses macro-synthesized symbols - tree-sitter opaque-tokens the macro body, so `lazy_static! { pub static ref FOO }` doesn't surface `FOO` in the index",
         ],
         verdict_summary: "MCP wins on precision and compactness, but the non-MCP path is viable for unique symbol names.",
         non_mcp_is_complete: true,
@@ -618,7 +814,7 @@ pub const SCENARIOS: &[Scenario] = &[
             "`context_lines` opt-in surrounding lines (default 0)",
         ],
         cons: &["Line-range mode requires knowing the target file up-front"],
-        verdict_summary: "MCP wins decisively — a non-MCP agent must over-read to guarantee body coverage.",
+        verdict_summary: "MCP wins decisively - a non-MCP agent must over-read to guarantee body coverage.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -630,7 +826,7 @@ pub const SCENARIOS: &[Scenario] = &[
         mcp_args: grep_args,
         non_mcp_steps: grep_steps,
         pros: &[
-            "Searches indexed symbols only — no comment/string noise",
+            "Searches indexed symbols only - no comment/string noise",
             "Prefix matching via FTS5",
             "Returns kind + line range per hit",
             "`regex: true` falls back to in-memory regex over indexed symbol names",
@@ -654,12 +850,12 @@ pub const SCENARIOS: &[Scenario] = &[
         pros: &[
             "Symbols pre-grouped by kind",
             "Signatures pre-parsed",
-            "Token-budgeted — no full-file read",
+            "Token-budgeted - no full-file read",
             "Struct fields are emitted as child rows nested under their parent",
         ],
         cons: &[
             "Token budget truncates very large files",
-            "Tuple-struct members are skipped — nothing meaningful to name",
+            "Tuple-struct members are skipped - nothing meaningful to name",
         ],
         verdict_summary: "MCP wins by ~20x on a 2300-line file; non-MCP path reads the entire file.",
         non_mcp_is_complete: true,
@@ -677,7 +873,7 @@ pub const SCENARIOS: &[Scenario] = &[
             "Bidirectional (imports + importers) in one call",
         ],
         cons: &[
-            "Flattens to file-level — loses per-symbol specifier",
+            "Flattens to file-level - loses per-symbol specifier",
             "Doesn't show which items are imported",
         ],
         verdict_summary: "MCP wins on accuracy (resolved paths) and compactness.",
@@ -699,7 +895,7 @@ pub const SCENARIOS: &[Scenario] = &[
         ],
         cons: &[
             "Misses dynamic dispatch: trait-object calls resolve at runtime and leave no static edge or call-site name the tree-sitter walker can anchor to",
-            "Transitive BFS can balloon on hub symbols — a symbol whose file is imported by 50 crates yields 50 * avg-fanout rows",
+            "Transitive BFS can balloon on hub symbols - a symbol whose file is imported by 50 crates yields 50 * avg-fanout rows",
         ],
         verdict_summary: "MCP now surfaces both file-level edges and AST call sites, closing the gap with grep while keeping the tree-sitter precision that skips strings and comments.",
         non_mcp_is_complete: true,
@@ -718,7 +914,7 @@ pub const SCENARIOS: &[Scenario] = &[
             "`include_tests: false` by default excludes test modules from the blast radius",
         ],
         cons: &["Co-change is statistical, not causal"],
-        verdict_summary: "MCP wins on correctness and output size: the non-MCP equivalent is a 2-level import BFS plus a full git-log mine with in-process pair counting — reproducible now that the sim matches what a real agent would actually have to do.",
+        verdict_summary: "MCP wins on correctness and output size: the non-MCP equivalent is a 2-level import BFS plus a full git-log mine with in-process pair counting - reproducible now that the sim matches what a real agent would actually have to do.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -747,15 +943,15 @@ pub const SCENARIOS: &[Scenario] = &[
         mcp_args: unused_args,
         non_mcp_steps: unused_steps,
         pros: &[
-            "Pre-materialized at index time — query is a single indexed SELECT",
+            "Pre-materialized at index time - query is a single indexed SELECT",
             "`limit` / `offset` pagination (default 50) keeps default output small",
             "Trait-impl methods are excluded at parse time via the `unused_excluded` flag",
         ],
         cons: &[
-            "Requires human filtering before action — dynamic dispatch callers don't register as static importers",
+            "Requires human filtering before action - dynamic dispatch callers don't register as static importers",
             "Pre-materialization is invalidated wholesale on re-index; a stale index may miss recently-added imports",
         ],
-        verdict_summary: "MCP wins massively: the non-MCP step captured here is only the candidate list — a real agent would need hundreds more greps.",
+        verdict_summary: "MCP wins massively: the non-MCP step captured here is only the candidate list - a real agent would need hundreds more greps.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -773,10 +969,10 @@ pub const SCENARIOS: &[Scenario] = &[
             "Aggregate output splits src and test files/LOC",
         ],
         cons: &[
-            "Test/src split is filename-based (`tests/`, `_test.rs`, `benches/`) — not build-graph-aware, so integration tests wired via Cargo `test` target live in `src/` look like production code",
+            "Test/src split is filename-based (`tests/`, `_test.rs`, `benches/`) - not build-graph-aware, so integration tests wired via Cargo `test` target live in `src/` look like production code",
             "Language buckets count files-only; weighted metrics (bytes, symbols per language) aren't broken out",
         ],
-        verdict_summary: "MCP wins — non-MCP glob dump requires external aggregation just to count files.",
+        verdict_summary: "MCP wins - non-MCP glob dump requires external aggregation just to count files.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -791,10 +987,10 @@ pub const SCENARIOS: &[Scenario] = &[
             "Tree-sitter AST distinguishes calls from references",
             "Callees resolved to definition file:line",
             "Transitive depth available (default 1, opt-in depth=2)",
-            "Per-session parse cache — repeat invocations are in-memory",
+            "Per-session parse cache - repeat invocations are in-memory",
         ],
         cons: &[
-            "Misses dynamic dispatch — trait-object `Box<dyn Foo>` calls leave no static call-site name",
+            "Misses dynamic dispatch - trait-object `Box<dyn Foo>` calls leave no static call-site name",
             "Depth=2 output can still balloon on hub functions; the grouping elision helps but the graph is inherently O(N^depth)",
         ],
         verdict_summary: "MCP wins on correctness (tree-sitter distinguishes call sites from type-position references) and tokens. A per-invocation parse cache and a textual pre-filter keep the AST walk from re-visiting files that cannot possibly contain the callee, so the cold-parse cost stays in the low milliseconds.",
@@ -816,7 +1012,7 @@ pub const SCENARIOS: &[Scenario] = &[
             "Opaque composite score",
             "Cannot answer 'why was X excluded'",
         ],
-        verdict_summary: "MCP wins — no single Grep/Read chain can approximate the composite ranking.",
+        verdict_summary: "MCP wins - no single Grep/Read chain can approximate the composite ranking.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -831,10 +1027,10 @@ pub const SCENARIOS: &[Scenario] = &[
             "Tree-sitter identifier matching skips strings/comments",
             "Atomic apply with word-boundary fallback",
             "Preview + apply in one API",
-            "Correctly handles aliased imports (`use foo::bar as baz`) — enshrined by a unit test",
+            "Correctly handles aliased imports (`use foo::bar as baz`) - enshrined by a unit test",
         ],
         cons: &["Only indexed languages"],
-        verdict_summary: "MCP wins on tokens and safety. The AST-based identifier match on a 2300-line file runs in the low single-digit milliseconds — slower than a raw grep but the cost buys correct skipping of strings, comments, and same-spelled but unrelated identifiers.",
+        verdict_summary: "MCP wins on tokens and safety. The AST-based identifier match on a 2300-line file runs in the low single-digit milliseconds - slower than a raw grep but the cost buys correct skipping of strings, comments, and same-spelled but unrelated identifiers.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -852,10 +1048,10 @@ pub const SCENARIOS: &[Scenario] = &[
             "Importer rewriting uses regex word boundaries (no substring over-match)",
         ],
         cons: &[
-            "Does not rewrite doc-comment references like `[`foo::bar`]` — the rewriter targets `use` paths and qualified call sites only",
-            "Ambiguity check is by symbol name, not by fully-qualified path — a free function `foo` and a method `foo` on a struct both count as ambiguous even when only one matches the move target kind",
+            "Does not rewrite doc-comment references like `[`foo::bar`]` - the rewriter targets `use` paths and qualified call sites only",
+            "Ambiguity check is by symbol name, not by fully-qualified path - a free function `foo` and a method `foo` on a struct both count as ambiguous even when only one matches the move target kind",
         ],
-        verdict_summary: "MCP wins — non-MCP path is a 3-step sequence with several edit-time pitfalls.",
+        verdict_summary: "MCP wins - non-MCP path is a 3-step sequence with several edit-time pitfalls.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 1,
@@ -873,7 +1069,7 @@ pub const SCENARIOS: &[Scenario] = &[
         ],
         cons: &[
             "`mod.rs → named.rs` edge case: the parent module's `mod foo;` declaration is *not* rewritten because the rename tool only touches files that import via `use crate::foo::…`, not files that declare the module",
-            "Doc links (`[`crate::foo`]` in `///` comments) aren't rewritten — the rewriter is limited to `use`-path tokens",
+            "Doc links (`[`crate::foo`]` in `///` comments) aren't rewritten - the rewriter is limited to `use`-path tokens",
         ],
         verdict_summary: "MCP wins for single-shot refactors; non-MCP path produces correct results only with careful scoping.",
         non_mcp_is_complete: true,
@@ -892,11 +1088,217 @@ pub const SCENARIOS: &[Scenario] = &[
             "`run` action resolves a subcommand to its shell form without executing",
         ],
         cons: &[
-            "Detects toolchain by file presence only — `Cargo.toml` / `package.json` / `go.mod` existing is enough, the tool never runs a probe command to confirm the toolchain actually works",
-            "No polyglot support — a Rust + Node monorepo resolves to the first detected toolchain (Cargo wins, Node is silent), so callers need to scope to a sub-directory to see the other",
+            "Detects toolchain by file presence only - `Cargo.toml` / `package.json` / `go.mod` existing is enough, the tool never runs a probe command to confirm the toolchain actually works",
+            "No polyglot support - a Rust + Node monorepo resolves to the first detected toolchain (Cargo wins, Node is silent), so callers need to scope to a sub-directory to see the other",
         ],
         verdict_summary: "Near-tie: reading Cargo.toml is already cheap; MCP wins only on portability across ecosystems.",
         non_mcp_is_complete: true,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_hotspots",
+        id: "qartez_hotspots_top10",
+        description: "Top 10 hotspots by composite score (complexity x coupling x churn).",
+        mcp_args: hotspots_args,
+        non_mcp_steps: hotspots_steps,
+        pros: &[
+            "Composite score from three independent signals in one call",
+            "Health score (0-10) for quick triage",
+            "File-level and symbol-level granularity",
+            "Sortable by individual factor (complexity, coupling, churn)",
+        ],
+        cons: &[
+            "Churn depends on git history depth at index time",
+            "Composite weights are fixed, not tunable",
+        ],
+        verdict_summary: "MCP wins overwhelmingly: non-MCP path requires three separate data-gathering passes (complexity parsing, import counting, git log mining) plus manual correlation.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_clones",
+        id: "qartez_clones_top10",
+        description: "Top 10 duplicate code groups by AST hash similarity.",
+        mcp_args: clones_args,
+        non_mcp_steps: clones_steps,
+        pros: &[
+            "AST-hash-based detection skips whitespace and comment differences",
+            "Groups clones by structural similarity, not textual",
+            "Pagination support (limit/offset)",
+            "min_lines filter excludes trivial getters",
+        ],
+        cons: &[
+            "Only detects Type-2 clones (structurally identical after normalization)",
+            "Cross-file detection requires reading the full index",
+        ],
+        verdict_summary: "MCP wins: no non-MCP toolchain can do AST-level clone detection in a single call; text-based diff is the only alternative and misses renamed-variable clones.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_smells",
+        id: "qartez_smells_all_kinds",
+        description: "Detect all code smell kinds (god functions, long params, feature envy).",
+        mcp_args: smells_args,
+        non_mcp_steps: smells_steps,
+        pros: &[
+            "Three smell detectors in one call: god functions, long parameter lists, feature envy",
+            "Configurable thresholds per smell kind",
+            "File-scoped mode available",
+            "Cyclomatic complexity pre-computed at index time",
+        ],
+        cons: &[
+            "Feature envy only reliable for Rust and Java where owner_type is populated",
+            "Thresholds are heuristic, not project-calibrated",
+        ],
+        verdict_summary: "MCP wins: a non-MCP agent needs to read every function body and manually count branches, parameters, and cross-type calls.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_test_gaps",
+        id: "qartez_test_gaps_top10",
+        description: "Top 10 untested source files ranked by risk (PageRank).",
+        mcp_args: test_gaps_args,
+        non_mcp_steps: test_gaps_steps,
+        pros: &[
+            "Pre-computed test-to-source mapping via import graph",
+            "Risk-ranked by PageRank so high-impact gaps surface first",
+            "'suggest' mode recommends tests to run for a git diff range",
+            "'map' mode shows bidirectional test-source relationships",
+        ],
+        cons: &[
+            "Mapping relies on import edges; integration tests with no direct imports are missed",
+            "Test detection is filename/pattern-based, not build-graph-aware",
+        ],
+        verdict_summary: "MCP wins: non-MCP path requires globbing test files, grepping their imports, diffing against source files, and manually ranking by importance.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_wiki",
+        id: "qartez_wiki_auto_cluster",
+        description: "Auto-generate architecture wiki from Leiden clustering.",
+        mcp_args: wiki_args,
+        non_mcp_steps: wiki_steps,
+        pros: &[
+            "Leiden community detection groups files by structural affinity",
+            "Configurable resolution and min cluster size",
+            "Inline or write-to-file output",
+            "Recompute option for stale clusters",
+        ],
+        cons: &[
+            "Clustering quality depends on import-graph density",
+            "No semantic naming of clusters (uses file-path heuristics)",
+        ],
+        verdict_summary: "MCP wins: no non-MCP toolchain can perform graph-based community detection; manual module grouping requires reading every import.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_boundaries",
+        id: "qartez_boundaries_suggest",
+        description: "Suggest architecture boundary rules from current clustering.",
+        mcp_args: boundaries_args,
+        non_mcp_steps: boundaries_steps,
+        pros: &[
+            "Auto-generates boundary TOML from Leiden clusters",
+            "Checker mode validates rules against live import graph",
+            "Write-to-file for CI integration",
+        ],
+        cons: &[
+            "Suggested rules may need manual curation",
+            "Only checks file-level imports, not symbol-level",
+        ],
+        verdict_summary: "MCP wins: non-MCP agent must manually trace every cross-module import to identify boundary violations.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_hierarchy",
+        id: "qartez_hierarchy_implementors",
+        description: "List all implementors of a trait/interface.",
+        mcp_args: hierarchy_args,
+        non_mcp_steps: hierarchy_steps,
+        pros: &[
+            "Tree-sitter-based impl/extends resolution",
+            "Transitive hierarchy traversal available",
+            "Mermaid output for visualization",
+            "Bidirectional: sub (implementors) and super (parents)",
+        ],
+        cons: &[
+            "Misses blanket impls and macro-generated impls",
+            "Transitive depth can balloon on widely-implemented traits",
+        ],
+        verdict_summary: "MCP wins on precision: grepping `impl Trait` catches string matches and misses `implements` variants across languages.",
+        non_mcp_is_complete: true,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_trend",
+        id: "qartez_trend_complexity_over_time",
+        description: "Complexity trend over last 10 commits for the top file.",
+        mcp_args: trend_args,
+        non_mcp_steps: trend_steps,
+        pros: &[
+            "Per-symbol complexity tracked across git history",
+            "Delta percentages show direction of change",
+            "Limit parameter caps history depth",
+        ],
+        cons: &[
+            "Requires re-parsing each historic file version",
+            "Only counts commits that changed the target file",
+        ],
+        verdict_summary: "MCP wins: non-MCP path requires checking out each historic version, re-parsing, and manually computing deltas.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_knowledge",
+        id: "qartez_knowledge_bus_factor",
+        description: "Author knowledge distribution and bus factor analysis.",
+        mcp_args: knowledge_args,
+        non_mcp_steps: knowledge_steps,
+        pros: &[
+            "Per-file author breakdown with ownership percentages",
+            "Module-level bus factor summary mode",
+            "Author filter for scoping to specific contributors",
+        ],
+        cons: &[
+            "Based on git blame line counts, not semantic ownership",
+            "Does not account for code review or pair programming",
+        ],
+        verdict_summary: "MCP wins on tokens and structure: non-MCP git-log mining produces raw commit data that requires in-process aggregation.",
+        non_mcp_is_complete: false,
+        reference_answer: None,
+        tier: 1,
+    },
+    Scenario {
+        tool: "qartez_diff_impact",
+        id: "qartez_diff_impact_head3",
+        description: "Blast radius of the last 3 commits (HEAD~3..HEAD).",
+        mcp_args: diff_impact_args,
+        non_mcp_steps: diff_impact_steps,
+        pros: &[
+            "Combines git diff with transitive import BFS in one call",
+            "Per-file risk scoring with health, boundary, and test coverage",
+            "Directly answers 'what could this change break'",
+        ],
+        cons: &[
+            "Risk scoring requires boundaries and test-gap data to be meaningful",
+            "Large diffs produce proportionally large output",
+        ],
+        verdict_summary: "MCP wins: non-MCP path is git diff + manual import chasing for every changed file, with no risk scoring.",
+        non_mcp_is_complete: false,
         reference_answer: None,
         tier: 1,
     },
@@ -909,7 +1311,7 @@ pub const SCENARIOS: &[Scenario] = &[
         non_mcp_steps: find_nonexistent_steps,
         pros: &["Graceful empty result"],
         cons: &["No faster than grep for zero matches"],
-        verdict_summary: "Validates error/empty path — both sides should return empty or a clear 'not found' message.",
+        verdict_summary: "Validates error/empty path - both sides should return empty or a clear 'not found' message.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 2,
@@ -922,7 +1324,7 @@ pub const SCENARIOS: &[Scenario] = &[
         non_mcp_steps: grep_regex_steps,
         pros: &["Regex support against indexed symbol names"],
         cons: &["Regex anchors match symbol names, not full lines"],
-        verdict_summary: "Tests regex handling — MCP searches indexed symbols while non-MCP greps raw lines.",
+        verdict_summary: "Tests regex handling - MCP searches indexed symbols while non-MCP greps raw lines.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 2,
@@ -948,7 +1350,7 @@ pub const SCENARIOS: &[Scenario] = &[
         non_mcp_steps: outline_small_file_steps,
         pros: &["Still structured even for small files"],
         cons: &["Marginal benefit when the whole file fits in context"],
-        verdict_summary: "MCP advantage shrinks for small files — the outline is nearly as large as reading the file.",
+        verdict_summary: "MCP advantage shrinks for small files - the outline is nearly as large as reading the file.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 2,
@@ -961,7 +1363,7 @@ pub const SCENARIOS: &[Scenario] = &[
         non_mcp_steps: unused_with_limit_steps,
         pros: &["Pagination limits output size"],
         cons: &["Non-MCP has no equivalent pagination"],
-        verdict_summary: "MCP wins — limit parameter keeps output bounded while non-MCP emits all matches.",
+        verdict_summary: "MCP wins - limit parameter keeps output bounded while non-MCP emits all matches.",
         non_mcp_is_complete: false,
         reference_answer: None,
         tier: 2,
@@ -974,7 +1376,7 @@ pub const SCENARIOS: &[Scenario] = &[
         non_mcp_steps: impact_nonexistent_steps,
         pros: &["Clear error message for missing files"],
         cons: &["Error path, not a real use case"],
-        verdict_summary: "Validates error handling — both sides should report 'file not found' gracefully.",
+        verdict_summary: "Validates error handling - both sides should report 'file not found' gracefully.",
         non_mcp_is_complete: true,
         reference_answer: None,
         tier: 2,
@@ -1042,11 +1444,11 @@ mod tests {
 
     #[test]
     fn scenario_reference_answer_field_present() {
-        // 18 tier-1 + 6 tier-2 = 24 without semantic, +1 with semantic = 25.
+        // 28 tier-1 + 6 tier-2 = 34 without semantic, +1 with semantic = 35.
         #[cfg(not(feature = "semantic"))]
-        let expected = 24;
+        let expected = 34;
         #[cfg(feature = "semantic")]
-        let expected = 25;
+        let expected = 35;
         assert_eq!(SCENARIOS.len(), expected);
         assert!(SCENARIOS[0].reference_answer.is_none());
         assert!(SCENARIOS.iter().all(|s| s.reference_answer.is_none()));
@@ -1055,7 +1457,7 @@ mod tests {
     #[test]
     fn tier_1_scenarios_count() {
         let tier1 = SCENARIOS.iter().filter(|s| s.tier == 1).count();
-        assert_eq!(tier1, 18);
+        assert_eq!(tier1, 28);
     }
 
     #[test]

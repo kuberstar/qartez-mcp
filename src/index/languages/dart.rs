@@ -6,6 +6,7 @@ use super::LanguageSupport;
 use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 /// Identifier -> declared type name, populated from formal parameters, typed
 /// locals, and (for methods) enclosing-class fields. Used by the resolver's
@@ -76,7 +77,7 @@ fn extract_from_node(
                 let idx = symbols.len();
                 symbols.push(sym);
                 // Class-header references (superclass, `with`, `implements`)
-                // attribute to the class. Skip the body — `extract_class_body`
+                // attribute to the class. Skip the body - `extract_class_body`
                 // walks each member and attributes per-method.
                 collect_references_skip(node, source, Some(idx), references, &["class_body"]);
                 extract_class_body(node, source, idx, symbols, references);
@@ -471,7 +472,7 @@ fn extract_import(node: Node, source: &[u8]) -> Option<ExtractedImport> {
     }
     // Dart's `import_or_export` covers both `import '…';` and `export '…';`.
     // A barrel library re-exports its internal files so every consumer of the
-    // barrel transitively depends on them — we record that as an edge (with
+    // barrel transitively depends on them - we record that as an edge (with
     // is_reexport=true) so impact/blast analysis walks through the barrel.
     let is_reexport = is_export_directive(node);
     Some(ExtractedImport {
@@ -598,7 +599,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     }
 
     let truncated = if sig.len() > 200 {
-        &sig[..sig.floor_char_boundary(200)]
+        &sig[..floor_char_boundary(sig, 200)]
     } else {
         sig
     };
@@ -638,7 +639,7 @@ fn collect_references(
 /// Like `collect_references` but does not descend into nodes whose kind is
 /// listed in `skip_kinds`. Used so that a class-level sweep can record
 /// references in the class header (superclass, `with`, `implements`) without
-/// also bleeding every method-body call into the class symbol — those are
+/// also bleeding every method-body call into the class symbol - those are
 /// attributed per-method by `extract_class_body`.
 fn collect_references_skip(
     root: Node,
@@ -1187,7 +1188,7 @@ final appName = 'MyApp';
     }
 
     #[test]
-    #[ignore = "debug aid — dumps AST"]
+    #[ignore = "debug aid - dumps AST"]
     fn _dump_ast_for_typed_scope() {
         let src = r#"
 class Foo { void doit() {} }
@@ -1223,7 +1224,7 @@ class Bar {
     }
 
     #[test]
-    #[ignore = "debug aid -- dumps AST"]
+    #[ignore = "debug aid - dumps AST"]
     fn _dump_ast_for_calls() {
         let src = r#"
 void setUp() {
@@ -1284,7 +1285,7 @@ void main() {
             calls.contains(&"SweFacade"),
             "expected `SweFacade` call ref (constructor in assignment), got {calls:?}"
         );
-        // Method call `obj.method(arg)` — the method name (not the receiver)
+        // Method call `obj.method(arg)` - the method name (not the receiver)
         // is the call target.
         assert!(
             calls.contains(&"method"),
@@ -1308,7 +1309,7 @@ class Greeter {
             .filter(|r| matches!(r.kind, ReferenceKind::TypeRef))
             .map(|r| r.name.as_str())
             .collect();
-        // Duration and DateTime are Dart builtins — they must be filtered.
+        // Duration and DateTime are Dart builtins - they must be filtered.
         assert!(
             !type_refs.contains(&"Duration"),
             "builtin Duration should not be a type ref, got {type_refs:?}"
@@ -1317,7 +1318,7 @@ class Greeter {
             !type_refs.contains(&"DateTime"),
             "builtin DateTime should not be a type ref, got {type_refs:?}"
         );
-        // Greeter is the declared class itself — its own header must not
+        // Greeter is the declared class itself - its own header must not
         // produce a self-reference.
         let self_refs: Vec<_> = result
             .references

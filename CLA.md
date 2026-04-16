@@ -1,6 +1,6 @@
 # Qartez Contributor License Agreement
 
-**Version 1.0 -- 2026-04-15**
+**Version 1.0 - 2026-04-15**
 
 Thank you for your interest in contributing to Qartez ("Project"), maintained
 by Kuberstar ("We", "Us", or "Our"). This Contributor License Agreement

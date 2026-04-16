@@ -158,7 +158,7 @@ struct Cli {
     judge_workers: usize,
 
     /// Self-consistency count for `--judge`. Each scenario is judged
-    /// `2 * n` times — `n` runs per position pass. With position swap
+    /// `2 * n` times - `n` runs per position pass. With position swap
     /// n=1 still gives 2 independent runs per scenario. Set n=2 for
     /// higher confidence at 2x the cost.
     #[arg(long, default_value_t = 1)]
@@ -266,7 +266,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve the language profile first — unknown / unimplemented
+    // Resolve the language profile first - unknown / unimplemented
     // languages should fail before we touch the database.
     let profile = profiles::by_name(&cli.lang).with_context(|| {
         let implemented = profiles::implemented_languages().join(", ");

@@ -48,7 +48,7 @@ check_deps() {
 
 # Extract a field for a given section from the TOML manifest.
 # Usage: toml_field <section> <key>
-# Implementation is intentionally simple — we control the TOML format.
+# Implementation is intentionally simple - we control the TOML format.
 toml_field() {
     local section="$1"
     local key="$2"
@@ -189,7 +189,7 @@ index_fixture() {
     note "$lang: indexing with $binary"
     local log
     log=$(mktemp -t qartez-index.XXXXXX)
-    # Ignore exit status intentionally — MCP stdin EOF always produces
+    # Ignore exit status intentionally - MCP stdin EOF always produces
     # a non-zero exit and we detect indexing success separately below.
     "$binary" --root "$dir" --log-level info </dev/null >/dev/null 2>"$log" || true
 

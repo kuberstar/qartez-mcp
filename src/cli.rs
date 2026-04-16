@@ -1,23 +1,43 @@
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+/// Output format for CLI commands.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum OutputFormat {
+    /// Colored, human-readable output (default for TTY)
+    #[default]
+    Human,
+    /// Raw JSON for piping and scripting
+    Json,
+    /// Concise text, good for CI logs
+    Compact,
+}
+
 #[derive(Parser)]
-#[command(name = "qartez-mcp", about = "MCP server for codebase intelligence")]
+#[command(
+    name = "qartez",
+    about = "Code intelligence toolkit - CLI and MCP server",
+    long_about = "Qartez provides code intelligence via tree-sitter indexing, PageRank ranking,\n\
+        blast-radius analysis, and more.\n\n\
+        Run without a subcommand to start the MCP server.\n\
+        Run with a subcommand to use the CLI directly.",
+    version
+)]
 pub struct Cli {
     /// Project root(s). Can be specified multiple times for monorepo support.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub root: Vec<PathBuf>,
 
     /// Force full re-index
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub reindex: bool,
 
     /// Max git commits to analyze for co-changes
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "300", global = true)]
     pub git_depth: u32,
 
     /// Database path override
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub db_path: Option<PathBuf>,
 
     /// Disable the automatic file watcher (watcher is enabled by default
@@ -26,7 +46,7 @@ pub struct Cli {
     pub no_watch: bool,
 
     /// Log level
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "info", global = true)]
     pub log_level: String,
 
     /// Generate an architecture wiki after indexing and write it to this path
@@ -38,4 +58,166 @@ pub struct Cli {
     /// clusters; smaller values merge clusters.
     #[arg(long, default_value = "1.0")]
     pub leiden_resolution: f64,
+
+    /// Output format (human, json, compact). Defaults to human for TTY.
+    #[arg(long, value_enum, global = true)]
+    pub format: Option<OutputFormat>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Project skeleton ranked by importance (PageRank)
+    Map {
+        /// Number of top files to show
+        #[arg(long, default_value = "20")]
+        top_n: u32,
+        /// Boost files containing these terms
+        #[arg(long)]
+        boost: Vec<String>,
+        /// Show all files (ignores --top-n)
+        #[arg(long)]
+        all_files: bool,
+        /// Ranking axis: files or symbols
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Jump to a symbol definition by name
+    Find {
+        /// Symbol name to look up
+        name: String,
+        /// Filter by symbol kind (function, struct, class, etc.)
+        #[arg(long)]
+        kind: Option<String>,
+    },
+
+    /// Search indexed symbols by name
+    Grep {
+        /// Search query (supports prefix* matching)
+        query: String,
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        /// Search function bodies instead of symbol names
+        #[arg(long)]
+        bodies: bool,
+        /// Interpret query as regex
+        #[arg(long)]
+        regex: bool,
+    },
+
+    /// Read symbol source code with line numbers
+    Read {
+        /// Symbol name to read (omit to read a file range)
+        name: Option<String>,
+        /// File path (disambiguates symbol or reads raw range)
+        #[arg(long)]
+        file: Option<String>,
+        /// Start line (for file range reads)
+        #[arg(long)]
+        start: Option<u32>,
+        /// End line (for file range reads)
+        #[arg(long)]
+        end: Option<u32>,
+        /// Context lines before the symbol
+        #[arg(long, default_value = "0")]
+        context: u32,
+    },
+
+    /// File symbol table (table of contents)
+    Outline {
+        /// File path
+        file: String,
+    },
+
+    /// Blast radius analysis before editing
+    Impact {
+        /// File path to analyze
+        file: String,
+        /// Include test files in blast radius
+        #[arg(long)]
+        include_tests: bool,
+    },
+
+    /// File dependency graph
+    Deps {
+        /// File path
+        file: String,
+    },
+
+    /// Project or per-file metrics
+    Stats {
+        /// Optional file path (omit for project-wide stats)
+        file: Option<String>,
+    },
+
+    /// Dead exports and unreferenced symbols
+    Unused {
+        /// Max results to return
+        #[arg(long, default_value = "50")]
+        limit: u32,
+    },
+
+    /// All usages of a symbol across the codebase
+    Refs {
+        /// Symbol name
+        name: String,
+    },
+
+    /// Complexity x coupling x churn ranking
+    Hotspots,
+
+    /// Call hierarchy (callers and callees)
+    Calls {
+        /// Symbol name
+        name: String,
+        /// Direction: callers, callees, or both
+        #[arg(long, default_value = "both")]
+        direction: String,
+        /// Max depth
+        #[arg(long, default_value = "2")]
+        depth: u32,
+    },
+
+    /// Duplicate code detection via AST hashing
+    Clones,
+
+    /// Architecture boundary rule violations
+    Boundaries,
+
+    /// Type/trait inheritance hierarchy
+    Hierarchy {
+        /// Type or trait name
+        name: String,
+    },
+
+    /// Symbol complexity trend over git history
+    Trend {
+        /// File path to analyze
+        file: String,
+        /// Optional symbol name to filter to one function
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Security analysis
+    Security,
+
+    /// Files that historically change together
+    Cochange {
+        /// File path
+        file: String,
+    },
+
+    /// Related files for a task (files you plan to modify)
+    Context {
+        /// File paths to analyze context for
+        files: Vec<String>,
+        /// Optional task description to help prioritize
+        #[arg(long)]
+        task: Option<String>,
+    },
 }

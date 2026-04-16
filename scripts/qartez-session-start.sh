@@ -1,5 +1,5 @@
 #!/bin/bash
-# qartez-session-start.sh — SessionStart hook for Claude Code
+# qartez-session-start.sh - SessionStart hook for Claude Code
 # Auto-indexes a project on session start if it looks like a code repo
 # and no .qartez/ index exists yet. Fire-and-forget: the hook returns
 # immediately and the indexer runs detached in the background.

@@ -2,7 +2,7 @@
 
 //! Architecture boundary enforcement over the file-level import graph.
 //!
-//! Users declare path-scoped rules in `.qartez/boundaries.toml` — files
+//! Users declare path-scoped rules in `.qartez/boundaries.toml` - files
 //! matching a `from` glob must not import files matching any `deny` glob,
 //! with an optional `allow` override for cross-cutting concerns (shared
 //! error types, logging, DTOs, etc.). The checker walks `edges`, resolves
@@ -19,7 +19,7 @@
 //! produces a starter config whose `from` prefixes match the dominant
 //! directory of each non-misc cluster and whose `deny` lists include
 //! every other cluster prefix that the current edge graph does not
-//! already traverse — i.e. it freezes the existing architecture so the
+//! already traverse - i.e. it freezes the existing architecture so the
 //! user can relax the rules intentionally rather than accidentally
 //! ratifying drift.
 
@@ -108,7 +108,7 @@ fn validate_glob(pattern: &str, path: &Path, idx: usize, field: &str) -> Result<
 ///
 /// The returned list is sorted by `(rule_index, from_file, to_file)` so
 /// re-running the checker on the same DB produces byte-identical output
-/// — important for CI gating and for writing deterministic tests.
+/// - important for CI gating and for writing deterministic tests.
 pub fn check_boundaries(
     config: &BoundaryConfig,
     files: &[FileRow],
@@ -194,7 +194,7 @@ impl CompiledRule {
 // so the unwrap path here only fires when a caller constructs a
 // `BoundaryConfig` in memory with a broken pattern. In that case the
 // rule is degraded to "matches nothing" rather than panicking at query
-// time — the user-supplied input path is parse_config, not this one.
+// time - the user-supplied input path is parse_config, not this one.
 fn compile_glob(pattern: &str) -> GlobMatcher {
     Glob::new(pattern)
         .map(|g| g.compile_matcher())

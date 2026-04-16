@@ -318,7 +318,7 @@ fn record_reference(
     let line = node.start_position().row as u32 + 1;
     match node.kind() {
         "invocation_expression" => {
-            // `Foo.Bar(x)` — first child is the callee expression.
+            // `Foo.Bar(x)` - first child is the callee expression.
             if let Some(func) = node
                 .child_by_field_name("function")
                 .or_else(|| node.child(0))
@@ -337,7 +337,7 @@ fn record_reference(
             }
         }
         "object_creation_expression" => {
-            // `new Foo()` — the type child holds the constructor name.
+            // `new Foo()` - the type child holds the constructor name.
             if let Some(type_node) = node.child_by_field_name("type").or_else(|| {
                 children(node).find(|c| {
                     matches!(
@@ -393,7 +393,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
     match node.kind() {
         "identifier_name" | "identifier" => node_text(node, source),
         "member_access_expression" => {
-            // `obj.Method` — try "name" field, fall back to last identifier child.
+            // `obj.Method` - try "name" field, fall back to last identifier child.
             node.child_by_field_name("name")
                 .or_else(|| {
                     node.child(node.child_count().saturating_sub(1) as u32)
@@ -405,7 +405,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
                 .unwrap_or_default()
         }
         "generic_name" => {
-            // `Foo<T>` — the identifier child is the base name.
+            // `Foo<T>` - the identifier child is the base name.
             node.child_by_field_name("name")
                 .or_else(|| node.child(0))
                 .map(|n| node_text(n, source))

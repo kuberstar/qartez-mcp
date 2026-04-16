@@ -184,7 +184,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
     // `CREATE INDEX idx_symbols_pagerank` below.
     migrate(conn)?;
 
-    // Phase 3: create indexes — safe now that every referenced column exists.
+    // Phase 3: create indexes - safe now that every referenced column exists.
     conn.execute_batch(
         &[
             CREATE_IDX_FILES_PAGERANK,
@@ -223,7 +223,7 @@ fn try_add_column(conn: &Connection, sql: &str) -> Result<()> {
 /// Apply idempotent schema migrations so existing `.qartez/index.db` files
 /// (created before a column was added) pick up new columns on the next open.
 /// Each `ALTER TABLE ADD COLUMN` is expected to fail with "duplicate column"
-/// when the migration has already run — that specific error is ignored.
+/// when the migration has already run - that specific error is ignored.
 /// All other errors (disk full, corruption, read-only) are propagated.
 fn migrate(conn: &Connection) -> Result<()> {
     // shape_hash is in the original CREATE_SYMBOLS but legacy DBs created
@@ -248,7 +248,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Owner type for methods extracted from `impl Foo { fn bar() }` blocks.
     // NULL for free functions and top-level items.
     try_add_column(conn, "ALTER TABLE symbols ADD COLUMN owner_type TEXT")?;
-    // Per-file git change count — how many commits touched this file within
+    // Per-file git change count - how many commits touched this file within
     // the configured analysis window. Defaults to 0 for non-git repos or
     // files that appear only in the working tree.
     try_add_column(

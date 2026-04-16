@@ -9,7 +9,7 @@
 # Pinning is intentional: benchmark numbers are only comparable across runs
 # when the source under test is byte-identical. To move to a newer commit,
 # bump the `commit` field here and re-run the setup script. Treat any bump
-# as a baseline refresh — call it out in the commit message.
+# as a baseline refresh - call it out in the commit message.
 #
 # If a pinned commit becomes unreachable (e.g. force-push removes it), pick
 # another commit from roughly mid-2025 for the same repo and record why in

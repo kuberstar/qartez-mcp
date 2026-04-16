@@ -77,7 +77,7 @@ static CREATE_SEQUENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-// END; or END $$ — terminates BEGIN...END blocks
+// END; or END $$ - terminates BEGIN...END blocks
 static END_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*END\s*[;$]").unwrap());
 
 /// Truncates a string to at most `max_len` characters.

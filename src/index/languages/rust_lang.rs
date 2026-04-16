@@ -5,6 +5,7 @@ use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
     ReferenceKind, RelationKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct RustSupport;
 
@@ -125,7 +126,7 @@ fn extract_from_node(
         _ => {}
     }
 
-    // Reference harvesting runs with the INPUT enclosing — a call_expression
+    // Reference harvesting runs with the INPUT enclosing - a call_expression
     // lives inside the symbol that contains it, not the symbol this very node
     // might be defining (definitions are harvested above via `new_enclosing`).
     record_reference(node, source, enclosing, references);
@@ -172,7 +173,7 @@ fn record_reference(
             }
         }
         "macro_invocation" => {
-            // `foo!(...)` -- the macro name behaves like a callee.
+            // `foo!(...)` - the macro name behaves like a callee.
             if let Some(mac) = node.child_by_field_name("macro") {
                 let name = match mac.kind() {
                     "identifier" => node_text(mac, source),
@@ -195,7 +196,7 @@ fn record_reference(
             }
         }
         "type_identifier" => {
-            // Skip type_identifiers that are the name of a definition -- those
+            // Skip type_identifiers that are the name of a definition - those
             // are not references to external symbols but the definitions
             // themselves. tree-sitter-rust attaches them as a direct child of
             // the defining node.
@@ -270,7 +271,7 @@ fn extract_callee_info(func: Node, source: &[u8]) -> (String, Option<String>) {
     }
 }
 
-/// Primitive types and `Self` — these are either handled directly by the
+/// Primitive types and `Self` - these are either handled directly by the
 /// compiler or self-references and should never reach the symbol graph.
 fn is_builtin_type(name: &str) -> bool {
     matches!(
@@ -462,7 +463,7 @@ fn extract_named_struct_fields(
         let signature = type_text.map(|t| format!("{}: {}", name, t));
         // A field is "exported" when the struct_item marks it `pub`.
         // tree-sitter-rust stores the visibility as a `visibility_modifier`
-        // child; absence means pub(crate)/private — close enough for the
+        // child; absence means pub(crate)/private - close enough for the
         // outline filter since `is_exported` is already a fuzzy flag.
         let is_pub = children(child).any(|c| c.kind() == "visibility_modifier");
         symbols.push(ExtractedSymbol {
@@ -474,7 +475,7 @@ fn extract_named_struct_fields(
             is_exported: is_pub,
             parent_idx: Some(parent_idx),
             // Fields of a struct never count as "unused exports" on their
-            // own — the struct's own export status drives the check.
+            // own - the struct's own export status drives the check.
             unused_excluded: true,
             complexity: None,
             owner_type: None,
@@ -555,11 +556,11 @@ fn extract_impl_type_name(impl_node: Node, source: &[u8]) -> Option<String> {
     let type_node = impl_node.child_by_field_name("type")?;
     match type_node.kind() {
         "type_identifier" => Some(node_text(type_node, source)),
-        // `impl Foo<Bar>` -- generic type, take the type name part.
+        // `impl Foo<Bar>` - generic type, take the type name part.
         "generic_type" => type_node
             .child_by_field_name("type")
             .map(|n| node_text(n, source)),
-        // `impl module::Foo` -- scoped type, take the last segment.
+        // `impl module::Foo` - scoped type, take the last segment.
         "scoped_type_identifier" => type_node
             .child_by_field_name("name")
             .map(|n| node_text(n, source)),
@@ -582,7 +583,7 @@ fn extract_impl_methods(
     // Trait impl methods are called via dynamic dispatch, so the static
     // "no file imports the defining file" check can't tell whether they
     // are actually unused. Flag them here so `qartez_unused` skips them at
-    // query time -- much cheaper than re-walking the AST for every call.
+    // query time - much cheaper than re-walking the AST for every call.
     let trait_node = impl_node.child_by_field_name("trait");
     let in_trait_impl = trait_node.is_some();
     let owner = extract_impl_type_name(impl_node, source);
@@ -845,7 +846,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     }
 
     let truncated = if sig.len() > 200 {
-        &sig[..sig.floor_char_boundary(200)]
+        &sig[..floor_char_boundary(sig, 200)]
     } else {
         sig
     };
@@ -1218,7 +1219,7 @@ fn f(x: i32) -> u64 { x as u64 }
 pub struct Foo {}
 "#,
         );
-        // The struct's own name must not appear as a reference — it is a
+        // The struct's own name must not appear as a reference - it is a
         // definition, not a use.
         let foo_refs: Vec<&ExtractedReference> = result
             .references

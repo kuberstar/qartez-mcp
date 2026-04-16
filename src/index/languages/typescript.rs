@@ -5,6 +5,7 @@ use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
     ReferenceKind, RelationKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct TypeScriptSupport;
 
@@ -215,7 +216,7 @@ fn extract_from_node(
 }
 
 /// Emit a reference for the node shapes we care about. Same shape as the
-/// Rust extractor — kept separate so that TypeScript-specific node kinds
+/// Rust extractor - kept separate so that TypeScript-specific node kinds
 /// (e.g. `new_expression`, `member_expression`) do not leak into the Rust
 /// extractor's match arms.
 fn record_reference(
@@ -303,7 +304,7 @@ fn extract_callee_name(func: Node, source: &[u8]) -> String {
 
 /// TypeScript built-in types. Filtering here keeps the symbol_refs table
 /// small and the PageRank weights meaningful. Missing a rare built-in is
-/// harmless — the resolver will just fail to find a matching symbol and
+/// harmless - the resolver will just fail to find a matching symbol and
 /// drop the reference.
 fn is_builtin_type(name: &str) -> bool {
     matches!(
@@ -742,7 +743,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     }
 
     let truncated = if sig.len() > 200 {
-        &sig[..sig.floor_char_boundary(200)]
+        &sig[..floor_char_boundary(sig, 200)]
     } else {
         sig
     };

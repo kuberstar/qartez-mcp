@@ -17,7 +17,7 @@
 //! # Design
 //!
 //! Follows FActScore (Min et al., EMNLP 2023) / SAFE (Wei et al., 2024) /
-//! RAGAS faithfulness (Es et al., 2023) — decompose the generated answer
+//! RAGAS faithfulness (Es et al., 2023) - decompose the generated answer
 //! into atomic claims and verify each against a trusted knowledge source.
 //! Here the knowledge source is the local filesystem plus the qartez
 //! SQLite index, rather than a web search. See
@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 use crate::storage::read;
 
 // ---------------------------------------------------------------------------
-// Scope caps — guard against pathological inputs.
+// Scope caps - guard against pathological inputs.
 // ---------------------------------------------------------------------------
 
 /// Hard cap on input size. Beyond this the extractor short-circuits to
@@ -62,7 +62,7 @@ const MAX_UNVERIFIED_EXAMPLES: usize = 5;
 // ---------------------------------------------------------------------------
 
 /// One extracted factual claim about the project. Deliberately not
-/// serialized — this is a transient parsing artifact; only the
+/// serialized - this is a transient parsing artifact; only the
 /// aggregated [`GroundingScores`] crosses the report / prompt boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Claim {
@@ -92,12 +92,12 @@ pub struct GroundingScores {
     pub total_claims: usize,
     /// Number of claims that verified against the live project.
     pub verified_claims: usize,
-    /// Breakdown — file-existence claims (raw `FilePath`).
+    /// Breakdown - file-existence claims (raw `FilePath`).
     pub file_claims: usize,
-    /// Breakdown — line / range claims (counted separately from plain
+    /// Breakdown - line / range claims (counted separately from plain
     /// file claims because a ranged claim also verifies a file).
     pub line_claims: usize,
-    /// Breakdown — symbol claims (excluded from denominator when
+    /// Breakdown - symbol claims (excluded from denominator when
     /// `degraded == true`).
     pub symbol_claims: usize,
     /// Verified subset of [`file_claims`](Self::file_claims).
@@ -155,13 +155,13 @@ pub struct GroundingContext<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Regex set (ordered — first match wins per span)
+// Regex set (ordered - first match wins per span)
 // ---------------------------------------------------------------------------
 //
 // Patterns taken verbatim from `docs/benchmark-v2/verifiable-grounding.md`
 // §1. Compiled once via `OnceLock` so repeat invocations pay zero regex
 // build cost. Each pattern targets a specific surface shape observed in
-// real benchmark output — adding a new tool shape only requires
+// real benchmark output - adding a new tool shape only requires
 // appending a pattern here.
 
 /// A file-extension whitelist baked into the bare-path regex. Kept
@@ -181,7 +181,7 @@ struct RegexSet {
     symbol_kind: Regex,
     /// Leading identifier form observed in `qartez_find` concise and
     /// `qartez_grep` detailed output. Shapes:
-    ///   `  + QartezServer — src/server/mod.rs [L116-L122]`
+    ///   `  + QartezServer - src/server/mod.rs [L116-L122]`
     ///   `find_symbol_by_name    function     src/storage/read.rs`
     /// The leading identifier is the claim; the trailing kind / path
     /// are handled by other regexes. Anchored to line start after
@@ -211,7 +211,7 @@ fn regex_set() -> &'static RegexSet {
         ))
         .expect("range_colon regex compiles");
 
-        // `@ src/server/mod.rs:L553-559` — qartez_read cat-n header form.
+        // `@ src/server/mod.rs:L553-559` - qartez_read cat-n header form.
         let range_at = Regex::new(&format!(
             r"@\s*({path_chars}+\.(?:{FILE_EXT_GROUP})):L?(\d+)-(\d+)"
         ))
@@ -483,7 +483,7 @@ pub fn extract_claims(text: &str) -> Vec<Claim> {
             }
         }
 
-        // Symbol claims — suppressed inside triple-fenced blocks.
+        // Symbol claims - suppressed inside triple-fenced blocks.
         if !in_fence {
             // Leading-identifier form comes FIRST so tabular output from
             // `qartez_find` / `qartez_grep` is captured before the generic
@@ -510,7 +510,7 @@ pub fn extract_claims(text: &str) -> Vec<Claim> {
                     continue;
                 }
                 if let Some(full) = cap.get(1).map(|g| g.as_str()) {
-                    // `foo::Bar` — take the final segment as the claim.
+                    // `foo::Bar` - take the final segment as the claim.
                     let name = full.rsplit("::").next().unwrap_or(full).to_string();
                     if symbol_ok(&name)
                         && push_claim(&mut out, &mut seen, Claim::Symbol { name, kind: None })
@@ -565,7 +565,7 @@ fn is_url_context(haystack: &str, at: usize) -> bool {
 
 fn strip_cat_n_prefix(line: &str) -> &str {
     // Pattern: optional whitespace, 1-6 digits, optional whitespace, `|`,
-    // optional whitespace — matches `  553 | ` in `qartez_read` output.
+    // optional whitespace - matches `  553 | ` in `qartez_read` output.
     let trimmed = line.trim_start();
     let bytes = trimmed.as_bytes();
     let mut i = 0;
@@ -717,7 +717,7 @@ fn push_claim(out: &mut Vec<Claim>, seen: &mut HashSet<String>, claim: Claim) ->
 /// `score N/A` for that side rather than a bogus `0.0`).
 ///
 /// Wraps extraction + verification in `std::panic::catch_unwind` so a
-/// parser bug does not crash the benchmark run — on panic this returns
+/// parser bug does not crash the benchmark run - on panic this returns
 /// a `degraded: true` sentinel with a single `"parser panic: ..."`
 /// example in `unverified`.
 pub fn verify_side(output: &str, ctx: &mut GroundingContext<'_>) -> Option<GroundingScores> {
@@ -743,7 +743,7 @@ pub fn verify_side(output: &str, ctx: &mut GroundingContext<'_>) -> Option<Groun
     // line numbers); verification is straightforward but cheap to guard.
     //
     // Note: `catch_unwind` requires `UnwindSafe`. `&mut` refs are not,
-    // so we use `AssertUnwindSafe` — the invariants we care about
+    // so we use `AssertUnwindSafe` - the invariants we care about
     // (caches left consistent) are upheld by push-only operations on
     // the cache hash maps, which cannot get corrupted by a mid-write
     // panic in safe Rust.
@@ -879,7 +879,7 @@ fn verify_file_exists(path: &str, ctx: &mut GroundingContext<'_>) -> Option<File
 }
 
 fn verify_file_direct(path: &str, ctx: &mut GroundingContext<'_>) -> Option<FileFacts> {
-    // Index path first — the qartez index carries `line_count` pre-
+    // Index path first - the qartez index carries `line_count` pre-
     // computed, no file I/O needed.
     if let Some(conn) = ctx.conn
         && let Ok(Some(file)) = read::get_file_by_path(conn, path)
@@ -972,18 +972,18 @@ fn verify_symbol_exists(name: &str, ctx: &mut GroundingContext<'_>) -> bool {
 /// between `ANSWERS TO GRADE` and `OUTPUT FORMAT` (PLAN.md §2.3).
 ///
 /// Three shapes are produced:
-/// 1. Normal — `claims=... verified=... unverified=...`.
-/// 2. No-claims — `no verifiable claims extracted — score N/A`
+/// 1. Normal - `claims=... verified=... unverified=...`.
+/// 2. No-claims - `no verifiable claims extracted - score N/A`
 ///    (when `g` is `None` or `total_claims == 0`).
-/// 3. Degraded — the normal body plus a trailing
+/// 3. Degraded - the normal body plus a trailing
 ///    `note: symbol check skipped (missing index)` line.
 pub fn render_prompt_block(label: &str, g: Option<&GroundingScores>) -> String {
     match g {
         None => format!(
-            "Programmatic grounding for {label}:\n  no verifiable claims extracted — score N/A"
+            "Programmatic grounding for {label}:\n  no verifiable claims extracted - score N/A"
         ),
         Some(scores) if scores.total_claims == 0 => format!(
-            "Programmatic grounding for {label}:\n  no verifiable claims extracted — score N/A"
+            "Programmatic grounding for {label}:\n  no verifiable claims extracted - score N/A"
         ),
         Some(scores) => {
             let unverified_list = if scores.unverified.is_empty() {
@@ -1041,7 +1041,7 @@ mod tests {
 
     #[test]
     fn extract_claims_qartez_find_shape() {
-        let input = " + QartezServer — src/server/mod.rs [L116-L122] →6";
+        let input = " + QartezServer - src/server/mod.rs [L116-L122] →6";
         let claims = extract_claims(input);
         assert!(
             claims.contains(&Claim::FileRange {
@@ -1136,7 +1136,7 @@ mod tests {
         // The bare-path regex requires at least one slash, so bare
         // basenames without a directory prefix do not land as
         // `FilePath` claims by design. The verifier then has nothing
-        // to do — bare prose basenames are genuinely ambiguous.
+        // to do - bare prose basenames are genuinely ambiguous.
         // This test documents the decision instead of flipping it.
         assert!(
             !claims
@@ -1313,14 +1313,14 @@ mod tests {
     #[test]
     fn render_prompt_block_none() {
         let rendered = render_prompt_block("ANSWER A (MCP)", None);
-        assert!(rendered.contains("no verifiable claims extracted — score N/A"));
+        assert!(rendered.contains("no verifiable claims extracted - score N/A"));
     }
 
     #[test]
     fn render_prompt_block_zero_claims() {
         let scores = GroundingScores::default();
         let rendered = render_prompt_block("ANSWER A (MCP)", Some(&scores));
-        assert!(rendered.contains("no verifiable claims extracted — score N/A"));
+        assert!(rendered.contains("no verifiable claims extracted - score N/A"));
     }
 
     #[test]

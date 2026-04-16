@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# Qartez MCP — zero-dependency installer
+# Qartez MCP - zero-dependency installer
 # Works on macOS (arm64/x86_64) and Linux (amd64/arm64/riscv64)
 # Only needs: curl or wget
 #
@@ -71,10 +71,10 @@ download() {
 # Download the source tarball into a temp dir and build from there.
 if [ -z "$SCRIPT_DIR" ] || [ ! -f "${SCRIPT_DIR}/Cargo.toml" ]; then
     if ! command -v tar >/dev/null 2>&1; then
-        err "tar not found — required to extract source tarball."
+        err "tar not found - required to extract source tarball."
         exit 1
     fi
-    info "Source not found locally — downloading from github.com/${QARTEZ_REPO}..."
+    info "Source not found locally - downloading from github.com/${QARTEZ_REPO}..."
     QARTEZ_TMPDIR="$(mktemp -d)"
     trap 'rm -rf "$QARTEZ_TMPDIR"' EXIT INT TERM
     download "https://codeload.github.com/${QARTEZ_REPO}/tar.gz/refs/heads/${QARTEZ_BRANCH}" "${QARTEZ_TMPDIR}/qartez.tar.gz"
@@ -116,14 +116,14 @@ info "Building release binaries (this may take a few minutes on first run)..."
 # --- Install ---
 TARGET_DIR="${CARGO_TARGET_DIR:-${SCRIPT_DIR}/target}"
 mkdir -p "$INSTALL_DIR"
-for bin in qartez-mcp qartez-guard qartez-setup; do
+for bin in qartez qartez-guard qartez-setup; do
     if ! [ -f "${TARGET_DIR}/release/${bin}" ]; then
         err "Binary not found: ${TARGET_DIR}/release/${bin}"
         exit 1
     fi
     # Atomic install: copy to .new, then rename. mv replaces the inode so a
     # running process keeps the old binary mapped via its open fd while new
-    # invocations get the fresh one — avoids ETXTBSY and corrupted overwrites.
+    # invocations get the fresh one - avoids ETXTBSY and corrupted overwrites.
     cp "${TARGET_DIR}/release/${bin}" "${INSTALL_DIR}/${bin}.new"
     if [ "$(uname)" = "Darwin" ]; then
         codesign -s - -f "${INSTALL_DIR}/${bin}.new" 2>/dev/null || true
@@ -132,6 +132,8 @@ for bin in qartez-mcp qartez-guard qartez-setup; do
     SIZE=$(wc -c < "${TARGET_DIR}/release/${bin}" | awk '{printf "%.1f MB", $1/1048576}')
     ok "Installed: ${INSTALL_DIR}/${bin} (${SIZE})"
 done
+ln -sf qartez "${INSTALL_DIR}/qartez-mcp"
+ok "Symlink: ${INSTALL_DIR}/qartez-mcp -> qartez"
 
 # --- Configure IDEs ---
 case "${1:-}" in

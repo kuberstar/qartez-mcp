@@ -159,7 +159,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             test_cmd: vec![driver.into(), "test".into()],
             build_cmd,
             lint_cmd: Some(vec![driver.into(), "analyze".into()]),
-            // `dart analyze` covers static type checking — no separate typechecker.
+            // `dart analyze` covers static type checking - no separate typechecker.
             typecheck_cmd: Some(vec![driver.into(), "analyze".into()]),
         });
     }
@@ -180,7 +180,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
 
 /// Checks whether a binary is available on PATH.
 pub fn binary_available(name: &str) -> bool {
-    // Skip path-relative binaries like ./gradlew — they are project-local.
+    // Skip path-relative binaries like ./gradlew - they are project-local.
     if name.starts_with('.') || name.contains('/') {
         return true;
     }
@@ -196,7 +196,7 @@ pub fn binary_available(name: &str) -> bool {
 fn pubspec_uses_flutter(pubspec: &str) -> bool {
     // Flutter projects declare `flutter:` under *runtime* `dependencies:` with
     // `sdk: flutter`, or include a top-level `flutter:` configuration block.
-    // `dev_dependencies:` is explicitly excluded — pure-Dart packages commonly
+    // `dev_dependencies:` is explicitly excluded - pure-Dart packages commonly
     // test with `flutter_test`, and we must not flip those to the Flutter
     // toolchain.
     let mut in_runtime_deps = false;

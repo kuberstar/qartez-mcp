@@ -75,6 +75,24 @@ mod flexible {
             .collect()
     }
 
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum F64OrStr {
+        Num(f64),
+        Str(String),
+    }
+
+    pub(super) fn f64_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        match Option::<F64OrStr>::deserialize(d)? {
+            None => Ok(None),
+            Some(F64OrStr::Num(n)) => Ok(Some(n)),
+            Some(F64OrStr::Str(s)) => s
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|e| D::Error::custom(format!("expected f64, got \"{s}\": {e}"))),
+        }
+    }
+
     pub(super) fn vec_string_opt<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<Option<Vec<String>>, D::Error> {
@@ -103,6 +121,7 @@ pub(super) enum Format {
     #[default]
     Detailed,
     Concise,
+    Mermaid,
 }
 
 /// Toolchain command selector for `qartez_project`. `Info` is the default so a
@@ -156,6 +175,10 @@ pub(super) enum HotspotSortBy {
 
 pub(super) fn is_concise(format: &Option<Format>) -> bool {
     matches!(format, Some(Format::Concise))
+}
+
+pub(super) fn is_mermaid(format: &Option<Format>) -> bool {
+    matches!(format, Some(Format::Mermaid))
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -229,7 +252,7 @@ pub(super) struct SoulReadParams {
     #[serde(default, deserialize_with = "flexible::vec_string_opt")]
     pub symbols: Option<Vec<String>>,
     #[schemars(
-        description = "Filter all symbols to a specific file path. When set without any symbol, reads the raw file contents -- the whole file by default, or the slice defined by start_line/end_line/limit. max_bytes still bounds the output. Aliases: `file`, `path`."
+        description = "Filter all symbols to a specific file path. When set without any symbol, reads the raw file contents - the whole file by default, or the slice defined by start_line/end_line/limit. max_bytes still bounds the output. Aliases: `file`, `path`."
     )]
     #[serde(alias = "file", alias = "path")]
     pub file_path: Option<String>,
@@ -244,7 +267,7 @@ pub(super) struct SoulReadParams {
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub context_lines: Option<u32>,
     #[schemars(
-        description = "Read partial body: 1-based start line. Combined with `end_line` or `limit`. When set together with `file_path` but without any symbol, dumps that raw line range from the file -- lets you read non-symbol code (imports, module headers) without falling back to Read. Alias: `offset`."
+        description = "Read partial body: 1-based start line. Combined with `end_line` or `limit`. When set together with `file_path` but without any symbol, dumps that raw line range from the file - lets you read non-symbol code (imports, module headers) without falling back to Read. Alias: `offset`."
     )]
     #[serde(default, alias = "offset", deserialize_with = "flexible::u32_opt")]
     pub start_line: Option<u32>,
@@ -284,6 +307,11 @@ pub(super) struct SoulDiffImpactParams {
     #[schemars(description = "Include test files in the blast radius (default: false)")]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_tests: Option<bool>,
+    #[schemars(
+        description = "Add per-file risk scoring: health, boundary violations, test coverage, and composite risk (default: false)"
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub risk: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -437,7 +465,7 @@ pub(super) struct SoulDepsParams {
     #[serde(alias = "file", alias = "path")]
     pub file_path: String,
     #[schemars(
-        description = "'concise' = file paths only, 'detailed' (default) = paths + edge kinds"
+        description = "'concise' = file paths only, 'detailed' (default) = paths + edge kinds, 'mermaid' = dependency graph as a Mermaid diagram (use only when the user asks for a visual)"
     )]
     pub format: Option<Format>,
     #[schemars(description = "Approximate token budget for output (default: 4000)")]
@@ -478,12 +506,12 @@ pub(super) struct SoulCallsParams {
     )]
     pub direction: Option<CallDirection>,
     #[schemars(
-        description = "Max depth for call chain traversal (default: 1). Pass 2 to also see transitive chains -- this can emit many lines on hub functions."
+        description = "Max depth for call chain traversal (default: 1). Pass 2 to also see transitive chains - this can emit many lines on hub functions."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub depth: Option<u32>,
     #[schemars(
-        description = "'concise' = names only, 'detailed' (default) = with file paths and lines"
+        description = "'concise' = names only, 'detailed' (default) = with file paths and lines, 'mermaid' = call graph as a Mermaid diagram (use only when the user asks for a visual)"
     )]
     pub format: Option<Format>,
 }
@@ -546,7 +574,7 @@ pub(super) struct SoulClonesParams {
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,
     #[schemars(
-        description = "Page offset for pagination -- skip this many groups before returning (default: 0)."
+        description = "Page offset for pagination - skip this many groups before returning (default: 0)."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub offset: Option<u32>,
@@ -559,6 +587,74 @@ pub(super) struct SoulClonesParams {
         description = "'concise' = compact list, 'detailed' (default) = grouped output with file paths and line ranges"
     )]
     pub format: Option<Format>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulSmellsParams {
+    #[schemars(
+        description = "Filter to specific smell kind(s): 'god_function', 'long_params', 'feature_envy', or comma-separated combination. Omit to detect all."
+    )]
+    pub kind: Option<String>,
+    #[schemars(description = "Scope detection to a single file path (relative to project root).")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_complexity: Option<u32>,
+    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_lines: Option<u32>,
+    #[schemars(
+        description = "Long Parameter List: minimum parameter count threshold (default: 5). self/&self do not count."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_params: Option<u32>,
+    #[schemars(
+        description = "Feature Envy: ratio of external-type calls to own-type calls that triggers the smell (default: 2.0). Only reliable for Rust and Java where owner_type is populated."
+    )]
+    #[serde(default, deserialize_with = "flexible::f64_opt")]
+    pub envy_ratio: Option<f64>,
+    #[schemars(description = "Max results to return (default: 30).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact one-line-per-smell, 'detailed' (default) = grouped output with context"
+    )]
+    pub format: Option<Format>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulTestGapsParams {
+    #[schemars(
+        description = "Analysis mode: 'map' = test-to-source mapping, 'gaps' (default) = untested source files ranked by risk, 'suggest' = test files to run for a git diff range."
+    )]
+    pub mode: Option<String>,
+    #[schemars(
+        description = "Scope to a single file path (relative to project root). In 'map' mode shows tests for this source file or sources for this test file."
+    )]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "Git diff range for 'suggest' mode (e.g., 'main', 'HEAD~3'). Same format as qartez_diff_impact base parameter."
+    )]
+    pub base: Option<String>,
+    #[schemars(description = "Max results to return (default: 30).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact one-line-per-entry, 'detailed' (default) = grouped output with context"
+    )]
+    pub format: Option<Format>,
+    #[schemars(
+        description = "In 'gaps' mode, only show files with PageRank above this threshold (default: 0.0)."
+    )]
+    #[serde(default, deserialize_with = "flexible::f64_opt")]
+    pub min_pagerank: Option<f64>,
+    #[schemars(
+        description = "In 'map' mode, include which symbols from source files are referenced by test files (default: false)."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_symbols: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -654,7 +750,7 @@ pub(super) struct SoulHierarchyParams {
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub max_depth: Option<u32>,
     #[schemars(
-        description = "'concise' = names only, 'detailed' (default) = full info with file paths and line numbers."
+        description = "'concise' = names only, 'detailed' (default) = full info with file paths and line numbers, 'mermaid' = inheritance graph as a Mermaid diagram (use only when the user asks for a visual)"
     )]
     pub format: Option<Format>,
 }
@@ -710,6 +806,40 @@ pub(super) struct SemanticParams {
     pub limit: Option<u32>,
     #[schemars(
         description = "'concise' = symbol + file only, 'detailed' (default) = full info with scores and snippets"
+    )]
+    pub format: Option<Format>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum KnowledgeLevel {
+    /// Per-file authorship breakdown (default).
+    #[default]
+    File,
+    /// Per-module (directory) bus factor summary.
+    Module,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulKnowledgeParams {
+    #[schemars(
+        description = "Scope analysis to a single file or directory prefix (relative to project root). Omit to analyze the entire project."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "Granularity: 'file' (default) = per-file author breakdown, 'module' = per-directory bus factor summary."
+    )]
+    pub level: Option<KnowledgeLevel>,
+    #[schemars(
+        description = "Filter results to files touched by this author (case-insensitive substring match)."
+    )]
+    pub author: Option<String>,
+    #[schemars(description = "Max results to return (default: 20).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact one-line-per-entry, 'detailed' (default) = full table with author percentages"
     )]
     pub format: Option<Format>,
 }

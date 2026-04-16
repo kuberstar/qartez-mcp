@@ -10,7 +10,7 @@
 //!
 //! Determinism: all iteration happens in sorted-node / sorted-community
 //! order, ties break on the smallest community id, and no rng is consulted.
-//! Running the same input twice must produce byte-identical output — the
+//! Running the same input twice must produce byte-identical output - the
 //! auto-wiki feature depends on this so re-indexing does not churn every PR.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -67,7 +67,7 @@ pub struct ClusterReport {
 /// Run modularity-maximizing community detection over `(nodes, edges)`.
 ///
 /// `nodes` lists the node ids in the graph (may include isolated nodes).
-/// `edges` is a directed edge list — each pair contributes weight 1 to the
+/// `edges` is a directed edge list - each pair contributes weight 1 to the
 /// undirected projection, and parallel directed edges accumulate. Returns a
 /// per-node community assignment (densely numbered from 1) and the final
 /// modularity score on the weighted undirected graph.

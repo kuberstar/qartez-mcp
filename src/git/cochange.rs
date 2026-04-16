@@ -32,7 +32,7 @@ impl Default for CoChangeConfig {
 /// `min_files` and `max_files` changed files) upserts a co-change count for
 /// each unique pair.
 pub fn analyze_cochanges(conn: &Connection, root: &Path, config: &CoChangeConfig) -> Result<()> {
-    let repo = match Repository::open(root) {
+    let repo = match Repository::discover(root) {
         Ok(r) => r,
         Err(e) => {
             info!("Skipping co-change analysis: not a git repo ({})", e);
@@ -124,7 +124,7 @@ pub fn analyze_cochanges(conn: &Connection, root: &Path, config: &CoChangeConfig
     for ((path_a, path_b), count) in &pair_counts {
         // Only record co-changes between files that currently exist on disk
         // (i.e. were inserted by full_index). Paths seen only in git history
-        // — renames, deletes, moves — are dropped rather than resurrected as
+        // - renames, deletes, moves - are dropped rather than resurrected as
         // phantom rows with zero size/mtime.
         let (Some(a), Some(b)) = (
             get_file_by_path(&tx, path_a)?,
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_unregistered_paths_are_skipped() {
-        // Files that appear only in git history — never indexed from disk —
+        // Files that appear only in git history - never indexed from disk -
         // must not be resurrected as phantom rows. Co-change pairs touching
         // such paths are simply dropped.
         let tmp = TempDir::new().unwrap();

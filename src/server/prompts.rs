@@ -4,7 +4,7 @@
 //!
 //! Each prompt is a slash-command recipe the assistant can invoke (e.g.
 //! `/qartez_review`). The handler does not touch the database or execute any
-//! Qartez tool itself — it returns a deterministic user-message payload
+//! Qartez tool itself - it returns a deterministic user-message payload
 //! that tells the assistant which Qartez tools to call, in what order, and
 //! how to interpret the output. That keeps prompts declarative, cheap to
 //! test, and free of runtime side effects.
@@ -84,10 +84,10 @@ impl QartezServer {
              \n\
              Run these tools in order and summarise the findings:\n\
              \n\
-             1. Call `qartez_impact` with `file_path=\"{target}\"` — this returns direct importers, transitive dependents, and co-change partners (the full blast radius).\n\
+             1. Call `qartez_impact` with `file_path=\"{target}\"` - this returns direct importers, transitive dependents, and co-change partners (the full blast radius).\n\
              2. Call `qartez_outline` with `file_path=\"{target}\"` so you can reason about the changed symbols one by one.\n\
              3. For every symbol that was renamed, removed, or had its signature changed, call `qartez_refs` with `symbol=\"<name>\"` to find lingering usages elsewhere.\n\
-             4. Call `qartez_cochange` with `file_path=\"{target}\"` and flag any historical sibling files that were NOT touched in this change — those are suspicious omissions.\n\
+             4. Call `qartez_cochange` with `file_path=\"{target}\"` and flag any historical sibling files that were NOT touched in this change - those are suspicious omissions.\n\
              \n\
              Finish with a concise review checklist:\n\
              - files to verify (direct importers, PageRank-ordered)\n\
@@ -119,7 +119,7 @@ impl QartezServer {
              \n\
              Run these tools in order:\n\
              \n\
-             1. Call `qartez_map` with `top_n={top_n}` and `format=\"concise\"` — these are the files that matter most by PageRank.\n\
+             1. Call `qartez_map` with `top_n={top_n}` and `format=\"concise\"` - these are the files that matter most by PageRank.\n\
              2. Call `qartez_stats` (no arguments) for the language / LOC / symbol-count breakdown.\n\
              3. Call `qartez_project` with `action=\"info\"` to surface the detected build tool and test / lint / typecheck commands.\n\
              \n\
@@ -129,7 +129,7 @@ impl QartezServer {
              - the dependency spine: which files fan into which\n\
              - where to start reading if you had to understand it in 30 minutes\n\
              \n\
-             Keep it tight — one screenful, no speculation beyond what the tools report."
+             Keep it tight - one screenful, no speculation beyond what the tools report."
         );
         GetPromptResult::new(user_text(text))
             .with_description("Qartez architecture overview workflow".to_string())
@@ -171,8 +171,8 @@ impl QartezServer {
              Then return a focused debug summary:\n\
              - definition location (file + line range)\n\
              - what the function does (one-line distillation of the body)\n\
-             - callers — the most likely entry points for the failing path\n\
-             - callees — the downstream functions to audit\n\
+             - callers - the most likely entry points for the failing path\n\
+             - callees - the downstream functions to audit\n\
              - any reference sites that look inconsistent with the current signature"
         );
         GetPromptResult::new(user_text(text))
@@ -196,12 +196,12 @@ impl QartezServer {
         let (step1, scope_note) = match area {
             Some(a) => (
                 format!(
-                    "1. Call `qartez_map` with `boost_terms=[\"{a}\"]`, `top_n=15`, and `format=\"detailed\"` — this surfaces the PageRank-ranked files biased toward `{a}`."
+                    "1. Call `qartez_map` with `boost_terms=[\"{a}\"]`, `top_n=15`, and `format=\"detailed\"` - this surfaces the PageRank-ranked files biased toward `{a}`."
                 ),
                 format!("focused on `{a}`"),
             ),
             None => (
-                "1. Call `qartez_map` with `top_n=15` and `format=\"detailed\"` — this surfaces the PageRank-ranked core files."
+                "1. Call `qartez_map` with `top_n=15` and `format=\"detailed\"` - this surfaces the PageRank-ranked core files."
                     .to_string(),
                 "of the whole codebase".to_string(),
             ),

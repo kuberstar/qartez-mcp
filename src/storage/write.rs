@@ -7,7 +7,7 @@ use crate::storage::models::SymbolInsert;
 use crate::storage::read::get_file_by_path;
 
 /// Maximum lines stored per symbol body in `symbols_body_fts`. Caps FTS
-/// storage at a bounded size — very large functions are truncated.
+/// storage at a bounded size - very large functions are truncated.
 const MAX_BODY_LINES: usize = 500;
 
 pub fn upsert_file(
@@ -53,8 +53,8 @@ pub fn get_or_create_file(conn: &Connection, path: &str) -> Result<i64> {
 }
 
 /// Insert a batch of symbols and return their new rowids in the same order
-/// as the input. Callers that need the ids — for example, the reference
-/// resolution pass in `full_index` — use these to translate the
+/// as the input. Callers that need the ids - for example, the reference
+/// resolution pass in `full_index` - use these to translate the
 /// parse-local `from_symbol_idx` into real DB ids. Older callers that only
 /// care about the side effect can simply ignore the returned `Vec` via `?`.
 pub fn insert_symbols(
@@ -139,7 +139,7 @@ pub fn delete_file_data(conn: &Connection, file_id: i64) -> Result<()> {
 /// its content refreshed while the rest of the dependency graph stays
 /// intact.
 pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
-    // FTS tables are standalone — clean up before the symbol rows vanish.
+    // FTS tables are standalone - clean up before the symbol rows vanish.
     conn.execute(
         "DELETE FROM symbols_fts WHERE rowid IN (SELECT id FROM symbols WHERE file_id = ?1)",
         [file_id],
@@ -158,7 +158,7 @@ pub fn clear_file_content(conn: &Connection, file_id: i64) -> Result<()> {
     conn.execute("DELETE FROM unused_exports WHERE file_id = ?1", [file_id])?;
     // symbol_refs cascade from symbols(id) ON DELETE CASCADE.
     conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
-    // Only outgoing edges — incoming edges stay so other files' import
+    // Only outgoing edges - incoming edges stay so other files' import
     // relationships remain valid.
     conn.execute("DELETE FROM edges WHERE from_file = ?1", [file_id])?;
     conn.execute("DELETE FROM type_hierarchy WHERE file_id = ?1", [file_id])?;
@@ -375,7 +375,7 @@ pub fn rebuild_symbol_bodies_for_file(
 
 /// Rebuild the `unused_exports` materialized table from the current
 /// `symbols` / `edges` state. Must be called at the tail of the indexing
-/// pipeline — after `full_index` has written every file's imports and the
+/// pipeline - after `full_index` has written every file's imports and the
 /// edge graph is settled. Query-time `qartez_unused` then becomes a single
 /// JOIN-plus-LIMIT instead of re-walking tree-sitter ASTs for every call.
 pub fn populate_unused_exports(conn: &Connection) -> Result<()> {
@@ -1091,7 +1091,7 @@ mod tests {
         // a imports b
         insert_edge(&conn, a, b, "import", None).unwrap();
 
-        // Clear b's content — the a→b edge must survive.
+        // Clear b's content - the a→b edge must survive.
         clear_file_content(&conn, b).unwrap();
 
         let edge_count: i64 = conn

@@ -1,9 +1,10 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use clap::Parser;
-use qartez_mcp::{cli, config, git, graph, index, server, storage, watch};
+use clap::{CommandFactory, Parser};
+use qartez_mcp::{cli, cli_runner, config, git, graph, index, server, storage, watch};
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -19,6 +20,21 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::from_cli(&cli)?;
 
+    // CLI subcommand path: index synchronously, run tool, exit.
+    if let Some(ref command) = cli.command {
+        let format = cli.format.unwrap_or_default();
+        return cli_runner::run(&config, command, format);
+    }
+
+    // No subcommand + interactive terminal: show help instead of
+    // silently blocking on stdin waiting for MCP JSON-RPC.
+    if std::io::stdin().is_terminal() {
+        cli::Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
+
+    // MCP server path below (stdin is piped by an MCP client).
     tracing::info!(
         "qartez-mcp starting, {} root(s), primary: {}",
         config.project_roots.len(),
@@ -165,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
 // The TTL gate exists in two places on purpose:
 //   1. Here, to avoid the process-spawn cost on every Claude Code start
 //      when the cache is fresh (~5–20ms per spawn).
-//   2. Inside qartez-setup itself, as the source of truth — protects
+//   2. Inside qartez-setup itself, as the source of truth - protects
 //      against concurrent qartez-mcp starts racing into the network.
 //
 // Skipped entirely when QARTEZ_NO_AUTO_UPDATE is set (any value).

@@ -280,7 +280,7 @@ pub fn get_all_edges(conn: &Connection) -> Result<Vec<(i64, i64)>> {
 
 /// All `(from_symbol_id, to_symbol_id)` tuples in the symbol-level graph,
 /// used as the edge list for `compute_symbol_pagerank`. Kind is intentionally
-/// dropped — PageRank does not distinguish between call / use / type edges
+/// dropped - PageRank does not distinguish between call / use / type edges
 /// in v1; every edge contributes equally to the random walk.
 pub fn get_all_symbol_refs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     let mut stmt = conn.prepare("SELECT from_symbol_id, to_symbol_id FROM symbol_refs")?;
@@ -424,7 +424,7 @@ pub fn count_unused_exports(conn: &Connection) -> Result<i64> {
 
 /// Paginated slice of the pre-materialized unused-exports table. Populated
 /// by `populate_unused_exports` at index time after edges have been built,
-/// so query-time work is one JOIN-plus-LIMIT — no tree walk, no per-file
+/// so query-time work is one JOIN-plus-LIMIT - no tree walk, no per-file
 /// exclusion-zone recompute.
 pub fn get_unused_exports_page(
     conn: &Connection,
@@ -562,7 +562,7 @@ pub fn get_clone_groups(
 /// use, or type-reference the target symbol show up.
 ///
 /// The returned shape intentionally matches the old signature so existing
-/// callers (`qartez_refs`, `qartez_rename`) keep working — the `EdgeRow` in
+/// callers (`qartez_refs`, `qartez_rename`) keep working - the `EdgeRow` in
 /// each `(EdgeRow, FileRow)` tuple is synthesised with `kind = "symbol_ref"`
 /// so consumers that only read `FileRow` see unchanged behaviour.
 pub fn get_symbol_references(
@@ -741,7 +741,7 @@ pub fn search_file_ids_by_fts(conn: &Connection, query: &str) -> Result<Vec<i64>
 /// Returns the distinct file paths whose symbol bodies contain `term`,
 /// via `symbols_body_fts`. The unicode61 tokenizer treats `_` as a word
 /// separator, so identifier-style queries like `find_symbol_by_name` are
-/// split into adjacent tokens and matched across all four terms — broad
+/// split into adjacent tokens and matched across all four terms - broad
 /// enough to catch every legitimate caller, narrow enough that the AST
 /// walk the caller runs afterwards filters out false positives cheaply.
 ///

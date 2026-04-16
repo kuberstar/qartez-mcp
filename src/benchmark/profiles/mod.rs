@@ -47,7 +47,7 @@ pub struct LanguageProfile {
     /// root.
     pub fixture_subdir: &'static str,
     /// The file that identifies the project for `qartez_project` and any
-    /// other tool that needs a project-root manifest — `Cargo.toml` for
+    /// other tool that needs a project-root manifest - `Cargo.toml` for
     /// Rust, `package.json` for TS/JS, etc.
     pub project_file: &'static str,
     /// Optional override for scenario targets. When `Some`, the benchmark

@@ -4,6 +4,7 @@ use super::LanguageSupport;
 use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct HaskellSupport;
 
@@ -63,7 +64,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
         return None;
     }
     let truncated = if first_line.len() > 200 {
-        &first_line[..first_line.floor_char_boundary(200)]
+        &first_line[..floor_char_boundary(first_line, 200)]
     } else {
         first_line
     };

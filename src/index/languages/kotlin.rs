@@ -4,6 +4,7 @@ use super::LanguageSupport;
 use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedSymbol, ParseResult, ReferenceKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct KotlinSupport;
 
@@ -278,7 +279,7 @@ fn record_reference(
     let line = node.start_position().row as u32 + 1;
     match node.kind() {
         "call_expression" => {
-            // `foo()` or `bar(x, y)` — the first child is the callee, the
+            // `foo()` or `bar(x, y)` - the first child is the callee, the
             // second is `call_suffix` containing the argument list.
             if let Some(callee) = node.child(0) {
                 let name = extract_callee_name(callee, source);
@@ -295,7 +296,7 @@ fn record_reference(
             }
         }
         "navigation_expression" => {
-            // `obj.method` — only record when the parent is NOT a
+            // `obj.method` - only record when the parent is NOT a
             // `call_expression`; the call_expression arm already handles
             // `obj.method()`.
             let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
@@ -356,7 +357,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
     match node.kind() {
         "simple_identifier" | "identifier" => node_text(node, source),
         "navigation_expression" => {
-            // `obj.method` — use the rightmost identifier as the callee name
+            // `obj.method` - use the rightmost identifier as the callee name
             node.child(node.child_count().saturating_sub(1) as u32)
                 .filter(|n| matches!(n.kind(), "simple_identifier" | "identifier"))
                 .map(|n| node_text(n, source))
@@ -478,7 +479,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     }
 
     let truncated = if sig.len() > 200 {
-        &sig[..sig.floor_char_boundary(200)]
+        &sig[..floor_char_boundary(sig, 200)]
     } else {
         sig
     };

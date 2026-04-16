@@ -303,7 +303,7 @@ impl<'a> BenchmarkRunner<'a> {
 /// Build a non-MCP cache map from a previously-written `BenchmarkReport`.
 ///
 /// When `expected_sha` is `Some`, the cache is only populated if the stored
-/// report's `git_sha` matches — otherwise an empty map is returned, forcing
+/// report's `git_sha` matches - otherwise an empty map is returned, forcing
 /// a fresh non-MCP run to avoid comparing against stale data.
 pub fn build_non_mcp_cache(
     prior: &BenchmarkReport,

@@ -3,7 +3,7 @@
 //! correctness, completeness, usability, groundedness, and
 //! conciseness. Uses the user's
 //! installed Claude Code session for authentication, so no
-//! `ANTHROPIC_API_KEY` is required — under a Max subscription the
+//! `ANTHROPIC_API_KEY` is required - under a Max subscription the
 //! marginal cost per score is effectively zero and the model can be
 //! the strongest one available (`claude-opus-4-6`).
 //!
@@ -20,7 +20,7 @@
 //! # Determinism
 //!
 //! Opus at temperature zero is close to deterministic across runs
-//! but not strictly so — expect ±1 point drift per axis. Do not use
+//! but not strictly so - expect ±1 point drift per axis. Do not use
 //! quality scores as a strict CI regression gate; treat them as a
 //! qualitative snapshot refreshed on demand.
 
@@ -70,7 +70,7 @@ fn strip_fence(raw: &str) -> &str {
 }
 
 /// Grading order in the judge prompt. The protocol judges every scenario
-/// twice — once with MCP as ANSWER A and once with non-MCP as ANSWER A —
+/// twice - once with MCP as ANSWER A and once with non-MCP as ANSWER A -
 /// then un-swaps the per-axis scores back to the `(mcp, non_mcp)` orientation
 /// and averages them. This directly counteracts position bias. The enum is
 /// exported so the ensemble wrapper can drive both positions itself when
@@ -85,7 +85,7 @@ pub enum Position {
 /// is restricted to the anchor set `{0, 3, 5, 7, 10}` via the JSON
 /// schema in [`JUDGE_JSON_SCHEMA`]; callers that construct the type
 /// manually are expected to stay inside that set (violation is a
-/// programming bug — [`parse_judge_response`] is the enforcement point).
+/// programming bug - [`parse_judge_response`] is the enforcement point).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SideQuality {
     pub correctness: u8,
@@ -109,8 +109,8 @@ impl SideQuality {
 }
 
 /// One single-call output from the judge (one `claude -p` invocation).
-/// The protocol calls the judge `2 * n` times per scenario — `n`
-/// self-consistency runs per position — and aggregates per-axis means
+/// The protocol calls the judge `2 * n` times per scenario - `n`
+/// self-consistency runs per position - and aggregates per-axis means
 /// via [`aggregate_self_consistency`]. The raw runs are preserved on
 /// [`QualityScores::runs`] for inter-rater statistics (Cohen's kappa,
 /// Krippendorff's alpha).
@@ -141,7 +141,7 @@ pub struct QualityScores {
 
 /// JSON schema passed to `claude -p --json-schema` for every call. The
 /// `enum: [0, 3, 5, 7, 10]` anchor set structurally enforces the rubric's
-/// "no interpolation, nearest anchor" rule — the model literally cannot
+/// "no interpolation, nearest anchor" rule - the model literally cannot
 /// emit `6` or `8.5`. See `docs/benchmark-v2/judge-core.md` §4.
 ///
 /// The schema is declared as a raw string so it can be copy-pasted into
@@ -183,7 +183,7 @@ pub const JUDGE_JSON_SCHEMA: &str = r#"{
 
 /// System prompt appended to every judge call via `claude -p
 /// --append-system-prompt`. This is one of the three determinism layers
-/// described in `docs/benchmark-v2/judge-core.md` §1.fallback — the
+/// described in `docs/benchmark-v2/judge-core.md` §1.fallback - the
 /// others are `--json-schema` (above) and self-consistency averaging
 /// (below). None of them is as strong as a real `temperature=0` knob,
 /// but we cannot pin temperature through the Claude Code CLI.
@@ -205,7 +205,7 @@ const RETRY_ATTEMPTS: u32 = 3;
 
 /// Backoff delays between retry attempts, in milliseconds. Three entries
 /// matching [`RETRY_ATTEMPTS`]. The pattern is 2s / 5s / 10s per PLAN.md
-/// §6 risk 8. The final entry is the ceiling — if three retries all
+/// §6 risk 8. The final entry is the ceiling - if three retries all
 /// fail, the scenario's `score_scenario` call propagates the error
 /// and the runner records it as an unjudged scenario.
 const RETRY_BACKOFF_MS: [u64; RETRY_ATTEMPTS as usize] = [2000, 5000, 10000];
@@ -216,10 +216,10 @@ const RETRY_BACKOFF_MS: [u64; RETRY_ATTEMPTS as usize] = [2000, 5000, 10000];
 /// Slice A always emits this fallback; slice B (grounding layer) later
 /// replaces the call sites with real verification output.
 pub fn grounding_fallback_block(label: &str) -> String {
-    format!("Programmatic grounding for {label}:\n  no verifiable claims extracted — score N/A")
+    format!("Programmatic grounding for {label}:\n  no verifiable claims extracted - score N/A")
 }
 
-/// Builds the judge prompt. **Pure function** of the inputs — no env
+/// Builds the judge prompt. **Pure function** of the inputs - no env
 /// access, no clock reads, no RNG. The ensemble wrapper relies on this
 /// to hand byte-identical prompts to both models so that inter-rater
 /// statistics are meaningful.
@@ -283,7 +283,7 @@ pub fn build_prompt(
     };
 
     format!(
-        "Grade two coding-assistant tool responses for the same task. Score each independently 0-10 on five axes (anchors: 0, 3, 5, 7, 10 only — no interpolation).\n\
+        "Grade two coding-assistant tool responses for the same task. Score each independently 0-10 on five axes (anchors: 0, 3, 5, 7, 10 only - no interpolation).\n\
          \n\
          TASK: \"{description}\"\n\
          Tool: `{tool}` | Non-MCP workflow: {sim_steps}\n\
@@ -331,7 +331,7 @@ pub fn build_prompt(
 /// `position`. The caller is expected to pass the raw `claude -p` stdout;
 /// any Markdown fences are defensively stripped via [`strip_fence`] in
 /// case the model ignored the prompt's "no fences" rule. Validation
-/// rejects any axis score outside [`AXIS_ANCHORS`] — that is a schema
+/// rejects any axis score outside [`AXIS_ANCHORS`] - that is a schema
 /// violation the model should never emit under `--json-schema` and we
 /// surface it as an error rather than silently clamping.
 pub fn parse_judge_response(raw: &str, position: Position, run_index: u8) -> Result<PerRunScores> {
@@ -404,7 +404,7 @@ fn validate_axis_anchor(value: u8, axis: &str, side: &str) -> Result<()> {
 
 /// Snaps a floating-point mean onto the nearest anchor in
 /// [`AXIS_ANCHORS`]. Ties are broken toward the lower anchor because the
-/// anchor set is not uniformly spaced (`[0, 3, 5, 7, 10]` — gaps of 3, 2,
+/// anchor set is not uniformly spaced (`[0, 3, 5, 7, 10]` - gaps of 3, 2,
 /// 2, 3), and preferring the lower anchor matches the rubric's strict-
 /// grading posture: when in doubt, grade one step down.
 fn snap_to_anchor(mean: f64) -> u8 {
@@ -424,7 +424,7 @@ fn snap_to_anchor(mean: f64) -> u8 {
 /// pair. The mean is computed per axis in `f64`, then snapped back onto
 /// the nearest [`AXIS_ANCHORS`] value so the result stays in the legal
 /// rubric range. An empty `runs` slice returns two zero-filled
-/// [`SideQuality`] and does not panic — an empty run set is a
+/// [`SideQuality`] and does not panic - an empty run set is a
 /// legitimate state when every `claude -p` call failed and the caller
 /// wants a sentinel rather than an `anyhow::bail!` bubbled back up.
 pub fn aggregate_self_consistency(runs: &[PerRunScores]) -> (SideQuality, SideQuality) {
@@ -614,7 +614,7 @@ fn extract_structured_output(envelope: &str) -> Result<String> {
     serde_json::to_string(structured).context("re-serialize structured_output")
 }
 
-/// Runs a single `claude -p` call with the structured output flags —
+/// Runs a single `claude -p` call with the structured output flags -
 /// `--append-system-prompt <DETERMINISM_SYSTEM_PROMPT>`,
 /// `--json-schema <JUDGE_JSON_SCHEMA>`, and `--output-format json`.
 /// The `--output-format json` flag is load-bearing: without it the CLI
@@ -750,7 +750,7 @@ fn run_judge_subprocess(prompt: &str, model: &str) -> Result<String> {
 /// have not enabled grounding pass [`grounding_fallback_block`] strings;
 /// slice B's runner passes real verification output from
 /// `grounding::render_prompt_block`. Both argument strings are ALWAYS
-/// named in MCP / non-MCP orientation — [`build_prompt`] un-swaps
+/// named in MCP / non-MCP orientation - [`build_prompt`] un-swaps
 /// them internally when `Position::NonMcpFirst` fires.
 ///
 /// # Errors
@@ -834,7 +834,7 @@ pub fn score_scenario(
     // prompt perturbation.
     if raw_bodies.len() >= 2 && raw_bodies.iter().all(|b| b == &raw_bodies[0]) {
         tracing::warn!(
-            "SC collapse on scenario `{}` — all {} runs identical",
+            "SC collapse on scenario `{}` - all {} runs identical",
             scenario.scenario_id,
             total_runs
         );
@@ -879,7 +879,7 @@ pub fn score_scenario(
 /// hashes are derived from a stable serialized fingerprint
 /// (`response_bytes`, `tokens`, `naive_tokens`, `response_preview`)
 /// rather than the literal `full_output` field, because `full_output`
-/// is `#[serde(skip)]` and does not survive a JSON round-trip — see
+/// is `#[serde(skip)]` and does not survive a JSON round-trip - see
 /// [`SideReport::full_output`](crate::benchmark::report::SideReport).
 /// Two outputs that share the byte count, both token counts, and the
 /// 240-byte preview are overwhelmingly likely to be byte-identical, so
@@ -912,13 +912,13 @@ pub struct CachedJudge {
 /// The hash inputs are deliberately limited to fields that survive JSON
 /// serialization: `response_bytes`, `tokens`, `naive_tokens`, and the
 /// 240-byte `response_preview`. The `full_output` field is
-/// `#[serde(skip)]` (PLAN.md §2.5 trade-off — keeps reports under
+/// `#[serde(skip)]` (PLAN.md §2.5 trade-off - keeps reports under
 /// ~200 KB) so a cache loaded from a prior JSON has it empty; hashing it
 /// would produce zero on the cached side and a real hash on the current
 /// side, missing every entry. Hashing the serialized fingerprint instead
 /// makes both sides agree.
 ///
-/// Uses [`std::hash::DefaultHasher`] (SipHash) — strong enough for
+/// Uses [`std::hash::DefaultHasher`] (SipHash) - strong enough for
 /// cache validation, present in `std`, no new crate.
 fn hash_side_for_judge_cache(side: &crate::benchmark::report::SideReport) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1021,11 +1021,11 @@ pub fn build_judge_cache(
 ///
 /// Hit semantics depend on `allow_stale`:
 ///
-/// - `allow_stale = false` — strict mode. The current scenario's
+/// - `allow_stale = false` - strict mode. The current scenario's
 ///   [`JudgeCacheKey`] must equal the cached key. Any drift in MCP
 ///   output, non-MCP output, reference answer, or either grounding
 ///   score invalidates the entry.
-/// - `allow_stale = true` — lenient mode. The cached entry is reused
+/// - `allow_stale = true` - lenient mode. The cached entry is reused
 ///   whenever the scenario_id appears in the cache, regardless of key
 ///   equality. Used for render-only workflows.
 pub fn lookup_judge_cache<'a>(
@@ -1051,7 +1051,7 @@ pub fn lookup_judge_cache<'a>(
 //
 // Wraps two parallel judge calls (primary + secondary) with a DAFE-style
 // arbiter escalation on disagreement. Cohen's weighted kappa and
-// Krippendorff's alpha are hand-rolled — no new crates.
+// Krippendorff's alpha are hand-rolled - no new crates.
 
 /// Output of the two-judge ensemble pipeline. Carries both independent
 /// ratings, an optional arbiter verdict on disagreement, the final
@@ -1059,7 +1059,7 @@ pub fn lookup_judge_cache<'a>(
 /// absolute deltas used for the disagreement gate and the "Top 3
 /// most-disputed scenarios" Markdown table.
 ///
-/// `abs_delta_per_axis` is ten floats — five axes for the MCP side
+/// `abs_delta_per_axis` is ten floats - five axes for the MCP side
 /// followed by five axes for the non-MCP side, in the canonical axis
 /// order: correctness, completeness, usability, groundedness,
 /// conciseness.
@@ -1075,7 +1075,7 @@ pub struct EnsembleQualityScores {
 
 /// Axis names emitted for the "Top 3 most-disputed scenarios" table.
 /// Walks in the canonical five-axis order for the MCP side, then again
-/// for the non-MCP side — matches the layout produced by
+/// for the non-MCP side - matches the layout produced by
 /// [`abs_delta_per_axis`] so index `i` maps to `AXIS_NAMES_TEN[i]`.
 pub const AXIS_NAMES_TEN: [&str; 10] = [
     "correctness (MCP)",
@@ -1104,7 +1104,7 @@ pub fn abs_delta_per_axis_side(a: &SideQuality, b: &SideQuality) -> Vec<f64> {
 }
 
 /// Per-axis absolute delta across both sides of an ensemble pair. Returns
-/// ten floats — five MCP axes followed by five non-MCP axes, matching
+/// ten floats - five MCP axes followed by five non-MCP axes, matching
 /// [`AXIS_NAMES_TEN`]. This is the shape consumed by the disagreement
 /// gate in [`score_ensemble_scenario`] and by the "Top 3 most-disputed"
 /// Markdown table in the renderer.
@@ -1180,7 +1180,7 @@ fn format_side_prior(side: &SideQuality) -> String {
 /// primary and secondary judges' per-side scores and verdict strings so
 /// the arbiter tie-breaks with full context. Exact block shape is
 /// specified in `docs/benchmark-v2/ensemble-and-agreement.md` §8; Phase
-/// 4 lifts it verbatim. No surgery on [`build_prompt`] — the prior
+/// 4 lifts it verbatim. No surgery on [`build_prompt`] - the prior
 /// block is informational and lives after `OUTPUT FORMAT`.
 pub fn append_prior_ratings(
     prompt: &str,
@@ -1297,7 +1297,7 @@ fn score_arbiter_scenario(
 /// Returns the full [`EnsembleQualityScores`] with `final_score` set to
 /// either the elementwise mean of primary and secondary (agreement) or
 /// the arbiter's scores (disagreement). The arbiter result is NOT
-/// averaged with primary and secondary — per
+/// averaged with primary and secondary - per
 /// `docs/benchmark-v2/ensemble-and-agreement.md` §1 the arbiter is a
 /// tie-break by construction and averaging would re-introduce the bias
 /// it is meant to resolve.
@@ -1394,7 +1394,7 @@ pub fn score_ensemble_scenario(
 /// Used by the ensemble runner when `--reuse-judge` produces a cache
 /// hit on the primary judge: the cached verdict drops in for the
 /// primary slot, and only the secondary (and optional arbiter) pay the
-/// `claude -p` cost. The secondary is intentionally NOT cached — it
+/// `claude -p` cost. The secondary is intentionally NOT cached - it
 /// runs every time so the Cohen's κ measurement and the disagreement
 /// gate stay honest. The arbiter still fires on disagreement above
 /// `disagreement_threshold`.
@@ -1545,7 +1545,7 @@ pub fn cohens_weighted_kappa(pairs: &[(u8, u8)], k: usize) -> f64 {
 /// Krippendorff's alpha (interval metric) for n raters with possible
 /// missing values. Each `units[u]` is a `Vec<Option<f64>>` where the
 /// outer index enumerates units (scenarios × axes) and the inner index
-/// enumerates raters. `None` marks a missing rating — used for the
+/// enumerates raters. `None` marks a missing rating - used for the
 /// arbiter-only subset where the arbiter rated disputed scenarios only.
 ///
 /// Formula per `docs/benchmark-v2/ensemble-and-agreement.md` §3.b:
@@ -1613,7 +1613,7 @@ pub fn krippendorff_alpha_interval(units: &[Vec<Option<f64>>]) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Batch judge — single LLM call for all scenarios
+// Batch judge - single LLM call for all scenarios
 // ---------------------------------------------------------------------------
 
 /// JSON schema for the batch judge response. Only 2 LLM-scored axes
@@ -1961,7 +1961,7 @@ pub fn score_batch(scenarios: &[&ScenarioReport], model: &str) -> Result<Vec<Qua
                 reference_answer_used: false,
             });
         } else {
-            // Skipped scenario — zero out LLM-judged axes so they don't
+            // Skipped scenario - zero out LLM-judged axes so they don't
             // inflate aggregate metrics. Programmatic axes are still valid.
             let (prog_mcp, prog_non_mcp) = compute_programmatic_axes(scenario);
             results.push(QualityScores {
@@ -2392,7 +2392,7 @@ mod tests {
     fn cohens_weighted_kappa_p_e_is_one() {
         // Two raters who both scored every pair 5 on a k=11 scale.
         // p_e hits 1.0 because the only non-zero entry in the expected
-        // table is row 5 × column 5 — special-cased to κ=1.0.
+        // table is row 5 × column 5 - special-cased to κ=1.0.
         let pairs = vec![(5u8, 5u8), (5, 5), (5, 5)];
         let k = cohens_weighted_kappa(&pairs, 11);
         assert!(
@@ -2805,7 +2805,7 @@ mod tests {
         let prior = make_report(None, vec![original]);
         let cache = build_judge_cache(&prior, None, false);
 
-        // Same scenario_id, different MCP body — must miss in strict mode.
+        // Same scenario_id, different MCP body - must miss in strict mode.
         let mut drifted = make_scenario("mcp drifted", "non-mcp");
         drifted.scenario_id = "scn".to_string();
         let hit = lookup_judge_cache(&cache, &drifted, false);

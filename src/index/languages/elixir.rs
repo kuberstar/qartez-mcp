@@ -157,15 +157,15 @@ fn extract_def(node: Node, source: &[u8], is_exported: bool) -> Option<Extracted
 
     let name = match first_arg.kind() {
         "call" => {
-            // `def greet(name)` -- the function head is itself a call node
+            // `def greet(name)` - the function head is itself a call node
             call_target_name(first_arg, source)
         }
         "identifier" => {
-            // `def run do ... end` -- zero-arity without parens
+            // `def run do ... end` - zero-arity without parens
             node_text(first_arg, source)
         }
         "binary_operator" => {
-            // `def greet(name) when is_binary(name)` -- guard clause wraps
+            // `def greet(name) when is_binary(name)` - guard clause wraps
             // the call in a `when` binary operator
             let left = first_arg.child_by_field_name("left")?;
             match left.kind() {

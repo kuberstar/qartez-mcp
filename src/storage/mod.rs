@@ -41,7 +41,7 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
     // than accumulating indefinitely. This must be set before any tables are
     // created; for existing databases without auto_vacuum the change has no
     // effect without a full VACUUM, which we skip here to avoid a long
-    // startup stall — WAL checkpointing after indexing is the primary
+    // startup stall - WAL checkpointing after indexing is the primary
     // mitigation for those.
     let av: i32 = conn
         .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))

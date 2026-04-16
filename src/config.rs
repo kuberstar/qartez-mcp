@@ -262,7 +262,7 @@ impl Config {
             if cwd_is_project {
                 (vec![cwd.clone()], true)
             } else {
-                // No markers in cwd — check for child project roots (meta-directory)
+                // No markers in cwd - check for child project roots (meta-directory)
                 let children = detect_child_project_roots(&cwd);
                 if !children.is_empty() {
                     (children, true)

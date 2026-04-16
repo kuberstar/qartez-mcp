@@ -24,7 +24,7 @@ pub struct SetComparisonScores {
 /// Maximum number of diff items to report per side.
 const MAX_DIFF_ITEMS: usize = 5;
 
-/// Tools where set comparison does not apply — they return prose,
+/// Tools where set comparison does not apply - they return prose,
 /// statistics, or structured data that cannot be meaningfully
 /// decomposed into comparable item sets.
 const EXCLUDED_TOOLS: &[&str] = &[
@@ -227,11 +227,11 @@ fn parse_outline_output(output: &str) -> BTreeSet<String> {
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("---") {
             continue;
         }
-        // MCP outline: `+ name [L10-L20] — signature` or `- name [L10-L20]`
+        // MCP outline: `+ name [L10-L20] - signature` or `- name [L10-L20]`
         if let Some(name) = extract_outline_symbol(trimmed) {
             items.insert(name);
         }
-        // Non-MCP: raw source — extract fn/struct/enum/trait definitions
+        // Non-MCP: raw source - extract fn/struct/enum/trait definitions
         else if let Some(name) = extract_definition_from_source(trimmed) {
             items.insert(name);
         }
@@ -239,7 +239,7 @@ fn parse_outline_output(output: &str) -> BTreeSet<String> {
     items
 }
 
-/// Fallback parser for unknown tools — extracts Rust-like identifiers.
+/// Fallback parser for unknown tools - extracts Rust-like identifiers.
 fn parse_generic_identifiers(output: &str) -> BTreeSet<String> {
     let mut items = BTreeSet::new();
     for line in output.lines() {
@@ -321,7 +321,7 @@ fn extract_file_line_pair(line: &str) -> Option<String> {
 }
 
 /// Extracts a symbol name from MCP outline format:
-/// `+ name [L10-L20] — signature` or `- name — type`
+/// `+ name [L10-L20] - signature` or `- name - type`
 fn extract_outline_symbol(line: &str) -> Option<String> {
     let rest = line
         .strip_prefix("+ ")
@@ -522,9 +522,9 @@ mod tests {
     #[test]
     fn outline_symbol_extraction() {
         let mcp = "# Outline: src/foo.rs\n\
-                    + new [L10-L20] — pub fn new() -> Self\n\
-                    + run [L25-L50] — pub fn run(&self)\n\
-                    - helper [L55-L60] — fn helper()";
+                    + new [L10-L20] - pub fn new() -> Self\n\
+                    + run [L25-L50] - pub fn run(&self)\n\
+                    - helper [L55-L60] - fn helper()";
         let items = parse_outline_output(mcp);
         assert!(items.contains("new"));
         assert!(items.contains("run"));

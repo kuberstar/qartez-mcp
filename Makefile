@@ -29,21 +29,23 @@ build: ## Build release binaries
 
 install: build ## Build and install binaries to ~/.local/bin
 	@mkdir -p $(INSTALL_DIR)
-	@for bin in qartez-mcp qartez-guard qartez-setup; do \
+	@for bin in qartez qartez-guard qartez-setup; do \
 		cp $(TARGET_DIR)/release/$$bin $(INSTALL_DIR)/$$bin; \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			codesign -s - -f $(INSTALL_DIR)/$$bin 2>/dev/null || true; \
 		fi; \
 		echo "\033[0;32m[+]\033[0m Binary: $(INSTALL_DIR)/$$bin ($$(wc -c < $(TARGET_DIR)/release/$$bin | awk '{printf "%.1f MB", $$1/1048576}'))"; \
 	done
+	@ln -sf qartez $(INSTALL_DIR)/qartez-mcp
+	@echo "\033[0;32m[+]\033[0m Symlink: $(INSTALL_DIR)/qartez-mcp -> qartez"
 
 setup: ## Interactive IDE setup wizard (install deps + build + choose IDEs)
 	@./install.sh --interactive
 
 uninstall: ## Remove qartez from all IDEs and uninstall binaries
 	@$(INSTALL_DIR)/qartez-setup --uninstall 2>/dev/null || true
-	@rm -f $(INSTALL_DIR)/qartez-mcp $(INSTALL_DIR)/qartez-guard $(INSTALL_DIR)/qartez-setup
-	@echo "\033[0;32m[+]\033[0m Binaries removed: $(INSTALL_DIR)/qartez-{mcp,guard,setup}"
+	@rm -f $(INSTALL_DIR)/qartez $(INSTALL_DIR)/qartez-mcp $(INSTALL_DIR)/qartez-guard $(INSTALL_DIR)/qartez-setup
+	@echo "\033[0;32m[+]\033[0m Binaries removed: $(INSTALL_DIR)/qartez{,-mcp,-guard,-setup}"
 
 clean: ## Remove build artifacts
 	$(CARGO) clean

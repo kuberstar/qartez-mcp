@@ -369,7 +369,7 @@ pub fn full_index_root(
     crate::storage::verify_foreign_keys(conn)?;
 
     // Checkpoint the WAL so it doesn't grow unboundedly across indexing runs.
-    // Failure is non-fatal — the next run or SQLite's auto-checkpoint will
+    // Failure is non-fatal - the next run or SQLite's auto-checkpoint will
     // eventually flush it.
     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
         tracing::debug!("WAL checkpoint after full_index failed (non-fatal): {e}");
@@ -386,8 +386,8 @@ pub fn full_index_root(
 /// `symbol_refs` in a single prepared-statement loop.
 ///
 /// The approach intentionally mirrors Aider's heuristic symbol graph:
-/// extractors capture identifiers liberally and this resolver decides —
-/// using file-level import edges — which target is the most plausible.
+/// extractors capture identifiers liberally and this resolver decides -
+/// using file-level import edges - which target is the most plausible.
 /// Ambiguous names that match many symbols and no import are dropped to
 /// keep the edge count manageable on large codebases.
 /// Candidate entry in the resolver's name index: symbol id, its file id,
@@ -405,7 +405,7 @@ fn kind_is_compatible(ref_kind: ReferenceKind, sym_kind: &str) -> bool {
     match ref_kind {
         // Plain functions + methods are the obvious case. Classes/structs/
         // enums/interfaces are included because languages like Dart, Java,
-        // and Kotlin write constructor calls as `Foo(x)` — syntactically a
+        // and Kotlin write constructor calls as `Foo(x)` - syntactically a
         // Call whose target is the type symbol. `type` covers typedefs
         // used as constructor aliases.
         ReferenceKind::Call => matches!(
@@ -507,7 +507,7 @@ fn resolve_symbol_references(
                 .collect();
             let narrowed_by_kind = !filtered.is_empty() && filtered.len() < raw_candidates.len();
             // Fall back to the raw list if kind-filtering erased every
-            // option -- avoids silently dropping edges when a language
+            // option - avoids silently dropping edges when a language
             // extractor emits a kind this resolver has not mapped.
             let candidates: Vec<&Candidate> = if filtered.is_empty() {
                 raw_candidates.iter().collect()
@@ -624,7 +624,7 @@ fn resolve_symbol_references(
             }
 
             // Priority 6: unique global match. Ambiguous global names are
-            // dropped -- with no import evidence and multiple candidates
+            // dropped - with no import evidence and multiple candidates
             // there is no principled way to pick, and keeping them all
             // would bury the signal under noise on large projects.
             if picked.is_empty() {
@@ -963,17 +963,17 @@ fn read_go_module(root: &Path) -> Option<String> {
 /// Resolves a Dart `import`/`part` specifier to a file path relative to `root`.
 ///
 /// Handles three specifier shapes:
-///   * `dart:io`, `dart:async` — SDK, not in the workspace, return empty.
-///   * `package:NAME/a/b.dart` — look up NAME in the workspace package map
+///   * `dart:io`, `dart:async` - SDK, not in the workspace, return empty.
+///   * `package:NAME/a/b.dart` - look up NAME in the workspace package map
 ///     and rewrite to `<pkg-dir>/lib/a/b.dart`.
-///   * relative (`./x.dart`, `../x.dart`, `x.dart`) — including `part`
-///     directives, which always carry a relative URI — fall through to the
+///   * relative (`./x.dart`, `../x.dart`, `x.dart`) - including `part`
+///     directives, which always carry a relative URI - fall through to the
 ///     generic relative resolver.
 ///
 /// **Scope:** workspace-only. Only packages whose `pubspec.yaml` lives inside
 /// `root` are resolvable; path-/git-dependencies outside the workspace and
 /// pub-cache packages are intentionally ignored. We do not consult
-/// `.dart_tool/package_config.json` — it requires `pub get` to be fresh and
+/// `.dart_tool/package_config.json` - it requires `pub get` to be fresh and
 /// would pull cache paths that are irrelevant for symbol indexing. A
 /// `package:` import whose package name is not in the workspace map returns
 /// no edge.
@@ -1064,7 +1064,7 @@ fn read_dart_packages(root: &Path) -> HashMap<String, String> {
 }
 
 /// Extracts the top-level `name:` field from a `pubspec.yaml` body. Only
-/// unindented `name:` keys count — an indented `name:` under some other
+/// unindented `name:` keys count - an indented `name:` under some other
 /// mapping must not hijack the package identity.
 fn parse_pubspec_name(pubspec: &str) -> Option<String> {
     for raw in pubspec.lines() {
@@ -1117,8 +1117,8 @@ fn file_mtime_ns(metadata: &std::fs::Metadata) -> i64 {
 /// changed or deleted. Avoids the O(n) filesystem walk that `full_index`
 /// performs, and only re-parses the files that actually changed.
 ///
-/// `changed` — paths that were created or modified on disk.
-/// `deleted` — paths that were removed from disk.
+/// `changed` - paths that were created or modified on disk.
+/// `deleted` - paths that were removed from disk.
 ///
 /// After updating the per-file rows, the function re-resolves import
 /// edges and symbol references for the changed files, then rebuilds the
@@ -1305,7 +1305,7 @@ pub fn incremental_index(
     // Update FTS and body index only for the files that actually changed.
     // This avoids the O(whole-codebase) full-table DELETE+re-insert that
     // sync_fts / rebuild_symbol_bodies would trigger on every file-save
-    // event — the primary cause of unbounded WAL growth on large codebases.
+    // event - the primary cause of unbounded WAL growth on large codebases.
     // clear_file_content (called above per file) already removed the old
     // FTS rows, so here we only need to insert the new ones.
     for entry in &indexed {

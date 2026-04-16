@@ -1,0 +1,60 @@
+name: Feature Request
+description: Suggest a new feature or improvement for Qartez MCP.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the problem and your proposed solution so we can evaluate it.
+
+  - type: checkboxes
+    id: existing-issue
+    attributes:
+      label: Pre-flight checklist
+      description: Please confirm the following before submitting.
+      options:
+        - label: I have searched the existing issues and this feature has not been requested yet.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: What problem does this feature solve? Describe the frustration or limitation you are experiencing.
+      placeholder: "I find it difficult to ... because ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Describe what you would like to happen. Be as specific as you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you considered any alternative solutions or workarounds? If so, describe them here.
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: Describe a concrete scenario where this feature would be useful. Include the language, project size, or workflow context if relevant.
+      placeholder: "When working on a large Rust monorepo, I need to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any other information, screenshots, or references that would help us understand the request.
+    validations:
+      required: false

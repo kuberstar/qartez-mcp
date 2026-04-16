@@ -42,7 +42,7 @@ pub fn complexity_trend(
     limit: u32,
 ) -> Result<Vec<SymbolTrend>> {
     let limit = limit.min(MAX_COMMIT_LIMIT);
-    let repo = Repository::open(root)?;
+    let repo = Repository::discover(root)?;
     let head = repo.head().map_err(|e| anyhow!("cannot read HEAD: {e}"))?;
     let head_oid = head.target().ok_or_else(|| anyhow!("HEAD has no target"))?;
 

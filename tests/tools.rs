@@ -457,7 +457,7 @@ fn test_get_symbol_references() {
     // Rewritten for the symbol-level refs implementation: the importer
     // side now needs a concrete referring symbol + an entry in the
     // `symbol_refs` table. A bare file-level import edge no longer
-    // produces a reference, which is intentional — it was the proxy
+    // produces a reference, which is intentional - it was the proxy
     // behaviour the rewrite set out to kill.
     let conn = setup();
     let lib = insert_file(&conn, "src/lib.rs");
@@ -1364,7 +1364,7 @@ fn test_qartez_read_file_path_alone_reads_whole_file() {
 }
 
 // ---------------------------------------------------------------------------
-// qartez-guard PreToolUse hook — end-to-end
+// qartez-guard PreToolUse hook - end-to-end
 // ---------------------------------------------------------------------------
 
 mod guard_binary {
@@ -1781,5 +1781,1484 @@ fn test_security_scan_severity_filter() {
     assert!(
         !result.contains("unwrap-in-exported"),
         "critical filter should exclude Low-severity unwrap, got: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// qartez_smells: end-to-end integration tests
+// ---------------------------------------------------------------------------
+
+/// Build a test DB with symbols designed to trigger each smell category.
+/// Returns (server, temp_dir) - temp_dir must live as long as server.
+#[cfg(feature = "benchmark")]
+fn smells_test_fixture() -> (qartez_mcp::server::QartezServer, TempDir) {
+    use qartez_mcp::server::QartezServer;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    // File A: contains a god function and a normal function
+    let file_a = insert_file(&conn, "src/engine.rs");
+    let _syms_a = write::insert_symbols(
+        &conn,
+        file_a,
+        &[
+            // God function: CC=20, 100 lines
+            SymbolInsert {
+                name: "process_everything".into(),
+                kind: "function".into(),
+                line_start: 1,
+                line_end: 100,
+                signature: Some("fn process_everything(data: Vec<u8>)".into()),
+                is_exported: true,
+                complexity: Some(20),
+                owner_type: None,
+                ..Default::default()
+            },
+            // Normal function: CC=3, 10 lines
+            SymbolInsert {
+                name: "small_helper".into(),
+                kind: "function".into(),
+                line_start: 102,
+                line_end: 112,
+                signature: Some("fn small_helper(x: i32)".into()),
+                is_exported: false,
+                complexity: Some(3),
+                owner_type: None,
+                ..Default::default()
+            },
+            // Long param list: 7 parameters
+            SymbolInsert {
+                name: "build_config".into(),
+                kind: "function".into(),
+                line_start: 114,
+                line_end: 130,
+                signature: Some(
+                    "fn build_config(a: i32, b: String, c: bool, d: f64, e: Vec<u8>, f: Option<String>, g: HashMap<String, i32>)"
+                        .into(),
+                ),
+                is_exported: true,
+                complexity: Some(2),
+                owner_type: None,
+                ..Default::default()
+            },
+            // Exactly 5 params (at threshold) - should appear with default min_params=5
+            SymbolInsert {
+                name: "at_threshold".into(),
+                kind: "function".into(),
+                line_start: 132,
+                line_end: 140,
+                signature: Some("fn at_threshold(a: i32, b: i32, c: i32, d: i32, e: i32)".into()),
+                is_exported: false,
+                complexity: Some(1),
+                owner_type: None,
+                ..Default::default()
+            },
+            // 4 params (below threshold)
+            SymbolInsert {
+                name: "below_threshold".into(),
+                kind: "function".into(),
+                line_start: 142,
+                line_end: 150,
+                signature: Some("fn below_threshold(a: i32, b: i32, c: i32, d: i32)".into()),
+                is_exported: false,
+                complexity: Some(1),
+                owner_type: None,
+                ..Default::default()
+            },
+            // Method with &self and 5 non-self params
+            SymbolInsert {
+                name: "method_long".into(),
+                kind: "method".into(),
+                line_start: 152,
+                line_end: 160,
+                signature: Some("fn method_long(&self, a: i32, b: i32, c: i32, d: i32, e: i32)".into()),
+                is_exported: false,
+                complexity: Some(1),
+                owner_type: Some("Engine".into()),
+                ..Default::default()
+            },
+        ],
+    )
+    .unwrap();
+
+    // File B: contains methods for feature envy testing
+    let file_b = insert_file(&conn, "src/adapter.rs");
+    let syms_b = write::insert_symbols(
+        &conn,
+        file_b,
+        &[
+            // Method on Adapter that mostly calls Engine methods (feature envy)
+            SymbolInsert {
+                name: "do_adaptation".into(),
+                kind: "method".into(),
+                line_start: 1,
+                line_end: 30,
+                signature: Some("fn do_adaptation(&self)".into()),
+                is_exported: true,
+                complexity: Some(5),
+                owner_type: Some("Adapter".into()),
+                ..Default::default()
+            },
+            // Target of calls: Engine method
+            SymbolInsert {
+                name: "engine_step_one".into(),
+                kind: "method".into(),
+                line_start: 32,
+                line_end: 40,
+                signature: Some("fn engine_step_one(&self)".into()),
+                is_exported: true,
+                complexity: Some(2),
+                owner_type: Some("Engine".into()),
+                ..Default::default()
+            },
+            SymbolInsert {
+                name: "engine_step_two".into(),
+                kind: "method".into(),
+                line_start: 42,
+                line_end: 50,
+                signature: Some("fn engine_step_two(&self)".into()),
+                is_exported: true,
+                complexity: Some(2),
+                owner_type: Some("Engine".into()),
+                ..Default::default()
+            },
+            SymbolInsert {
+                name: "engine_step_three".into(),
+                kind: "method".into(),
+                line_start: 52,
+                line_end: 60,
+                signature: Some("fn engine_step_three(&self)".into()),
+                is_exported: true,
+                complexity: Some(2),
+                owner_type: Some("Engine".into()),
+                ..Default::default()
+            },
+            // Own-type call target
+            SymbolInsert {
+                name: "adapter_helper".into(),
+                kind: "method".into(),
+                line_start: 62,
+                line_end: 70,
+                signature: Some("fn adapter_helper(&self)".into()),
+                is_exported: false,
+                complexity: Some(1),
+                owner_type: Some("Adapter".into()),
+                ..Default::default()
+            },
+        ],
+    )
+    .unwrap();
+
+    // Insert symbol_refs: do_adaptation calls 3 Engine methods and 1 Adapter method
+    // That's 3 external to 1 own = ratio 3.0 (above default 2.0 threshold)
+    let do_adaptation_id = syms_b[0];
+    let engine_step_one_id = syms_b[1];
+    let engine_step_two_id = syms_b[2];
+    let engine_step_three_id = syms_b[3];
+    let adapter_helper_id = syms_b[4];
+
+    write::insert_symbol_refs(
+        &conn,
+        &[
+            (do_adaptation_id, engine_step_one_id, "call"),
+            (do_adaptation_id, engine_step_two_id, "call"),
+            (do_adaptation_id, engine_step_three_id, "call"),
+            (do_adaptation_id, adapter_helper_id, "call"),
+        ],
+    )
+    .unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+    (server, dir)
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_detects_god_functions() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"kind": "god_function"}))
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("process_everything"),
+        "should detect god function, got: {result}"
+    );
+    assert!(
+        !result.contains("small_helper"),
+        "should not flag low-complexity function, got: {result}"
+    );
+    assert!(
+        result.contains("CC"),
+        "should show complexity info, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_detects_long_param_lists() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"kind": "long_params"}))
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("build_config"),
+        "should detect 7-param function, got: {result}"
+    );
+    assert!(
+        result.contains("at_threshold"),
+        "should detect function at exactly 5 params, got: {result}"
+    );
+    assert!(
+        result.contains("method_long"),
+        "should detect method with 5 non-self params, got: {result}"
+    );
+    assert!(
+        !result.contains("below_threshold"),
+        "should not flag 4-param function, got: {result}"
+    );
+    assert!(
+        !result.contains("small_helper"),
+        "should not flag 1-param function, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_detects_feature_envy() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"kind": "feature_envy"}))
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("do_adaptation"),
+        "should detect feature envy (3 Engine calls vs 1 own), got: {result}"
+    );
+    assert!(
+        result.contains("Adapter"),
+        "should show own type, got: {result}"
+    );
+    assert!(
+        result.contains("Engine"),
+        "should show envied type, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_all_kinds_combined() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // No kind filter - all three categories
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({}))
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("God Functions"),
+        "should have god function section, got: {result}"
+    );
+    assert!(
+        result.contains("Long Parameter Lists"),
+        "should have long params section, got: {result}"
+    );
+    assert!(
+        result.contains("Feature Envy"),
+        "should have feature envy section, got: {result}"
+    );
+    assert!(
+        result.contains("Code Smells"),
+        "should have summary header, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_custom_thresholds() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // Raise thresholds so nothing triggers
+    let result = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({"min_complexity": 50, "min_lines": 200, "min_params": 20, "envy_ratio": 100.0}),
+        )
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("No code smells detected"),
+        "should report no smells with very high thresholds, got: {result}"
+    );
+
+    // Lower god function thresholds to catch small_helper too
+    let result2 = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({"kind": "god_function", "min_complexity": 1, "min_lines": 1}),
+        )
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result2.contains("small_helper"),
+        "lowered thresholds should catch small_helper, got: {result2}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_concise_format() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"format": "concise"}))
+        .expect("qartez_smells should succeed");
+
+    // Concise format should not have markdown table delimiters
+    assert!(
+        !result.contains("|---"),
+        "concise format should not have table separators, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_file_path_scoping() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // Scope to engine.rs only - should see god function but not feature envy
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"file_path": "src/engine.rs"}))
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("process_everything"),
+        "should find god function in engine.rs, got: {result}"
+    );
+    assert!(
+        !result.contains("do_adaptation"),
+        "should not find adapter.rs symbols, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_invalid_file_path_returns_error() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    let result =
+        server.call_tool_by_name("qartez_smells", json!({"file_path": "nonexistent/file.rs"}));
+
+    assert!(result.is_err(), "should error for missing file");
+    assert!(
+        result.unwrap_err().contains("not found"),
+        "error should mention file not found"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_header_counts_are_consistent() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // With a very small limit, the header should still show total found
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({"limit": 2}))
+        .expect("qartez_smells should succeed");
+
+    // Header should show total found count, not truncated count
+    assert!(
+        result.contains("found:"),
+        "should have summary with total, got: {result}"
+    );
+    // With limit=2 and multiple categories, some get truncated
+    if result.contains("Showing") {
+        assert!(
+            result.contains("of"),
+            "truncation message should show X of Y, got: {result}"
+        );
+    }
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_feature_envy_works_when_file_scoped() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // Scope to adapter.rs - should still detect feature envy because
+    // the owner_lookup resolves Engine symbols from the full DB
+    let result = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({"kind": "feature_envy", "file_path": "src/adapter.rs"}),
+        )
+        .expect("qartez_smells should succeed");
+
+    assert!(
+        result.contains("do_adaptation"),
+        "file-scoped envy should still detect cross-file references, got: {result}"
+    );
+    assert!(
+        result.contains("Engine"),
+        "should show envied type even when scoped, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_empty_db_returns_no_smells() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    let result = server
+        .call_tool_by_name("qartez_smells", json!({}))
+        .expect("should succeed on empty DB");
+
+    assert!(
+        result.contains("No code smells detected"),
+        "empty DB should report no smells, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn smells_string_coercion_for_numeric_params() {
+    use serde_json::json;
+    let (server, _dir) = smells_test_fixture();
+
+    // MCP clients sometimes send numbers as strings
+    let result = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({"min_complexity": "15", "min_lines": "50", "min_params": "5", "envy_ratio": "2.0", "limit": "10"}),
+        )
+        .expect("string-coerced params should work");
+
+    assert!(
+        result.contains("Code Smells"),
+        "should work with string params, got: {result}"
+    );
+}
+
+// ---- qartez_test_gaps tests ----
+
+#[cfg(feature = "benchmark")]
+fn test_gaps_fixture() -> (qartez_mcp::server::QartezServer, TempDir) {
+    use qartez_mcp::server::QartezServer;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    // Source file A: has a test file importing it
+    let file_a = insert_file(&conn, "src/core.rs");
+    write::insert_symbols(
+        &conn,
+        file_a,
+        &[SymbolInsert {
+            name: "process".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 20,
+            signature: Some("fn process(data: Vec<u8>)".into()),
+            is_exported: true,
+            complexity: Some(8),
+            owner_type: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    // Source file B: no test imports it (gap)
+    let file_b = insert_file(&conn, "src/utils.rs");
+    write::insert_symbols(
+        &conn,
+        file_b,
+        &[SymbolInsert {
+            name: "helper".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 10,
+            signature: Some("fn helper(x: i32) -> i32".into()),
+            is_exported: true,
+            complexity: Some(3),
+            owner_type: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    // Source file C: also no test (another gap, higher complexity)
+    let file_c = insert_file(&conn, "src/engine.rs");
+    write::insert_symbols(
+        &conn,
+        file_c,
+        &[SymbolInsert {
+            name: "run_engine".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 80,
+            signature: Some("fn run_engine()".into()),
+            is_exported: true,
+            complexity: Some(18),
+            owner_type: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    // Test file that imports file_a
+    let test_file = insert_file(&conn, "tests/test_core.rs");
+    write::insert_symbols(
+        &conn,
+        test_file,
+        &[SymbolInsert {
+            name: "test_process".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 10,
+            signature: Some("fn test_process()".into()),
+            is_exported: false,
+            complexity: Some(1),
+            owner_type: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    // Edge: test file imports source file A
+    write::insert_edge(&conn, test_file, file_a, "import", None).unwrap();
+    // Edge: engine imports utils (for blast radius)
+    write::insert_edge(&conn, file_c, file_b, "import", None).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+    (server, dir)
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_mode_shows_coverage() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "map"}))
+        .expect("map mode should succeed");
+
+    assert!(
+        result.contains("Test-to-source mapping"),
+        "should show mapping header, got: {result}"
+    );
+    assert!(
+        result.contains("src/core.rs"),
+        "should show covered source file, got: {result}"
+    );
+    assert!(
+        result.contains("tests/test_core.rs"),
+        "should show test file, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_mode_file_scoped() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "src/core.rs"}),
+        )
+        .expect("file-scoped map should succeed");
+
+    assert!(
+        result.contains("tests/test_core.rs"),
+        "should show test file for core.rs, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_mode_uncovered_file() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "src/utils.rs"}),
+        )
+        .expect("uncovered file map should succeed");
+
+    assert!(
+        result.contains("no test files importing it"),
+        "should indicate no coverage, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_gaps_mode_finds_untested() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("gaps mode should succeed");
+
+    assert!(
+        result.contains("Test coverage gaps"),
+        "should show gaps header, got: {result}"
+    );
+    assert!(
+        result.contains("src/utils.rs"),
+        "should flag utils.rs as untested, got: {result}"
+    );
+    assert!(
+        result.contains("src/engine.rs"),
+        "should flag engine.rs as untested, got: {result}"
+    );
+    assert!(
+        !result.contains("src/core.rs"),
+        "core.rs has test coverage, should not appear in gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_gaps_mode_default_is_gaps() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({}))
+        .expect("default mode should succeed");
+
+    assert!(
+        result.contains("Test coverage gaps"),
+        "default mode should be gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_gaps_mode_concise() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "gaps", "format": "concise"}),
+        )
+        .expect("concise gaps should succeed");
+
+    assert!(
+        result.contains("PR="),
+        "concise format should show PR= notation, got: {result}"
+    );
+    assert!(
+        result.contains("score="),
+        "concise format should show score=, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_gaps_mode_pagerank_filter() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    // Set a very high min_pagerank that filters out everything
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "gaps", "min_pagerank": 100.0}),
+        )
+        .expect("pagerank filter should succeed");
+
+    assert!(
+        result.contains("No untested source files found"),
+        "high pagerank filter should exclude all, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_invalid_mode() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server.call_tool_by_name("qartez_test_gaps", json!({"mode": "invalid"}));
+
+    assert!(result.is_err(), "invalid mode should return error");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("Unknown mode"),
+        "should mention unknown mode, got: {err}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_suggest_mode_requires_base() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server.call_tool_by_name("qartez_test_gaps", json!({"mode": "suggest"}));
+
+    assert!(result.is_err(), "suggest without base should return error");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("base"),
+        "error should mention base param, got: {err}"
+    );
+}
+
+// ---- Edge-case tests ----
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_empty_db() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    // Map mode on empty DB
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "map"}))
+        .expect("map on empty DB should succeed");
+    assert!(
+        result.contains("0/0 source files"),
+        "empty DB map should show 0/0, got: {result}"
+    );
+
+    // Gaps mode on empty DB
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("gaps on empty DB should succeed");
+    assert!(
+        result.contains("No untested source files"),
+        "empty DB gaps should show no gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_all_files_covered() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    let src = insert_file(&conn, "src/lib.rs");
+    let test = insert_file(&conn, "tests/test_lib.rs");
+    write::insert_edge(&conn, test, src, "import", None).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("No untested source files"),
+        "all covered - should show no gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_test_file_not_counted_as_gap() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    // Only a test file, no source files
+    let _test = insert_file(&conn, "tests/test_only.rs");
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("No untested source files"),
+        "test-only DB should show no gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_self_referencing_edge_ignored() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    let src = insert_file(&conn, "src/self_ref.rs");
+    // Self-referencing edge should not count as test coverage
+    write::insert_edge(&conn, src, src, "import", None).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("src/self_ref.rs"),
+        "self-ref file should appear as gap, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_mode_test_file_with_no_source_imports() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    // Test file that imports nothing
+    let _test = insert_file(&conn, "tests/orphan_test.rs");
+    let _src = insert_file(&conn, "src/lonely.rs");
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    // Map for the test file
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "tests/orphan_test.rs"}),
+        )
+        .expect("should succeed");
+    assert!(
+        result.contains("no indexed source imports"),
+        "orphan test should have no source imports, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_mode_include_symbols() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "src/core.rs", "include_symbols": true}),
+        )
+        .expect("include_symbols should succeed");
+
+    assert!(
+        result.contains("process"),
+        "should list exported symbols, got: {result}"
+    );
+    assert!(
+        result.contains("exported symbols"),
+        "should have exported symbols section, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_limit_parameter() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps", "limit": 1}))
+        .expect("limit=1 should succeed");
+
+    // Should have exactly 1 row in the table (plus header)
+    let data_rows = result.lines().filter(|l| l.starts_with("| src/")).count();
+    assert_eq!(
+        data_rows, 1,
+        "limit=1 should show exactly 1 gap, got {data_rows} in: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_gaps_ranking_order() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("gaps should succeed");
+
+    // engine.rs (CC=18) should rank higher than utils.rs (CC=3)
+    let engine_pos = result.find("engine.rs").expect("engine should appear");
+    let utils_pos = result.find("utils.rs").expect("utils should appear");
+    assert!(
+        engine_pos < utils_pos,
+        "engine.rs (higher complexity) should rank before utils.rs, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_string_coercion_for_numeric_params() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    // MCP clients sometimes send numbers as strings
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "gaps", "limit": "5", "min_pagerank": "0.0"}),
+        )
+        .expect("string-coerced params should work");
+
+    assert!(
+        result.contains("Test coverage gaps"),
+        "should work with string params, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_multiple_tests_for_one_source() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+
+    let src = insert_file(&conn, "src/core.rs");
+    let test_a = insert_file(&conn, "tests/test_core_a.rs");
+    let test_b = insert_file(&conn, "tests/test_core_b.rs");
+    write::insert_edge(&conn, test_a, src, "import", None).unwrap();
+    write::insert_edge(&conn, test_b, src, "import", None).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    // Map for the source file should list both tests
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "src/core.rs"}),
+        )
+        .expect("should succeed");
+
+    assert!(
+        result.contains("2 test file(s)"),
+        "should show 2 test files, got: {result}"
+    );
+    assert!(
+        result.contains("test_core_a.rs"),
+        "should list test A, got: {result}"
+    );
+    assert!(
+        result.contains("test_core_b.rs"),
+        "should list test B, got: {result}"
+    );
+
+    // Gaps should be empty since src/core.rs is covered
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("No untested source files"),
+        "covered file should not appear in gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_full_shows_correct_counts() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "map"}))
+        .expect("map should succeed");
+
+    // Fixture: 3 source files, 1 test file, 1 source covered
+    assert!(
+        result.contains("1/3 source files covered by 1 test files"),
+        "should show correct coverage fraction, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_map_concise_format() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "format": "concise"}),
+        )
+        .expect("concise map should succeed");
+
+    // Concise format should NOT have the "- file (N tests)" with sub-items
+    assert!(
+        !result.contains("    -"),
+        "concise format should not have indented test list, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_test_files_excluded_from_gaps() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    let result = server
+        .call_tool_by_name("qartez_test_gaps", json!({"mode": "gaps"}))
+        .expect("should succeed");
+
+    assert!(
+        !result.contains("tests/test_core.rs"),
+        "test files should never appear in gaps, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_gaps_params_null_and_extra_fields() {
+    use serde_json::json;
+    let (server, _dir) = test_gaps_fixture();
+
+    // All-null params (should use defaults)
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": null, "limit": null, "format": null, "min_pagerank": null}),
+        )
+        .expect("null params should use defaults");
+    assert!(
+        result.contains("Test coverage gaps"),
+        "null mode should default to gaps, got: {result}"
+    );
+
+    // Extra unknown fields should be silently ignored (serde default behavior)
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "gaps", "unknown_field": "ignored", "another": 42}),
+        )
+        .expect("unknown fields should be ignored");
+    assert!(
+        result.contains("Test coverage gaps"),
+        "should work with extra fields, got: {result}"
+    );
+
+    // include_symbols as string "true" should work via flexible::bool_opt
+    let result = server
+        .call_tool_by_name(
+            "qartez_test_gaps",
+            json!({"mode": "map", "file_path": "src/core.rs", "include_symbols": "true"}),
+        )
+        .expect("string bool should work");
+    assert!(
+        result.contains("exported symbols"),
+        "string 'true' should enable include_symbols, got: {result}"
+    );
+}
+
+// ---- qartez_knowledge integration tests ----
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_no_git_depth_returns_error() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let conn = setup();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+    let result = server.call_tool_by_name("qartez_knowledge", json!({}));
+    assert!(result.is_err(), "should error when git_depth is 0");
+    assert!(
+        result.unwrap_err().contains("git history"),
+        "error should mention git history"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_file_level_via_call_tool_by_name() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    // Set up a git repo with multiple authors
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
+    fs::write(src.join("lib.rs"), "pub fn foo() {}\npub fn bar() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("src/main.rs")).unwrap();
+    index.add_path(Path::new("src/lib.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Alice", "alice@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    // Index files in DB
+    let conn = setup();
+    write::upsert_file(&conn, "src/main.rs", 0, 50, "rust", 3).unwrap();
+    write::upsert_file(&conn, "src/lib.rs", 0, 40, "rust", 2).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    // Default params (file level, detailed)
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({}))
+        .expect("should succeed");
+    assert!(
+        result.contains("Bus Factor"),
+        "should have header, got: {result}"
+    );
+    assert!(
+        result.contains("src/main.rs"),
+        "should list files, got: {result}"
+    );
+    assert!(
+        result.contains("Alice"),
+        "should show author name, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_module_level_via_call_tool_by_name() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("src/a.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Bob", "bob@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let conn = setup();
+    write::upsert_file(&conn, "src/a.rs", 0, 10, "rust", 1).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"level": "module"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("module level"),
+        "should have module header, got: {result}"
+    );
+    assert!(result.contains("src"), "should list module, got: {result}");
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_concise_format_via_call_tool_by_name() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    fs::write(dir.path().join("f.rs"), "fn f() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("f.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Carol", "carol@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let conn = setup();
+    write::upsert_file(&conn, "f.rs", 0, 10, "rust", 1).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"format": "concise"}))
+        .expect("should succeed");
+    assert!(
+        !result.contains("+----"),
+        "concise should not contain table borders, got: {result}"
+    );
+    assert!(result.contains("f.rs"), "should list file, got: {result}");
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_file_path_filter() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let src = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&tests_dir).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+    fs::write(tests_dir.join("t.rs"), "fn test() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("src/lib.rs")).unwrap();
+    index.add_path(Path::new("tests/t.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Dev", "dev@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let conn = setup();
+    write::upsert_file(&conn, "src/lib.rs", 0, 14, "rust", 1).unwrap();
+    write::upsert_file(&conn, "tests/t.rs", 0, 14, "rust", 1).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    // Filter to src/ only
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"file_path": "src/"}))
+        .expect("should succeed");
+    assert!(
+        result.contains("src/lib.rs"),
+        "should include src file, got: {result}"
+    );
+    assert!(
+        !result.contains("tests/t.rs"),
+        "should exclude test file, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_author_filter_via_call_tool_by_name() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("a.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("SpecificPerson", "sp@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let conn = setup();
+    write::upsert_file(&conn, "a.rs", 0, 10, "rust", 1).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    // Filter to existing author
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"author": "specific"}))
+        .expect("should succeed with matching author");
+    assert!(
+        result.contains("a.rs"),
+        "should find file by author, got: {result}"
+    );
+
+    // Filter to non-existent author
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"author": "NonExistentPerson"}))
+        .expect("should succeed even with no matches");
+    assert!(
+        result.contains("No blame data"),
+        "should report no data for unknown author, got: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn knowledge_string_coercion_for_limit() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("a.rs")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Dev", "dev@test.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let conn = setup();
+    write::upsert_file(&conn, "a.rs", 0, 10, "rust", 1).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+
+    // MCP clients sometimes send numbers as strings
+    let result = server
+        .call_tool_by_name("qartez_knowledge", json!({"limit": "5"}))
+        .expect("string-coerced limit should work");
+    assert!(
+        result.contains("Bus Factor"),
+        "should work with string limit, got: {result}"
+    );
+}
+
+#[test]
+fn test_call_tool_by_name_deps_mermaid() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("main.rs"),
+        "mod lib;\nfn main() { lib::hello(); }\n",
+    )
+    .unwrap();
+    fs::write(src.join("lib.rs"), "pub fn hello() { println!(\"hi\"); }\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name(
+            "qartez_deps",
+            json!({"file_path": "src/main.rs", "format": "mermaid"}),
+        )
+        .expect("qartez_deps mermaid via dispatcher");
+    assert!(
+        result.starts_with("graph LR\n"),
+        "should start with graph direction, got: {result}"
+    );
+    assert!(
+        !result.contains("```"),
+        "raw mermaid output, no markdown fences, got: {result}"
+    );
+}
+
+#[test]
+fn test_mermaid_format_fallback_on_unsupported_tool() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("main.rs"), "fn main() { }\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    // qartez_outline does not have a mermaid branch - should fall back to detailed
+    let result = server
+        .call_tool_by_name(
+            "qartez_outline",
+            json!({"file_path": "src/main.rs", "format": "mermaid"}),
+        )
+        .expect("mermaid on outline should not error");
+    assert!(
+        !result.starts_with("graph "),
+        "outline has no mermaid path, should produce detailed output, got: {result}"
+    );
+    assert!(
+        !result.is_empty(),
+        "outline with mermaid format should still produce output"
+    );
+
+    // qartez_grep does not have a mermaid branch
+    let result = server
+        .call_tool_by_name("qartez_grep", json!({"query": "main", "format": "mermaid"}))
+        .expect("mermaid on grep should not error");
+    assert!(
+        !result.starts_with("graph "),
+        "grep has no mermaid path, should produce detailed output"
+    );
+}
+
+#[test]
+fn test_call_tool_by_name_calls_mermaid() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("main.rs"),
+        "fn helper() { }\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name("qartez_calls", json!({"name": "main", "format": "mermaid"}))
+        .expect("qartez_calls mermaid via dispatcher");
+    assert!(
+        result.starts_with("graph TD\n"),
+        "should start with graph direction, got: {result}"
+    );
+    assert!(
+        !result.contains("```"),
+        "raw mermaid output, no markdown fences, got: {result}"
+    );
+    assert!(
+        result.contains("main"),
+        "should contain target symbol, got: {result}"
     );
 }

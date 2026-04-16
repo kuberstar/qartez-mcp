@@ -247,7 +247,7 @@ fn find_binding_value(node: Node) -> Option<Node> {
 
 /// Check whether a value node represents a function definition.
 ///
-/// A function in Nix is any expression that starts with `args:` -- either
+/// A function in Nix is any expression that starts with `args:` - either
 /// a bare identifier (`x: body`) or a formals set (`{ a, b }: body`).
 fn is_function_value(node: Node) -> bool {
     if node.kind() == "function_expression" {

@@ -32,7 +32,7 @@ pub const DEFAULT_PAGERANK_MIN: f64 = 0.05;
 pub const DEFAULT_BLAST_MIN: i64 = 10;
 
 /// How long an acknowledgment (a prior `qartez_impact` call) remains valid.
-/// 10 minutes matches typical Claude Code conversation windows — long enough
+/// 10 minutes matches typical Claude Code conversation windows - long enough
 /// to stay out of the way, short enough that acks don't leak across sessions.
 pub const DEFAULT_ACK_TTL_SECS: u64 = 600;
 
@@ -88,7 +88,7 @@ impl GuardConfig {
 }
 
 /// Shape of the tool-use hook payload (compatible with Claude Code and Gemini CLI).
-/// Only the fields the guard actually uses are deserialized — unknown fields
+/// Only the fields the guard actually uses are deserialized - unknown fields
 /// are ignored so future CLI releases adding keys don't break us.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
@@ -123,12 +123,12 @@ pub struct FileFacts {
     /// Top-ranked symbols inside this file, in descending order of their
     /// symbol-level PageRank. Populated by the guard binary from
     /// `read::get_symbols_ranked_for_file`; empty on legacy DBs that
-    /// predate symbol PageRank. Used purely to enrich the deny message —
+    /// predate symbol PageRank. Used purely to enrich the deny message -
     /// does not affect the Allow/Deny decision.
     pub hot_symbols: Vec<(String, f64)>,
 }
 
-/// Core decision function — pure, no I/O, so it can be unit-tested without
+/// Core decision function - pure, no I/O, so it can be unit-tested without
 /// touching a SQLite database or stdin.
 ///
 /// Returns `Deny` iff the file is "hot" (PageRank or blast radius above the
@@ -173,7 +173,7 @@ fn format_deny_reason(
         facts.rel_path,
     );
     if !facts.hot_symbols.is_empty() {
-        // Keep it terse — one comma-separated line that Claude can scan at
+        // Keep it terse - one comma-separated line that Claude can scan at
         // a glance before deciding to call qartez_impact.
         let parts: Vec<String> = facts
             .hot_symbols
@@ -263,7 +263,7 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 
 /// Called by `qartez_impact` when Claude successfully reviews a file. Writes
 /// (or touches) the ack file so subsequent edits within `ack_ttl_secs` are
-/// let through. Failures are swallowed — ack is an optimisation, not a
+/// let through. Failures are swallowed - ack is an optimisation, not a
 /// correctness guarantee.
 pub fn touch_ack(project_root: &Path, rel_path: &str) {
     let path = ack_path(project_root, rel_path);

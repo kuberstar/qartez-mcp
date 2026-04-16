@@ -4,7 +4,7 @@
 //! src/main/java layout, package prefix `tools.jackson.core.*`. Test
 //! sources and generated output are excluded from the non-MCP walk
 //! because jackson-core's src/test/java nearly doubles the file count
-//! without adding library-surface signal — an agent trying to understand
+//! without adding library-surface signal - an agent trying to understand
 //! the public API would never grep through the test tree first.
 //!
 //! ## Known gotchas for Java
@@ -20,8 +20,8 @@
 //!   `qartez_move`**: the sim steps slice the outline target file with
 //!   hard-coded ranges (e.g. `(260, 290)` or `(2180, 2225)`) chosen for
 //!   the pre-refactor Rust fixture. Those ranges over-read on Java,
-//!   which is actually more honest — a real agent exploring the codebase
-//!   without prior knowledge also over-reads — so we let the ranges
+//!   which is actually more honest - a real agent exploring the codebase
+//!   without prior knowledge also over-reads - so we let the ranges
 //!   stand instead of patching `scenarios.rs`.
 //! - **Zero file-level edges**: Java imports reference fully-qualified
 //!   package paths rather than relative paths, so the tree-sitter-based

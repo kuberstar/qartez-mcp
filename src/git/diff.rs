@@ -8,7 +8,7 @@ use git2::Repository;
 /// Accepts standard git revspec syntax (`main..HEAD`, `HEAD~3..HEAD`) or a
 /// single ref (`main`), which is interpreted as `<ref>..HEAD`.
 pub fn changed_files_in_range(root: &Path, revspec: &str) -> Result<Vec<String>> {
-    let repo = Repository::open(root)?;
+    let repo = Repository::discover(root)?;
 
     let effective = if revspec.contains("..") {
         revspec.to_string()

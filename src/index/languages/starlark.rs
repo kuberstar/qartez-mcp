@@ -2,6 +2,7 @@ use tree_sitter::{Language, Node};
 
 use super::LanguageSupport;
 use crate::index::symbols::{ExtractedImport, ExtractedSymbol, ParseResult, SymbolKind};
+use crate::str_utils::floor_char_boundary;
 
 /// Starlark/BUILD file parser for Bazel and similar build systems.
 ///
@@ -73,7 +74,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
         return None;
     }
     let truncated = if first_line.len() > 200 {
-        &first_line[..first_line.floor_char_boundary(200)]
+        &first_line[..floor_char_boundary(first_line, 200)]
     } else {
         first_line
     };

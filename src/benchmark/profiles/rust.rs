@@ -44,5 +44,6 @@ fn rust_targets() -> ResolvedTargets {
         rename_file_destination: "src/server/server.rs".to_string(),
         calls_target_symbol: "build_overview".to_string(),
         rename_new_name: "trunc_path".to_string(),
+        hierarchy_target_symbol: "LanguageSupport".to_string(),
     }
 }

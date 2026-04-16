@@ -23,7 +23,7 @@ use super::scenarios::Scenario;
 /// Aggregate LLM-judge quality statistics computed by
 /// [`average_quality`] and rendered in the headline. Tracks the five
 /// axes so the headline can report per-side averages. The model string
-/// is the effective primary judge model — for ensemble runs it carries
+/// is the effective primary judge model - for ensemble runs it carries
 /// both models joined by `" + "`.
 #[derive(Debug, Clone)]
 struct QualityAggregate {
@@ -88,7 +88,7 @@ fn average_quality(report: &BenchmarkReport) -> Option<QualityAggregate> {
 
 /// Computes inter-rater agreement stats across every ensemble-scored
 /// scenario in `report`. Returns `None` when no scenario carries an
-/// `ensemble_quality` entry — the renderer uses that to skip the whole
+/// `ensemble_quality` entry - the renderer uses that to skip the whole
 /// `## Judge reliability` section on legacy reports.
 ///
 /// The rating pool for Cohen's κ is built from every
@@ -605,12 +605,12 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
     }
     if incomplete_count > 0 {
         out.push_str(&format!(
-            "- ✱ {incomplete_count} scenario(s) marked with ✱ have an incomplete non-MCP sim — the non-MCP side cannot produce a comparable answer, so the token and Savings columns are shown as `—`. MCP is awarded the win on correctness; the Speedup column still reflects the real latency cost the non-MCP side paid for its partial output.\n",
+            "- ✱ {incomplete_count} scenario(s) marked with ✱ have an incomplete non-MCP sim - the non-MCP side cannot produce a comparable answer, so the token and Savings columns are shown as `-`. MCP is awarded the win on correctness; the Speedup column still reflects the real latency cost the non-MCP side paid for its partial output.\n",
         ));
     }
     out.push('\n');
 
-    // Headline — the single aggregate figure a reader sees at the top of the
+    // Headline - the single aggregate figure a reader sees at the top of the
     // report. Uses the same formula as `aggregate_savings_pct` and the stdout
     // `print_summary` helper in `src/bin/benchmark.rs`, so all three outputs
     // report the same number. Rendered between the metadata bullets and the
@@ -634,7 +634,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
         }
         None => {
             out.push_str(
-                "**Aggregate token savings vs Glob+Grep+Read: —** (Σ non-MCP tokens = 0; headline cannot be computed)\n",
+                "**Aggregate token savings vs Glob+Grep+Read: -** (Σ non-MCP tokens = 0; headline cannot be computed)\n",
             );
         }
     }
@@ -657,7 +657,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
     }
     out.push('\n');
 
-    // Judge reliability section — slice C adds this block between the
+    // Judge reliability section - slice C adds this block between the
     // Headline and the Matrix when `--judge-ensemble` produced any
     // ensemble rows. Renders Cohen's weighted κ + Landis-Koch band,
     // mean |Δ|, arbitration count, top-3 most-disputed scenarios, and
@@ -667,7 +667,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
         render_judge_reliability(&mut out, report, &stats);
     }
 
-    // Session cost context — frames token savings relative to the base
+    // Session cost context - frames token savings relative to the base
     // cost of a Claude Code session (~20k tokens for system prompt +
     // CLAUDE.md + tools).
     {
@@ -711,7 +711,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
                 format!("{:+.1}%", r.savings.tokens_pct),
             )
         } else {
-            ("—".to_string(), "—".to_string())
+            ("-".to_string(), "-".to_string())
         };
 
         let mut row = format!(
@@ -734,9 +734,9 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
                     r.savings
                         .effective_savings_pct
                         .map(|e| format!("{e:+.1}%"))
-                        .unwrap_or_else(|| "—".to_string()),
+                        .unwrap_or_else(|| "-".to_string()),
                 ),
-                None => ("—".to_string(), "—".to_string(), "—".to_string()),
+                None => ("-".to_string(), "-".to_string(), "-".to_string()),
             };
             row.push_str(&format!(" {prec_cell} | {recall_cell} | {eff_cell} |"));
         }
@@ -744,14 +744,14 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
             let compile_cell = match &r.compilation_check {
                 Some(c) if c.passed => "✓",
                 Some(_) => "✗",
-                None => "—",
+                None => "-",
             };
             row.push_str(&format!(" {compile_cell} |"));
         }
         if any_quality {
             let quality_cell = match &r.quality {
                 Some(q) => format!("{:.1} / {:.1}", q.mcp.average(), q.non_mcp.average()),
-                None => "—".to_string(),
+                None => "-".to_string(),
             };
             row.push_str(&format!(" {quality_cell} |"));
         }
@@ -762,7 +762,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
         out.push_str(&row);
     }
 
-    // Quality breakdown table — shows per-axis scores when any scenario
+    // Quality breakdown table - shows per-axis scores when any scenario
     // has been judged. Distinguishes LLM-scored (correctness, usability)
     // from programmatic (completeness, groundedness, conciseness) axes.
     if any_quality {
@@ -826,11 +826,11 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
     for r in &report.scenarios {
         if r.tier > 1 {
             out.push_str(&format!(
-                "### `{}` — {} (tier {})\n\n",
+                "### `{}` - {} (tier {})\n\n",
                 r.tool, r.scenario_id, r.tier,
             ));
         } else {
-            out.push_str(&format!("### `{}` — {}\n\n", r.tool, r.scenario_id));
+            out.push_str(&format!("### `{}` - {}\n\n", r.tool, r.scenario_id));
         }
         out.push_str(&format!("{}\n\n", r.description));
 
@@ -861,10 +861,10 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
 
         out.push_str("\n**Non-MCP side**");
         if r.non_mcp.reused {
-            out.push_str(" (reused from cache — latency is historical)");
+            out.push_str(" (reused from cache - latency is historical)");
         }
         if !r.non_mcp_is_complete {
-            out.push_str(" ✱ **incomplete** — the step sequence below does not produce a comparable answer; byte/token counts are noise, not a measure of efficiency");
+            out.push_str(" ✱ **incomplete** - the step sequence below does not produce a comparable answer; byte/token counts are noise, not a measure of efficiency");
         }
         out.push_str("\n\n");
         if let Some(steps) = &r.non_mcp.steps {
@@ -896,7 +896,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
             ));
         } else {
             out.push_str(&format!(
-                "\n**Savings:** — tokens, — bytes, {:.2}× speedup (token comparison skipped: non-MCP sim is incomplete)\n\n",
+                "\n**Savings:** - tokens, - bytes, {:.2}× speedup (token comparison skipped: non-MCP sim is incomplete)\n\n",
                 r.savings.latency_ratio,
             ));
         }
@@ -929,7 +929,7 @@ pub fn render_markdown(report: &BenchmarkReport) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Renderer helpers — Matrix columns, judge reliability section,
+// Renderer helpers - Matrix columns, judge reliability section,
 // per-scenario quality / ensemble / grounding blocks.
 // ---------------------------------------------------------------------------
 
@@ -965,7 +965,7 @@ fn matrix_header_and_sep(
 }
 
 /// Renders one `GroundingScores` side as `pct% (verified/total)` or a
-/// literal `—` when the side carries no grounding entry. Used by the
+/// literal `-` when the side carries no grounding entry. Used by the
 /// Matrix column cell builder.
 fn format_grounding_side(g: Option<&crate::benchmark::grounding::GroundingScores>) -> String {
     match g {
@@ -975,7 +975,7 @@ fn format_grounding_side(g: Option<&crate::benchmark::grounding::GroundingScores
             v = scores.verified_claims,
             t = scores.total_claims,
         ),
-        _ => "—".to_string(),
+        _ => "-".to_string(),
     }
 }
 
@@ -1004,7 +1004,7 @@ fn render_judge_reliability(out: &mut String, report: &BenchmarkReport, stats: &
         stats.n_arbitrated as f64 / stats.n_scenarios as f64 * 100.0
     };
     let kappa_str = if stats.cohens_kappa.is_nan() {
-        "—".to_string()
+        "-".to_string()
     } else {
         format!("{:.2}", stats.cohens_kappa)
     };
@@ -1060,7 +1060,7 @@ fn render_judge_reliability(out: &mut String, report: &BenchmarkReport, stats: &
 /// `docs/benchmark-v2/judge-core.md` §7 via the slice-C extension.
 fn render_per_scenario_quality(out: &mut String, q: &QualityScores) {
     out.push_str(&format!(
-        "**LLM-judge ({model}):** MCP {mcp_avg:.1}/10 (correctness {mc}, completeness {mcp_cp}, usability {mu}, groundedness {mg}, conciseness {mcon}) vs non-MCP {non_mcp_avg:.1}/10 (correctness {nc}, completeness {ncp}, usability {nu}, groundedness {ng}, conciseness {ncon}) — _{verdict}_\n",
+        "**LLM-judge ({model}):** MCP {mcp_avg:.1}/10 (correctness {mc}, completeness {mcp_cp}, usability {mu}, groundedness {mg}, conciseness {mcon}) vs non-MCP {non_mcp_avg:.1}/10 (correctness {nc}, completeness {ncp}, usability {nu}, groundedness {ng}, conciseness {ncon}) - _{verdict}_\n",
         model = q.model,
         mcp_avg = q.mcp.average(),
         mc = q.mcp.correctness,
@@ -1138,12 +1138,12 @@ fn render_ensemble_line(out: &mut String, label: &str, q: &QualityScores) {
     let non_mcp_avg = q.non_mcp.average();
     let pair_avg = (mcp_avg + non_mcp_avg) / 2.0;
     let verdict = if q.verdict.is_empty() {
-        "—".to_string()
+        "-".to_string()
     } else {
         q.verdict.clone()
     };
     out.push_str(&format!(
-        "- {label} ({model}): MCP {mcp_avg:.1} / non-MCP {non_mcp_avg:.1} (pair avg {pair_avg:.1}) — _{verdict}_\n",
+        "- {label} ({model}): MCP {mcp_avg:.1} / non-MCP {non_mcp_avg:.1} (pair avg {pair_avg:.1}) - _{verdict}_\n",
         label = label,
         model = q.model,
         mcp_avg = mcp_avg,
@@ -1156,7 +1156,7 @@ fn render_ensemble_line(out: &mut String, label: &str, q: &QualityScores) {
 /// Renders the per-scenario `**Grounding (claim-level fact check):**`
 /// block per `docs/benchmark-v2/verifiable-grounding.md` §4. Emits one
 /// bullet per side, with the verified fraction, per-category counts,
-/// and the first few unverified claims. `—` is emitted for a side that
+/// and the first few unverified claims. `-` is emitted for a side that
 /// carries no grounding entry.
 fn render_per_scenario_grounding(out: &mut String, r: &ScenarioReport) {
     out.push_str("**Grounding (claim-level fact check):**\n");
@@ -1176,7 +1176,7 @@ fn render_per_scenario_grounding(out: &mut String, r: &ScenarioReport) {
 /// `degraded` note.
 fn format_grounding_detail(g: Option<&crate::benchmark::grounding::GroundingScores>) -> String {
     let Some(scores) = g else {
-        return "—".to_string();
+        return "-".to_string();
     };
     if scores.total_claims == 0 {
         return "no verifiable claims extracted".to_string();
@@ -1248,7 +1248,7 @@ pub fn check_regression(
                 * 100.0
         };
         // Suppress latency regressions when both readings sit in the noise
-        // floor — relative deltas there are run-to-run variance, not real
+        // floor - relative deltas there are run-to-run variance, not real
         // perf changes.
         let latency_above_noise = cur.mcp.latency.mean_us > LATENCY_NOISE_FLOOR_US
             || base.mcp.latency.mean_us > LATENCY_NOISE_FLOOR_US;
@@ -1306,21 +1306,21 @@ const DIVERGENCE_HIGHLIGHT_PCT: f64 = 20.0;
 ///
 /// The output contains four sections:
 ///
-/// 1. **Headline matrix** — one row per language, one column per tool, with
+/// 1. **Headline matrix** - one row per language, one column per tool, with
 ///    the per-tool MCP token savings rendered as `+xx.x%`. Cells where
 ///    `non_mcp_is_complete = false` (the non-MCP sim cannot produce a
-///    comparable answer) render as `—` so a reader does not mistake an
+///    comparable answer) render as `-` so a reader does not mistake an
 ///    incomplete sim for genuine MCP/non-MCP parity.
-/// 2. **Per-language summary** — one row per language with fixture name,
+/// 2. **Per-language summary** - one row per language with fixture name,
 ///    file/symbol counts (extracted from the `qartez_map` preview when
 ///    present), aggregate savings, and the win/tie/non-MCP/error tally.
-/// 3. **Cross-language divergence** — for each tool, the savings range
+/// 3. **Cross-language divergence** - for each tool, the savings range
 ///    (max minus min across languages). Tools whose range exceeds
 ///    [`DIVERGENCE_HIGHLIGHT_PCT`] are flagged because the harness is
 ///    delivering meaningfully different signals per language and a reader
 ///    should investigate the per-language report before trusting the
 ///    aggregate.
-/// 4. **Known gotchas roll-up** — short hand-written notes per language
+/// 4. **Known gotchas roll-up** - short hand-written notes per language
 ///    pointing readers at the full per-language gotchas section. The
 ///    per-language gotchas were authored by four different agents with
 ///    slightly different formatting, so the roll-up is hard-coded here
@@ -1351,7 +1351,7 @@ pub fn render_cross_language_summary(reports: &[(String, BenchmarkReport)]) -> S
     out.push_str(&format!("- Languages: {}\n", reports.len()));
     out.push_str(
         "- Each row is one language profile; each tool is a column. \
-         Cells render `+xx.x%` MCP token savings; `—` means the non-MCP \
+         Cells render `+xx.x%` MCP token savings; `-` means the non-MCP \
          sim is incomplete for that scenario and the comparison is not \
          meaningful.\n",
     );
@@ -1365,22 +1365,22 @@ pub fn render_cross_language_summary(reports: &[(String, BenchmarkReport)]) -> S
     out.push('\n');
 
     if reports.is_empty() {
-        out.push_str("_No language reports supplied — nothing to summarize._\n");
+        out.push_str("_No language reports supplied - nothing to summarize._\n");
         return out;
     }
 
     let tools = collect_tool_order(reports);
 
-    out.push_str("## Section 1 — Headline savings matrix\n\n");
+    out.push_str("## Section 1 - Headline savings matrix\n\n");
     render_headline_matrix(&mut out, reports, &tools);
 
-    out.push_str("\n## Section 2 — Per-language summary\n\n");
+    out.push_str("\n## Section 2 - Per-language summary\n\n");
     render_per_language_summary(&mut out, reports);
 
-    out.push_str("\n## Section 3 — Cross-language divergence\n\n");
+    out.push_str("\n## Section 3 - Cross-language divergence\n\n");
     render_divergence_table(&mut out, reports, &tools);
 
-    out.push_str("\n## Section 4 — Known gotchas roll-up\n\n");
+    out.push_str("\n## Section 4 - Known gotchas roll-up\n\n");
     render_gotchas_rollup(&mut out, reports);
 
     out
@@ -1425,7 +1425,7 @@ fn render_headline_matrix(
         for t in tools {
             match by_tool.get(t) {
                 Some(Some(pct)) => out.push_str(&format!(" {pct:+.1}% |")),
-                Some(None) => out.push_str(" — |"),
+                Some(None) => out.push_str(" - |"),
                 None => out.push_str(" n/a |"),
             }
         }
@@ -1435,7 +1435,7 @@ fn render_headline_matrix(
 
 /// Maps each tool name to its first scenario's MCP savings percentage in
 /// the report, or `None` when the scenario is marked incomplete (so the
-/// caller renders it as `—`). When a tool appears more than once in a
+/// caller renders it as `-`). When a tool appears more than once in a
 /// report, only the first scenario is used; this matches the harness's
 /// "one canonical scenario per tool" expectation and keeps the headline
 /// matrix from blowing up into a multi-row mess for languages whose
@@ -1463,7 +1463,7 @@ fn render_per_language_summary(out: &mut String, reports: &[(String, BenchmarkRe
         let agg = aggregate_savings_pct(r);
         let agg_cell = match agg {
             Some(pct) => format!("{pct:+.1}%"),
-            None => "—".to_string(),
+            None => "-".to_string(),
         };
         let (files, symbols) = extract_files_symbols(r);
         let files_cell = files.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
@@ -1519,7 +1519,7 @@ fn aggregate_savings_pct(r: &BenchmarkReport) -> Option<f64> {
 /// `qartez_map_top5_concise` scenario's preview always begins with
 /// `<files> files, <symbols> symbols (` because that's the header the
 /// `format_concise` formatter writes. Parsing the preview is fragile by
-/// design — when the preview format changes the cells fall back to `?`,
+/// design - when the preview format changes the cells fall back to `?`,
 /// which the renderer treats as an unknown rather than crashing.
 fn extract_files_symbols(r: &BenchmarkReport) -> (Option<usize>, Option<usize>) {
     let Some(scenario) = r
@@ -1558,7 +1558,7 @@ fn parse_files_symbols(preview: &str) -> (Option<usize>, Option<usize>) {
 /// hand-renamed `reports/benchmark-zod-v4.json` still surfaces as
 /// `typescript`. The fixture-specific name (e.g. `zod`, `httpx`,
 /// `cobra`, `jackson-core`) is then derived from a hard-coded table
-/// — Wave 2 fixtures are pinned in `benchmarks/fixtures.toml` and only
+/// - Wave 2 fixtures are pinned in `benchmarks/fixtures.toml` and only
 /// change when the team explicitly bumps them, so a static map is the
 /// least-fragile place to store the mapping.
 fn fixture_name_for(label: &str, r: &BenchmarkReport) -> String {
@@ -1630,7 +1630,7 @@ fn render_divergence_table(
         "Sorted by `max − min` savings range across languages. \
          Rows where the range exceeds 20 percentage points are flagged \
          with `!!` and indicate scenarios where the harness gives a \
-         meaningfully different answer per language — typically a \
+         meaningfully different answer per language - typically a \
          hand-authored sim that misses the target language's idioms.\n\n",
     );
     out.push_str("| Tool | Range | Worst (lang / savings) | Best (lang / savings) | Flag |\n");
@@ -1694,7 +1694,7 @@ fn gotchas_for(language: &str) -> &'static [&'static str] {
         ],
         "python" => &[
             "`qartez_calls_build_overview` errors because the auto-resolver picks the `Response` *class* (the largest exported symbol of `httpx/_models.py`) and `qartez_calls` only walks function bodies.",
-            "Same Rust-regex problem hits `qartez_deps`, `qartez_unused`, and `qartez_rename_file` — non-MCP greps for `^use crate::` / `^pub` produce empty baselines.",
+            "Same Rust-regex problem hits `qartez_deps`, `qartez_unused`, and `qartez_rename_file` - non-MCP greps for `^use crate::` / `^pub` produce empty baselines.",
             "`qartez_unused` reports many helper functions because Python uses leading-underscore convention for export visibility; treat the list as a starting point for human review, not authoritative dead code.",
             "Hard-coded line ranges (`(260, 290)` etc.) over-read on small Python files; numbers are honest but weaker than Rust.",
         ],
@@ -1705,9 +1705,9 @@ fn gotchas_for(language: &str) -> &'static [&'static str] {
         ],
         "java" => &[
             "Java imports are file-external package paths, so the indexer emits zero cross-file edges and PageRank flattens to `1/N`. The profile ships a hand-coded `target_override` (`jackson_core_targets`) to keep scenarios deterministic.",
-            "Same Rust-regex story for `qartez_deps`, `qartez_context`, `qartez_impact`, `qartez_unused`, `qartez_rename_file` — Java imports start with `import tools.jackson.core.…`, never `use crate::`.",
+            "Same Rust-regex story for `qartez_deps`, `qartez_context`, `qartez_impact`, `qartez_unused`, `qartez_rename_file` - Java imports start with `import tools.jackson.core.…`, never `use crate::`.",
             "`qartez_refs` and `qartez_calls` show non-MCP wins on jackson-core because the chosen targets (`createParser`, `getValueAsBoolean`) have many short references that grep collects cheaply, while MCP collects full call graphs.",
-            "`qartez_project` returns 0 bytes because jackson-core's `pom.xml` is not a flat manifest the formatter recognizes — known limitation.",
+            "`qartez_project` returns 0 bytes because jackson-core's `pom.xml` is not a flat manifest the formatter recognizes - known limitation.",
         ],
         _ => &["No hand-written gotcha summary for this language; see the per-language report."],
     }
@@ -1831,10 +1831,10 @@ mod tests {
             ("rust".to_string(), rust),
             ("typescript".to_string(), ts),
         ]);
-        assert!(summary.contains("Section 1 — Headline savings matrix"));
-        assert!(summary.contains("Section 2 — Per-language summary"));
-        assert!(summary.contains("Section 3 — Cross-language divergence"));
-        assert!(summary.contains("Section 4 — Known gotchas roll-up"));
+        assert!(summary.contains("Section 1 - Headline savings matrix"));
+        assert!(summary.contains("Section 2 - Per-language summary"));
+        assert!(summary.contains("Section 3 - Cross-language divergence"));
+        assert!(summary.contains("Section 4 - Known gotchas roll-up"));
         assert!(summary.contains("`qartez_map`"));
     }
 
@@ -1880,9 +1880,9 @@ mod tests {
             "rust".to_string(),
         );
         let summary = render_cross_language_summary(&[("rust".to_string(), rust)]);
-        // The matrix renders the per-tool cell as `—` when the scenario
+        // The matrix renders the per-tool cell as `-` when the scenario
         // is incomplete, exactly as the per-language reports do.
-        assert!(summary.contains("| — |"));
+        assert!(summary.contains("| - |"));
     }
 
     #[test]
@@ -1944,7 +1944,7 @@ mod tests {
         );
         let md = render_markdown(&report);
         assert!(
-            md.contains("**Aggregate token savings vs Glob+Grep+Read: —**"),
+            md.contains("**Aggregate token savings vs Glob+Grep+Read: -**"),
             "zero-denominator headline missing: {md}"
         );
     }

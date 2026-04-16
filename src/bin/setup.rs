@@ -1,5 +1,5 @@
 // Rust guideline compliant 2026-04-15
-//! `qartez-setup` — interactive IDE auto-setup wizard.
+//! `qartez-setup` - interactive IDE auto-setup wizard.
 //!
 //! Detects installed IDEs, presents an interactive checkbox prompt, and
 //! configures MCP server entries for all selected IDEs. Replaces the seven
@@ -441,7 +441,7 @@ fn discover_prefixed_dirs(prefix: &str) -> Vec<PathBuf> {
 /// Claude config directory.
 ///
 /// Claude Code persists active MCP server entries here, and this file takes
-/// precedence over `settings.json` for accounts that have one — so we must
+/// precedence over `settings.json` for accounts that have one - so we must
 /// touch both to make qartez visible to the CLI on next launch.
 ///
 /// Path layout differs between the default account and named variants:
@@ -715,7 +715,7 @@ fn uninstall_ide(ide: Ide) -> anyhow::Result<()> {
 fn install_claude(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
     let dirs = discover_claude_dirs();
     if dirs.is_empty() {
-        // No Claude Code config dirs yet — bootstrap the default one so a
+        // No Claude Code config dirs yet - bootstrap the default one so a
         // first-time user still ends up with a working setup.
         let fallback = home_dir().join(".claude");
         install_claude_one(&fallback, bin, guard_bin)?;
@@ -2451,7 +2451,7 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Global gitignore applies regardless of which IDE was selected —
+    // Global gitignore applies regardless of which IDE was selected -
     // .qartez/ directories are created for any IDE, not just Claude Code.
     if let Err(e) = install_global_gitignore() {
         eprintln!(
@@ -2576,14 +2576,14 @@ fn update_cache_is_fresh() -> bool {
 }
 
 // Cross-process exclusion for the update path. Users frequently open many
-// Claude Code sessions at once — each starts qartez-mcp which spawns
+// Claude Code sessions at once - each starts qartez-mcp which spawns
 // qartez-setup --update-background. Without a lock, all of them would
 // race to the GitHub API and potentially to parallel install.sh rebuilds.
 //
 // Uses advisory flock on ~/.qartez/update.lock. The OS releases it on
 // process exit, so a crashed updater won't leave a dangling lock. The
 // returned file handle must be kept alive for the duration of the
-// critical section — dropping it releases the lock.
+// critical section - dropping it releases the lock.
 fn acquire_update_lock() -> Option<fs::File> {
     let path = home_dir().join(".qartez").join("update.lock");
     if let Some(parent) = path.parent() {
@@ -2662,7 +2662,7 @@ fn run_update(background: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Cross-process lock — only one qartez-setup update may run at a
+    // Cross-process lock - only one qartez-setup update may run at a
     // time across all Claude Code sessions. Other parallel invocations
     // skip silently; by the time they check the TTL on their next start,
     // the winning process will have touched the cache.
@@ -2674,7 +2674,7 @@ fn run_update(background: bool) -> anyhow::Result<()> {
         Some(f) => f,
         None => {
             if !background {
-                eprintln!("  Another qartez-setup update is already running — skipping.");
+                eprintln!("  Another qartez-setup update is already running - skipping.");
             }
             return Ok(());
         }
@@ -2700,7 +2700,7 @@ fn run_update(background: bool) -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "  {} qartez {} → {} — rebuilding from source...",
+        "  {} qartez {} → {} - rebuilding from source...",
         style("[+]").green(),
         current,
         latest.trim_start_matches('v'),
@@ -2866,7 +2866,7 @@ mod tests {
 
     #[test]
     fn is_newer_uses_numeric_component_order() {
-        // Lexical compare would say "0.1.2" > "0.1.10" — make sure we don't.
+        // Lexical compare would say "0.1.2" > "0.1.10" - make sure we don't.
         assert!(is_newer_version("0.1.10", "0.1.2"));
         assert!(is_newer_version("v0.2.0", "v0.1.99"));
         assert!(is_newer_version("v1.0.0", "v0.99.99"));

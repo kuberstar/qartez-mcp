@@ -2,7 +2,7 @@
 //!
 //! Fixture: `colinhacks/zod` pinned at `499df780` (a pnpm monorepo with the
 //! real schema-validation source under `packages/zod/src/**`). Scenario
-//! targets are resolved live from the `.qartez/` database — no override —
+//! targets are resolved live from the `.qartez/` database - no override -
 //! so every Wave 2 rebuild of the fixture automatically picks whichever
 //! top-PageRank file and smallest-unused function are indexed, without
 //! hand-maintaining a pinned list.
@@ -35,8 +35,8 @@
 //!   `(260, 290)` or `(2180, 2225)` that were chosen from Rust fixtures.
 //!   On TypeScript the ranges still point inside the real top file (zod's
 //!   `packages/zod/src/v4/core/errors.ts` is long enough), they just happen
-//!   to land on unrelated code. This actually stays honest — a real agent
-//!   without prior knowledge over-reads too — so we let the ranges stand.
+//!   to land on unrelated code. This actually stays honest - a real agent
+//!   without prior knowledge over-reads too - so we let the ranges stand.
 //! - **Auto-picked `qartez_rename_file` source**: the live target resolver
 //!   picks `README.md` (lowest-ranked file) as `rename_file_source`. The
 //!   MCP `qartez_rename_file` tool operates on that file and the non-MCP

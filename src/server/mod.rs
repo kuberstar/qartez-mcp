@@ -720,7 +720,7 @@ impl QartezServer {
 
     #[tool(
         name = "qartez_diff_impact",
-        description = "Batch impact analysis for a git diff range. Pass a revspec like 'main..HEAD' to get a unified report: changed files with PageRank, union blast radius, convergence points (files affected by 2+ changes), and co-change omissions (historically coupled files missing from the diff). Single call replaces N calls to qartez_impact + qartez_cochange.",
+        description = "Batch impact analysis for a git diff range. Pass a revspec like 'main..HEAD' to get a unified report: changed files with PageRank, union blast radius, convergence points (files affected by 2+ changes), and co-change omissions (historically coupled files missing from the diff). Pass risk=true to add per-file risk scoring (health, boundary violations, test coverage). Single call replaces N calls to qartez_impact + qartez_cochange.",
         annotations(
             title = "Diff Impact Analysis",
             read_only_hint = true,
@@ -830,6 +830,88 @@ impl QartezServer {
             max_b.cmp(max_a)
         });
 
+        // Per-file risk scoring (when risk=true).
+        // Each entry: (health, risk_score, boundary_violations, has_test_coverage)
+        let risk_data: Option<Vec<(f64, f64, usize, bool)>> = if params.risk.unwrap_or(false) {
+            use crate::graph::boundaries::{Violation, check_boundaries, load_config};
+
+            let all_files = read::get_all_files(&conn).unwrap_or_default();
+            let all_edges = read::get_all_edges(&conn).unwrap_or_default();
+            let id_to_path: HashMap<i64, &str> =
+                all_files.iter().map(|f| (f.id, f.path.as_str())).collect();
+
+            // Reverse adjacency for test coverage detection
+            let mut reverse: HashMap<i64, Vec<i64>> = HashMap::new();
+            for &(from, to) in &all_edges {
+                if from != to {
+                    reverse.entry(to).or_default().push(from);
+                }
+            }
+
+            // Boundary violations (best-effort: skip if no config file)
+            let boundary_path = self.project_root.join(".qartez/boundaries.toml");
+            let violations: Vec<Violation> = if boundary_path.exists() {
+                load_config(&boundary_path)
+                    .ok()
+                    .map(|cfg| {
+                        check_boundaries(&cfg, &all_files, &all_edges)
+                            .into_iter()
+                            .filter(|v| {
+                                changed_set.contains(v.from_file.as_str())
+                                    || changed_set.contains(v.to_file.as_str())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            // Health formula (same as hotspots)
+            let health_of = |max_cc: f64, coupling: f64, churn: i64| -> f64 {
+                let cc_h = 10.0 / (1.0 + max_cc / 10.0);
+                let coupling_h = 10.0 / (1.0 + coupling * 50.0);
+                let churn_h = 10.0 / (1.0 + churn as f64 / 8.0);
+                (cc_h + coupling_h + churn_h) / 3.0
+            };
+
+            let mut risks = Vec::new();
+            for file in &indexed {
+                let symbols = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
+                let max_cc = symbols
+                    .iter()
+                    .filter_map(|s| s.complexity)
+                    .max()
+                    .unwrap_or(0) as f64;
+                let health = health_of(max_cc, file.pagerank, file.change_count);
+
+                let bv_count = violations
+                    .iter()
+                    .filter(|v| v.from_file == file.path || v.to_file == file.path)
+                    .count();
+
+                let has_test = if is_test_path(&file.path) {
+                    true
+                } else {
+                    reverse.get(&file.id).is_some_and(|importers| {
+                        importers
+                            .iter()
+                            .any(|&imp_id| id_to_path.get(&imp_id).is_some_and(|p| is_test_path(p)))
+                    })
+                };
+
+                let risk = ((10.0 - health)
+                    + (bv_count.min(3) as f64 * 0.5)
+                    + if !has_test { 1.5 } else { 0.0 })
+                .clamp(0.0, 10.0);
+
+                risks.push((health, risk, bv_count, has_test));
+            }
+            Some(risks)
+        } else {
+            None
+        };
+
         if concise {
             let files_list = changed
                 .iter()
@@ -845,13 +927,24 @@ impl QartezServer {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let risk_tag = if let Some(ref risks) = risk_data {
+                let avg = if risks.is_empty() {
+                    0.0
+                } else {
+                    risks.iter().map(|(_, r, _, _)| r).sum::<f64>() / risks.len() as f64
+                };
+                format!(" | risk: {avg:.1}")
+            } else {
+                String::new()
+            };
             return Ok(format!(
-                "Diff: {} | {} files | blast union: {} | convergence: {} | omissions: {}\nFiles: {}\nOmissions: {}",
+                "Diff: {} | {} files | blast union: {} | convergence: {} | omissions: {}{}\nFiles: {}\nOmissions: {}",
                 params.base,
                 changed.len(),
                 direct_entries.len(),
                 convergence.len(),
                 omissions.len(),
+                risk_tag,
                 files_list,
                 if omissions.is_empty() {
                     "none".to_string()
@@ -868,20 +961,43 @@ impl QartezServer {
         );
 
         out.push_str("## Changed files\n");
-        out.push_str(" # | File                                | PageRank | Blast\n");
-        out.push_str("---+-------------------------------------+----------+------\n");
+        if risk_data.is_some() {
+            out.push_str(
+                " # | File                                | PageRank | Blast | Risk | Health\n",
+            );
+            out.push_str(
+                "---+-------------------------------------+----------+-------+------+-------\n",
+            );
+        } else {
+            out.push_str(" # | File                                | PageRank | Blast\n");
+            out.push_str("---+-------------------------------------+----------+------\n");
+        }
         let mut row_idx = 0usize;
         for (i, file) in indexed.iter().enumerate() {
             row_idx += 1;
             let blast_count = blast_results[i].transitive_importers.len();
-            out.push_str(&format!(
-                "{:>2} | {:<35} | {:>8.4} | {}{}\n",
-                row_idx,
-                truncate_path(&file.path, 35),
-                file.pagerank,
-                "->",
-                blast_count,
-            ));
+            if let Some(ref risks) = risk_data {
+                let (health, risk, _, _) = risks[i];
+                let blast_str = format!("->{blast_count}");
+                out.push_str(&format!(
+                    "{:>2} | {:<35} | {:>8.4} | {:<5} | {:>4.1} | {:>6.1}\n",
+                    row_idx,
+                    truncate_path(&file.path, 35),
+                    file.pagerank,
+                    blast_str,
+                    risk,
+                    health,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{:>2} | {:<35} | {:>8.4} | {}{}\n",
+                    row_idx,
+                    truncate_path(&file.path, 35),
+                    file.pagerank,
+                    "->",
+                    blast_count,
+                ));
+            }
         }
         for path in &not_indexed {
             row_idx += 1;
@@ -939,6 +1055,62 @@ impl QartezServer {
                     })
                     .collect();
                 out.push_str(&format!("  - {} ({})\n", partner, detail.join(", ")));
+            }
+        }
+
+        if let Some(ref risks) = risk_data {
+            let total_violations: usize = risks.iter().map(|(_, _, bv, _)| *bv).sum();
+            let untested: usize = indexed
+                .iter()
+                .zip(risks.iter())
+                .filter(|(f, (_, _, _, has_test))| !is_test_path(&f.path) && !has_test)
+                .count();
+            let non_test_count = indexed.iter().filter(|f| !is_test_path(&f.path)).count();
+            let avg_risk: f64 = if risks.is_empty() {
+                0.0
+            } else {
+                risks.iter().map(|(_, r, _, _)| r).sum::<f64>() / risks.len() as f64
+            };
+            let highest = risks.iter().enumerate().max_by(|a, b| {
+                a.1.1
+                    .partial_cmp(&b.1.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            out.push_str(&format!(
+                "\n## Risk summary\nOverall risk: {:.1} / 10\n",
+                avg_risk,
+            ));
+            if total_violations > 0 {
+                out.push_str(&format!(
+                    "Boundary violations: {} (in changed files)\n",
+                    total_violations,
+                ));
+            }
+            out.push_str(&format!(
+                "Untested files: {} / {}\n",
+                untested, non_test_count,
+            ));
+            if let Some((idx, (health, risk, bv, has_test))) = highest {
+                let mut reasons = Vec::new();
+                if *health < 4.0 {
+                    reasons.push("low health");
+                }
+                if !has_test && !is_test_path(&indexed[idx].path) {
+                    reasons.push("no test coverage");
+                }
+                if *bv > 0 {
+                    reasons.push("boundary violations");
+                }
+                if reasons.is_empty() {
+                    reasons.push("high coupling");
+                }
+                out.push_str(&format!(
+                    "Highest risk: {} ({:.1}) - {}\n",
+                    truncate_path(&indexed[idx].path, 40),
+                    risk,
+                    reasons.join(", "),
+                ));
             }
         }
 
@@ -1884,7 +2056,7 @@ impl QartezServer {
             ));
             out.push_str("```\n");
             let preview = if extracted_code.len() > 500 {
-                let end = extracted_code.floor_char_boundary(500);
+                let end = crate::str_utils::floor_char_boundary(&extracted_code, 500);
                 format!("{}...\n(truncated)", &extracted_code[..end])
             } else {
                 extracted_code.clone()
@@ -2342,6 +2514,48 @@ impl QartezServer {
             .map(|r| r.transitive_count as i64)
             .unwrap_or(0);
 
+        if is_mermaid(&params.format) {
+            let center_id = helpers::mermaid_node_id(&params.file_path);
+            let center_label = helpers::mermaid_label(&params.file_path);
+            let mut out = format!("graph LR\n  {center_id}[\"{center_label}\"]\n");
+            let max_nodes = 50;
+            let mut count = 0usize;
+            let mut seen_edges = HashSet::new();
+            for edge in &outgoing {
+                if count >= max_nodes {
+                    out.push_str("  mermaid_truncated[\"... truncated\"]\n");
+                    break;
+                }
+                if let Some(target) = read::get_file_by_id(&conn, edge.to_file).ok().flatten() {
+                    let tid = helpers::mermaid_node_id(&target.path);
+                    let edge_key = format!("{center_id}-->{tid}");
+                    if !seen_edges.insert(edge_key) {
+                        continue;
+                    }
+                    let tlabel = helpers::mermaid_label(&target.path);
+                    out.push_str(&format!("  {center_id} --> {tid}[\"{tlabel}\"]\n"));
+                    count += 1;
+                }
+            }
+            for edge in &incoming {
+                if count >= max_nodes {
+                    out.push_str("  mermaid_truncated[\"... truncated\"]\n");
+                    break;
+                }
+                if let Some(source) = read::get_file_by_id(&conn, edge.from_file).ok().flatten() {
+                    let sid = helpers::mermaid_node_id(&source.path);
+                    let edge_key = format!("{sid}-->{center_id}");
+                    if !seen_edges.insert(edge_key) {
+                        continue;
+                    }
+                    let slabel = helpers::mermaid_label(&source.path);
+                    out.push_str(&format!("  {sid}[\"{slabel}\"] --> {center_id}\n"));
+                    count += 1;
+                }
+            }
+            return Ok(out);
+        }
+
         if concise {
             let out_paths: Vec<String> = outgoing
                 .iter()
@@ -2591,6 +2805,16 @@ impl QartezServer {
                 "'{}' exists but is not a function/method",
                 params.name
             ));
+        }
+
+        if is_mermaid(&params.format) {
+            return self.qartez_calls_mermaid(
+                &params.name,
+                &func_symbols,
+                &all_files,
+                want_callers,
+                want_callees,
+            );
         }
 
         let mut out = String::new();
@@ -3302,6 +3526,749 @@ impl QartezServer {
     }
 
     #[tool(
+        name = "qartez_smells",
+        description = "Detect code smells: god functions (high complexity + long body), long parameter lists (too many args), and feature envy (methods that call another type more than their own). Thresholds are configurable. Feature envy detection relies on owner_type, which is only well-populated for Rust and Java.",
+        annotations(
+            title = "Code Smell Detection",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_smells(
+        &self,
+        Parameters(params): Parameters<SoulSmellsParams>,
+    ) -> Result<String, String> {
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+        let limit = params.limit.unwrap_or(30) as usize;
+        let concise = matches!(params.format, Some(Format::Concise));
+
+        // Thresholds with defaults
+        let min_cc = params.min_complexity.unwrap_or(15);
+        let min_lines = params.min_lines.unwrap_or(50);
+        let min_params = params.min_params.unwrap_or(5) as usize;
+        let envy_ratio = params.envy_ratio.unwrap_or(2.0);
+
+        // Parse requested smell kinds
+        let requested: Vec<&str> = match &params.kind {
+            Some(k) => k.split(',').map(|s| s.trim()).collect(),
+            None => vec!["god_function", "long_params", "feature_envy"],
+        };
+        let detect_god = requested.contains(&"god_function");
+        let detect_params = requested.contains(&"long_params");
+        let detect_envy = requested.contains(&"feature_envy");
+
+        // Load symbols with file paths, optionally scoped to one file
+        let all_symbols = if let Some(ref fp) = params.file_path {
+            let resolved = self.safe_resolve(fp).map_err(|e| e.to_string())?;
+            let rel = resolved
+                .strip_prefix(&self.project_root)
+                .unwrap_or(&resolved)
+                .to_string_lossy()
+                .to_string();
+            let file = read::get_file_by_path(&conn, &rel)
+                .map_err(|e| format!("DB error: {e}"))?
+                .ok_or_else(|| format!("File not found: {fp}"))?;
+            let syms =
+                read::get_symbols_for_file(&conn, file.id).map_err(|e| format!("DB error: {e}"))?;
+            syms.into_iter()
+                .map(|s| (s, rel.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?
+        };
+
+        let func_kinds = ["function", "method"];
+
+        // --- God Function detection ---
+        struct GodFunc {
+            name: String,
+            path: String,
+            cc: u32,
+            lines: u32,
+            line_start: u32,
+            line_end: u32,
+        }
+        let mut god_functions: Vec<GodFunc> = Vec::new();
+        if detect_god {
+            for (sym, path) in &all_symbols {
+                if !func_kinds.contains(&sym.kind.as_str()) {
+                    continue;
+                }
+                let cc = match sym.complexity {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let body_lines = sym.line_end.saturating_sub(sym.line_start) + 1;
+                if cc >= min_cc && body_lines >= min_lines {
+                    god_functions.push(GodFunc {
+                        name: sym.name.clone(),
+                        path: path.clone(),
+                        cc,
+                        lines: body_lines,
+                        line_start: sym.line_start,
+                        line_end: sym.line_end,
+                    });
+                }
+            }
+            god_functions.sort_by(|a, b| b.cc.cmp(&a.cc).then(b.lines.cmp(&a.lines)));
+        }
+
+        // --- Long Parameter List detection ---
+        struct LongParams {
+            name: String,
+            path: String,
+            param_count: usize,
+            signature: String,
+        }
+        let mut long_params: Vec<LongParams> = Vec::new();
+        if detect_params {
+            for (sym, path) in &all_symbols {
+                if !func_kinds.contains(&sym.kind.as_str()) {
+                    continue;
+                }
+                let sig = match &sym.signature {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let count = count_signature_params(sig);
+                if count >= min_params {
+                    long_params.push(LongParams {
+                        name: sym.name.clone(),
+                        path: path.clone(),
+                        param_count: count,
+                        signature: sig.clone(),
+                    });
+                }
+            }
+            long_params.sort_by(|a, b| b.param_count.cmp(&a.param_count));
+        }
+
+        // --- Feature Envy detection ---
+        struct FeatureEnvy {
+            name: String,
+            path: String,
+            own_type: String,
+            envied_type: String,
+            own_calls: usize,
+            external_calls: usize,
+            ratio: f64,
+        }
+        let mut feature_envy: Vec<FeatureEnvy> = Vec::new();
+        if detect_envy {
+            // Collect methods that have an owner_type
+            let methods_with_owner: Vec<&(crate::storage::models::SymbolRow, String)> = all_symbols
+                .iter()
+                .filter(|(s, _)| func_kinds.contains(&s.kind.as_str()) && s.owner_type.is_some())
+                .collect();
+
+            if !methods_with_owner.is_empty() {
+                // Build a symbol_id -> owner_type lookup from ALL symbols
+                // in the DB (not just the file-scoped subset) so we can
+                // resolve owner_type of call targets in other files.
+                let full_symbols =
+                    read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?;
+                let mut owner_lookup: std::collections::HashMap<i64, String> =
+                    std::collections::HashMap::new();
+                for (sym, _) in &full_symbols {
+                    if let Some(ref ot) = sym.owner_type {
+                        owner_lookup.insert(sym.id, ot.clone());
+                    }
+                }
+
+                for (sym, path) in &methods_with_owner {
+                    let own_type = sym.owner_type.as_ref().unwrap();
+
+                    // Query outgoing refs from this symbol
+                    let refs: Vec<i64> = conn
+                        .prepare_cached(
+                            "SELECT to_symbol_id FROM symbol_refs WHERE from_symbol_id = ?1",
+                        )
+                        .and_then(|mut stmt| {
+                            let rows = stmt.query_map([sym.id], |row| row.get(0))?;
+                            rows.collect()
+                        })
+                        .map_err(|e| format!("DB error: {e}"))?;
+
+                    if refs.is_empty() {
+                        continue;
+                    }
+
+                    let mut own_calls: usize = 0;
+                    let mut external_by_type: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+
+                    for to_id in &refs {
+                        match owner_lookup.get(to_id) {
+                            Some(target_type) if target_type == own_type => {
+                                own_calls += 1;
+                            }
+                            Some(target_type) => {
+                                *external_by_type.entry(target_type.clone()).or_insert(0) += 1;
+                            }
+                            None => {}
+                        }
+                    }
+
+                    // Check if any single external type exceeds the ratio
+                    for (ext_type, ext_count) in &external_by_type {
+                        let ratio = if own_calls == 0 {
+                            *ext_count as f64
+                        } else {
+                            *ext_count as f64 / own_calls as f64
+                        };
+                        if ratio >= envy_ratio && *ext_count >= 2 {
+                            feature_envy.push(FeatureEnvy {
+                                name: sym.name.clone(),
+                                path: (*path).clone(),
+                                own_type: own_type.clone(),
+                                envied_type: ext_type.clone(),
+                                own_calls,
+                                external_calls: *ext_count,
+                                ratio,
+                            });
+                        }
+                    }
+                }
+                feature_envy.sort_by(|a, b| {
+                    a.ratio
+                        .partial_cmp(&b.ratio)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .reverse()
+                });
+            }
+        }
+
+        let god_count = god_functions.len();
+        let params_count = long_params.len();
+        let envy_count = feature_envy.len();
+        let total = god_count + params_count + envy_count;
+        if total == 0 {
+            return Ok(
+                "No code smells detected with current thresholds. Adjust min_complexity, min_lines, min_params, or envy_ratio to widen the search."
+                    .to_string(),
+            );
+        }
+
+        // Apply global limit proportionally
+        let god_limit = (limit * god_count)
+            .checked_div(total)
+            .unwrap_or(limit)
+            .max(1);
+        let params_limit = (limit * params_count)
+            .checked_div(total)
+            .unwrap_or(limit)
+            .max(1);
+        let envy_limit = limit
+            .saturating_sub(god_limit)
+            .saturating_sub(params_limit)
+            .max(1);
+        god_functions.truncate(god_limit);
+        long_params.truncate(params_limit);
+        feature_envy.truncate(envy_limit);
+
+        let shown = god_functions.len() + long_params.len() + feature_envy.len();
+        let mut out = format!(
+            "# Code Smells ({total} found: {god_count} god functions, {params_count} long param lists, {envy_count} feature envy)\n\n",
+        );
+        if shown < total {
+            out.push_str(&format!(
+                "Showing {shown} of {total} (use limit= to see more).\n\n"
+            ));
+        }
+
+        // God Functions
+        if !god_functions.is_empty() {
+            if concise {
+                out.push_str("## God Functions\n");
+                for g in &god_functions {
+                    out.push_str(&format!(
+                        "  {} @ {} L{}-{} CC={} lines={}\n",
+                        g.name, g.path, g.line_start, g.line_end, g.cc, g.lines,
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "## God Functions (CC >= {min_cc} AND lines >= {min_lines})\n\n"
+                ));
+                out.push_str("| Symbol | File | CC | Lines | Range |\n");
+                out.push_str("|--------|------|----|-------|-------|\n");
+                for g in &god_functions {
+                    out.push_str(&format!(
+                        "| {} | {} | {} | {} | L{}-{} |\n",
+                        g.name, g.path, g.cc, g.lines, g.line_start, g.line_end,
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Long Parameter Lists
+        if !long_params.is_empty() {
+            if concise {
+                out.push_str("## Long Parameter Lists\n");
+                for lp in &long_params {
+                    out.push_str(&format!(
+                        "  {} @ {} params={}\n",
+                        lp.name, lp.path, lp.param_count,
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "## Long Parameter Lists (>= {min_params} params, excluding self)\n\n"
+                ));
+                out.push_str("| Symbol | File | Params | Signature |\n");
+                out.push_str("|--------|------|--------|-----------|\n");
+                for lp in &long_params {
+                    let sig_display = if lp.signature.len() > 80 {
+                        let end = crate::str_utils::floor_char_boundary(&lp.signature, 77);
+                        format!("{}...", &lp.signature[..end])
+                    } else {
+                        lp.signature.clone()
+                    };
+                    out.push_str(&format!(
+                        "| {} | {} | {} | `{}` |\n",
+                        lp.name, lp.path, lp.param_count, sig_display,
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Feature Envy
+        if !feature_envy.is_empty() {
+            if concise {
+                out.push_str("## Feature Envy\n");
+                for fe in &feature_envy {
+                    out.push_str(&format!(
+                        "  {} @ {} own={} ext={}({}) ratio={:.1}\n",
+                        fe.name, fe.path, fe.own_type, fe.envied_type, fe.external_calls, fe.ratio,
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "## Feature Envy (external/own ratio >= {envy_ratio:.1})\n\n"
+                ));
+                out.push_str(
+                    "| Symbol | File | Own Type | Envied Type | Own Calls | Ext Calls | Ratio |\n",
+                );
+                out.push_str(
+                    "|--------|------|----------|-------------|-----------|-----------|-------|\n",
+                );
+                for fe in &feature_envy {
+                    out.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {:.1} |\n",
+                        fe.name,
+                        fe.path,
+                        fe.own_type,
+                        fe.envied_type,
+                        fe.own_calls,
+                        fe.external_calls,
+                        fe.ratio,
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+
+    #[tool(
+        name = "qartez_test_gaps",
+        description = "Test-to-code mapping, coverage gap detection, and test suggestion for changes. Three modes: 'map' shows which test files cover which source files via import edges. 'gaps' (default) finds untested source files ranked by risk score (health * blast radius). 'suggest' takes a git diff range and returns which existing tests to run plus which changed files lack test coverage.",
+        annotations(
+            title = "Test Coverage Gaps",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_test_gaps(
+        &self,
+        Parameters(params): Parameters<SoulTestGapsParams>,
+    ) -> Result<String, String> {
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+        let limit = params.limit.unwrap_or(30) as usize;
+        let concise = is_concise(&params.format);
+        let mode = params.mode.as_deref().unwrap_or("gaps");
+
+        let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
+        let all_edges = read::get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
+
+        let id_to_file: HashMap<i64, &crate::storage::models::FileRow> =
+            all_files.iter().map(|f| (f.id, f)).collect();
+        let path_to_id: HashMap<&str, i64> =
+            all_files.iter().map(|f| (f.path.as_str(), f.id)).collect();
+
+        // Forward: file -> files it imports. Reverse: file -> files that import it.
+        let mut forward: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut reverse: HashMap<i64, Vec<i64>> = HashMap::new();
+        for &(from, to) in &all_edges {
+            if from != to {
+                forward.entry(from).or_default().push(to);
+                reverse.entry(to).or_default().push(from);
+            }
+        }
+
+        match mode {
+            "map" => {
+                // Build source -> tests mapping via import edges from test files
+                let mut source_to_tests: HashMap<&str, Vec<&str>> = HashMap::new();
+                let mut test_to_sources: HashMap<&str, Vec<&str>> = HashMap::new();
+
+                for file in &all_files {
+                    if !is_test_path(&file.path) {
+                        continue;
+                    }
+                    let imports = forward.get(&file.id).cloned().unwrap_or_default();
+                    for imp_id in imports {
+                        if let Some(imp_file) = id_to_file.get(&imp_id)
+                            && !is_test_path(&imp_file.path)
+                        {
+                            source_to_tests
+                                .entry(imp_file.path.as_str())
+                                .or_default()
+                                .push(file.path.as_str());
+                            test_to_sources
+                                .entry(file.path.as_str())
+                                .or_default()
+                                .push(imp_file.path.as_str());
+                        }
+                    }
+                }
+
+                if let Some(ref fp) = params.file_path {
+                    let resolved = self.safe_resolve(fp).map_err(|e| e.to_string())?;
+                    let rel = resolved
+                        .strip_prefix(&self.project_root)
+                        .unwrap_or(&resolved)
+                        .to_string_lossy()
+                        .to_string();
+
+                    if is_test_path(&rel) {
+                        let sources = test_to_sources
+                            .get(rel.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        if sources.is_empty() {
+                            return Ok(format!("Test file '{rel}' has no indexed source imports."));
+                        }
+                        let mut out = format!(
+                            "# Test coverage: {rel}\n\nImports {} source file(s):\n",
+                            sources.len(),
+                        );
+                        for src in sources.iter().take(limit) {
+                            out.push_str(&format!("  - {src}\n"));
+                        }
+                        return Ok(out);
+                    }
+
+                    let tests = source_to_tests
+                        .get(rel.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    if tests.is_empty() {
+                        return Ok(format!(
+                            "Source file '{rel}' has no test files importing it."
+                        ));
+                    }
+                    let mut out =
+                        format!("# Test coverage: {rel}\n\n{} test file(s):\n", tests.len(),);
+                    for t in tests.iter().take(limit) {
+                        out.push_str(&format!("  - {t}\n"));
+                    }
+                    if params.include_symbols.unwrap_or(false)
+                        && let Some(&file_id) = path_to_id.get(rel.as_str())
+                    {
+                        let symbols = read::get_symbols_for_file(&conn, file_id)
+                            .map_err(|e| format!("DB error: {e}"))?;
+                        let exported: Vec<_> = symbols.iter().filter(|s| s.is_exported).collect();
+                        if !exported.is_empty() {
+                            out.push_str(&format!("\n{} exported symbols:\n", exported.len(),));
+                            for sym in exported.iter().take(20) {
+                                out.push_str(&format!("  - {} ({})\n", sym.name, sym.kind));
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+
+                // Full mapping: source files with their test coverage
+                let mut entries: Vec<(&str, &Vec<&str>)> =
+                    source_to_tests.iter().map(|(&k, v)| (k, v)).collect();
+                entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+
+                let total_covered = entries.len();
+                let total_source = all_files.iter().filter(|f| !is_test_path(&f.path)).count();
+                let total_test = all_files.iter().filter(|f| is_test_path(&f.path)).count();
+
+                let mut out = format!(
+                    "# Test-to-source mapping\n\n{total_covered}/{total_source} source files covered by {total_test} test files\n\n",
+                );
+
+                if concise {
+                    for (src, tests) in entries.iter().take(limit) {
+                        out.push_str(&format!("  {} ({})\n", src, tests.len()));
+                    }
+                } else {
+                    for (src, tests) in entries.iter().take(limit) {
+                        out.push_str(&format!("- {} ({} tests)\n", src, tests.len()));
+                        for t in tests.iter().take(5) {
+                            out.push_str(&format!("    - {t}\n"));
+                        }
+                        if tests.len() > 5 {
+                            out.push_str(&format!("    ... and {} more\n", tests.len() - 5,));
+                        }
+                    }
+                }
+                if entries.len() > limit {
+                    out.push_str(&format!(
+                        "\n... and {} more (use limit= to see more)\n",
+                        entries.len() - limit,
+                    ));
+                }
+
+                Ok(out)
+            }
+            "gaps" => {
+                let min_pagerank = params.min_pagerank.unwrap_or(0.0);
+
+                // Pre-compute max complexity per file path
+                let all_syms =
+                    read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?;
+                let mut max_cc_by_path: HashMap<&str, u32> = HashMap::new();
+                for (sym, path) in &all_syms {
+                    if let Some(cc) = sym.complexity {
+                        let entry = max_cc_by_path.entry(path.as_str()).or_insert(0);
+                        if cc > *entry {
+                            *entry = cc;
+                        }
+                    }
+                }
+
+                // Health formula (same as hotspots/diff_impact)
+                let health_of = |max_cc: f64, coupling: f64, churn: i64| -> f64 {
+                    let cc_h = 10.0 / (1.0 + max_cc / 10.0);
+                    let coupling_h = 10.0 / (1.0 + coupling * 50.0);
+                    let churn_h = 10.0 / (1.0 + churn as f64 / 8.0);
+                    (cc_h + coupling_h + churn_h) / 3.0
+                };
+
+                let mut gaps: Vec<(&crate::storage::models::FileRow, f64)> = Vec::new();
+
+                for file in &all_files {
+                    if is_test_path(&file.path) || file.pagerank < min_pagerank {
+                        continue;
+                    }
+
+                    let has_test_importer = reverse.get(&file.id).is_some_and(|importers| {
+                        importers.iter().any(|&imp_id| {
+                            id_to_file
+                                .get(&imp_id)
+                                .is_some_and(|f| is_test_path(&f.path))
+                        })
+                    });
+
+                    if !has_test_importer {
+                        let max_cc =
+                            max_cc_by_path.get(file.path.as_str()).copied().unwrap_or(0) as f64;
+                        let health = health_of(max_cc, file.pagerank, file.change_count);
+                        let blast_count = reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
+                        let score = (10.0 - health) * (1.0 + blast_count as f64 / 10.0);
+                        gaps.push((file, score));
+                    }
+                }
+
+                gaps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                if gaps.is_empty() {
+                    return Ok(
+                        "No untested source files found. All source files have at least one test file importing them."
+                            .to_string(),
+                    );
+                }
+
+                let total_source = all_files.iter().filter(|f| !is_test_path(&f.path)).count();
+                let gap_count = gaps.len();
+                let shown = gap_count.min(limit);
+
+                let mut out = format!(
+                    "# Test coverage gaps ({gap_count}/{total_source} source files untested)\n\n",
+                );
+                if shown < gap_count {
+                    out.push_str(&format!(
+                        "Showing {shown} of {gap_count} (use limit= to see more).\n\n",
+                    ));
+                }
+
+                if concise {
+                    for (file, score) in gaps.iter().take(limit) {
+                        let blast = reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
+                        out.push_str(&format!(
+                            "  {} PR={:.4} blast={} score={:.1}\n",
+                            file.path, file.pagerank, blast, score,
+                        ));
+                    }
+                } else {
+                    out.push_str("| File | PageRank | Blast | Churn | Score |\n");
+                    out.push_str("|------|----------|-------|-------|-------|\n");
+                    for (file, score) in gaps.iter().take(limit) {
+                        let blast = reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
+                        out.push_str(&format!(
+                            "| {} | {:.4} | {} | {} | {:.1} |\n",
+                            truncate_path(&file.path, 40),
+                            file.pagerank,
+                            blast,
+                            file.change_count,
+                            score,
+                        ));
+                    }
+                }
+
+                Ok(out)
+            }
+            "suggest" => {
+                let base = params.base.as_deref().ok_or(
+                    "The 'suggest' mode requires a 'base' parameter (git diff range, e.g., 'main' or 'HEAD~3').",
+                )?;
+
+                let changed = crate::git::diff::changed_files_in_range(&self.project_root, base)
+                    .map_err(|e| format!("Git error: {e}"))?;
+
+                if changed.is_empty() {
+                    return Ok(format!("No files changed in range '{base}'."));
+                }
+
+                let changed_source: Vec<&str> = changed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|p| !is_test_path(p))
+                    .collect();
+                let changed_tests: Vec<&str> = changed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|p| is_test_path(p))
+                    .collect();
+
+                // For each changed source file, find connected test files
+                let mut tests_to_run: HashMap<String, Vec<String>> = HashMap::new();
+                let mut untested_sources: Vec<&str> = Vec::new();
+
+                for &src_path in &changed_source {
+                    let file_id = match path_to_id.get(src_path) {
+                        Some(&id) => id,
+                        None => {
+                            untested_sources.push(src_path);
+                            continue;
+                        }
+                    };
+
+                    guard::touch_ack(&self.project_root, src_path);
+
+                    let mut found_tests: Vec<String> = Vec::new();
+
+                    // Test files that import this source (reverse edges)
+                    if let Some(importers) = reverse.get(&file_id) {
+                        for &imp_id in importers {
+                            if let Some(imp_file) = id_to_file.get(&imp_id)
+                                && is_test_path(&imp_file.path)
+                            {
+                                found_tests.push(imp_file.path.clone());
+                            }
+                        }
+                    }
+
+                    // Co-change partners that are test files
+                    let cochanges = read::get_cochanges(&conn, file_id, 10).unwrap_or_default();
+                    for (_, partner) in &cochanges {
+                        if is_test_path(&partner.path) && !found_tests.contains(&partner.path) {
+                            found_tests.push(partner.path.clone());
+                        }
+                    }
+
+                    if found_tests.is_empty() {
+                        untested_sources.push(src_path);
+                    } else {
+                        for t in &found_tests {
+                            tests_to_run
+                                .entry(t.clone())
+                                .or_default()
+                                .push(src_path.to_string());
+                        }
+                    }
+                }
+
+                // Include directly changed test files
+                for &test_path in &changed_tests {
+                    if !tests_to_run.contains_key(test_path) {
+                        tests_to_run
+                            .entry(test_path.to_string())
+                            .or_default()
+                            .push("(directly changed)".into());
+                    }
+                    guard::touch_ack(&self.project_root, test_path);
+                }
+
+                let mut test_entries: Vec<(&String, &Vec<String>)> = tests_to_run.iter().collect();
+                test_entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+
+                let mut out = format!(
+                    "# Test suggestion for {base}\n\n{} changed files ({} source, {} test)\n\n",
+                    changed.len(),
+                    changed_source.len(),
+                    changed_tests.len(),
+                );
+
+                if test_entries.is_empty() && untested_sources.is_empty() {
+                    out.push_str("No test files found for the changed source files.\n");
+                    return Ok(out);
+                }
+
+                if !test_entries.is_empty() {
+                    out.push_str(&format!(
+                        "## Tests to run ({} test files)\n",
+                        test_entries.len(),
+                    ));
+                    if concise {
+                        for (test, sources) in test_entries.iter().take(limit) {
+                            out.push_str(&format!("  {} (covers {})\n", test, sources.len(),));
+                        }
+                    } else {
+                        for (test, sources) in test_entries.iter().take(limit) {
+                            out.push_str(&format!("- {}\n", test));
+                            for src in sources.iter().take(5) {
+                                out.push_str(&format!("    covers: {src}\n"));
+                            }
+                            if sources.len() > 5 {
+                                out.push_str(&format!("    ... and {} more\n", sources.len() - 5,));
+                            }
+                        }
+                    }
+                    out.push('\n');
+                }
+
+                if !untested_sources.is_empty() {
+                    out.push_str(&format!(
+                        "## Untested changes ({} source files need new tests)\n",
+                        untested_sources.len(),
+                    ));
+                    for src in untested_sources.iter().take(limit) {
+                        out.push_str(&format!("  - {src}\n"));
+                    }
+                }
+
+                Ok(out)
+            }
+            _ => Err(format!(
+                "Unknown mode '{mode}'. Use 'map', 'gaps', or 'suggest'."
+            )),
+        }
+    }
+
+    #[tool(
         name = "qartez_wiki",
         description = "Generate a markdown architecture wiki from Leiden-style community detection on the import graph. Partitions files into clusters, names each by the shared path prefix or top-PageRank file, and emits ARCHITECTURE.md with per-cluster file lists, top exported symbols, and inter-cluster edges. Use write_to=null to return the markdown as a string, or write_to=<path> to save to disk. Resolution controls cluster granularity (default 1.0; higher = more clusters).",
         annotations(
@@ -3534,6 +4501,15 @@ impl QartezServer {
         let transitive = params.transitive.unwrap_or(false);
         const DEFAULT_MAX_DEPTH: u32 = 20;
         let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+
+        if is_mermaid(&params.format) {
+            return self.qartez_hierarchy_mermaid(
+                &params.symbol,
+                &direction,
+                transitive,
+                max_depth,
+            );
+        }
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
@@ -3944,6 +4920,194 @@ impl QartezServer {
     }
 
     #[tool(
+        name = "qartez_knowledge",
+        description = "Git-blame-based authorship analysis: find single-author files, knowledge silos, and bus factor per module. Bus factor = minimum authors who own >50% of lines. Use level='file' for per-file breakdown or level='module' for per-directory summary. Useful before modifying code with concentrated ownership.",
+        annotations(
+            title = "Knowledge / Bus Factor",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn qartez_knowledge(
+        &self,
+        Parameters(params): Parameters<SoulKnowledgeParams>,
+    ) -> Result<String, String> {
+        if self.git_depth == 0 {
+            return Err(
+                "Knowledge analysis requires git history. Re-index with --git-depth > 0.".into(),
+            );
+        }
+
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+        let limit = params.limit.unwrap_or(20) as usize;
+        let concise = matches!(params.format, Some(Format::Concise));
+        let level = params.level.unwrap_or(KnowledgeLevel::File);
+
+        let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
+
+        let file_paths: Vec<String> = if let Some(ref prefix) = params.file_path {
+            all_files
+                .iter()
+                .filter(|f| f.path.starts_with(prefix.as_str()))
+                .map(|f| f.path.clone())
+                .collect()
+        } else {
+            all_files.iter().map(|f| f.path.clone()).collect()
+        };
+
+        if file_paths.is_empty() {
+            return Ok(format!(
+                "No indexed files match '{}'.",
+                params.file_path.as_deref().unwrap_or("*"),
+            ));
+        }
+
+        drop(conn);
+
+        let file_authorships = crate::git::knowledge::analyze_knowledge(
+            &self.project_root,
+            &file_paths,
+            params.author.as_deref(),
+        )
+        .map_err(|e| format!("knowledge analysis failed: {e}"))?;
+
+        if file_authorships.is_empty() {
+            return Ok("No blame data available. Ensure the repository has commit history.".into());
+        }
+
+        match level {
+            KnowledgeLevel::File => {
+                let mut files = file_authorships;
+                // Sort: lowest bus factor first (riskiest), then largest file.
+                files.sort_by(|a, b| {
+                    a.bus_factor
+                        .cmp(&b.bus_factor)
+                        .then(b.total_lines.cmp(&a.total_lines))
+                });
+                files.truncate(limit);
+
+                if concise {
+                    let mut out = String::from("# bus_factor lines authors file\n");
+                    for (i, f) in files.iter().enumerate() {
+                        let author_list: Vec<&str> =
+                            f.authors.iter().map(|(n, _)| n.as_str()).collect();
+                        out.push_str(&format!(
+                            "{} {} {} {} {}\n",
+                            i + 1,
+                            f.bus_factor,
+                            f.total_lines,
+                            author_list.join(";"),
+                            f.path,
+                        ));
+                    }
+                    Ok(out)
+                } else {
+                    let total_analyzed = file_paths.len();
+                    let single_author_count = files.iter().filter(|f| f.bus_factor == 1).count();
+                    let mut out = format!(
+                        "# Knowledge / Bus Factor (file level)\n\n\
+                         Analyzed {} files. Showing top {} by risk (lowest bus factor first).\n\
+                         Single-author files in view: {}\n\n",
+                        total_analyzed,
+                        files.len(),
+                        single_author_count,
+                    );
+                    out.push_str(
+                        "  # | BF | Lines | File                               | Top Authors\n",
+                    );
+                    out.push_str(
+                        "----+----+-------+------------------------------------+------------\n",
+                    );
+                    for (i, f) in files.iter().enumerate() {
+                        let top: Vec<String> = f
+                            .authors
+                            .iter()
+                            .take(3)
+                            .map(|(name, lines)| {
+                                let pct = if f.total_lines > 0 {
+                                    *lines as f64 / f.total_lines as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                format!("{name} ({pct:.0}%)")
+                            })
+                            .collect();
+                        out.push_str(&format!(
+                            "{:>3} | {:>2} | {:>5} | {:<34} | {}\n",
+                            i + 1,
+                            f.bus_factor,
+                            f.total_lines,
+                            truncate_path(&f.path, 34),
+                            top.join(", "),
+                        ));
+                    }
+                    Ok(out)
+                }
+            }
+            KnowledgeLevel::Module => {
+                let mut modules = crate::git::knowledge::rollup_modules(&file_authorships);
+                modules.truncate(limit);
+
+                if modules.is_empty() {
+                    return Ok("No module data available.".into());
+                }
+
+                if concise {
+                    let mut out =
+                        String::from("# bus_factor files single_author_files lines module\n");
+                    for (i, m) in modules.iter().enumerate() {
+                        out.push_str(&format!(
+                            "{} {} {} {} {} {}\n",
+                            i + 1,
+                            m.bus_factor,
+                            m.file_count,
+                            m.single_author_files,
+                            m.total_lines,
+                            m.module,
+                        ));
+                    }
+                    Ok(out)
+                } else {
+                    let mut out = String::from(
+                        "# Knowledge / Bus Factor (module level)\n\n\
+                         Bus factor = minimum authors to cover >50% of lines. Lower = riskier.\n\n",
+                    );
+                    out.push_str("  # | BF | Files | Solo | Lines | Module                          | Top Authors\n");
+                    out.push_str("----+----+-------+------+-------+---------------------------------+------------\n");
+                    for (i, m) in modules.iter().enumerate() {
+                        let top: Vec<String> = m
+                            .top_authors
+                            .iter()
+                            .take(3)
+                            .map(|(name, lines)| {
+                                let pct = if m.total_lines > 0 {
+                                    *lines as f64 / m.total_lines as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                format!("{name} ({pct:.0}%)")
+                            })
+                            .collect();
+                        out.push_str(&format!(
+                            "{:>3} | {:>2} | {:>5} | {:>4} | {:>5} | {:<31} | {}\n",
+                            i + 1,
+                            m.bus_factor,
+                            m.file_count,
+                            m.single_author_files,
+                            m.total_lines,
+                            truncate_path(&m.module, 31),
+                            top.join(", "),
+                        ));
+                    }
+                    Ok(out)
+                }
+            }
+        }
+    }
+
+    #[tool(
         name = "qartez_tools",
         description = "Discover and enable additional Qartez tools. Call with no arguments to see all available tiers and tools. Use enable/disable to dynamically add or remove tool tiers or individual tools. Tier names: 'core' (always on), 'analysis', 'refactor', 'meta'. Pass 'all' to enable everything.",
         annotations(
@@ -4169,20 +5333,322 @@ fn qartez_semantic_dispatch(
     )
 }
 
-#[cfg(feature = "benchmark")]
+/// Count the number of parameters in a function signature string, excluding
+/// receiver params (`self`, `&self`, `&mut self` in Rust, `self`/`cls` in
+/// Python). Handles nested generics (`HashMap<K, V>`) and nested parens so
+/// commas inside type parameters are not miscounted.
+fn count_signature_params(sig: &str) -> usize {
+    // Find the first '(' and its matching ')'
+    let start = match sig.find('(') {
+        Some(i) => i + 1,
+        None => return 0,
+    };
+    let mut depth: u32 = 1;
+    let mut end = start;
+    for (i, &byte) in sig.as_bytes().iter().enumerate().skip(start) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let params_str = sig[start..end].trim();
+    if params_str.is_empty() {
+        return 0;
+    }
+    // Split by commas, respecting angle brackets `<>` and nested parens
+    let mut params = Vec::new();
+    let mut angle_depth: u32 = 0;
+    let mut paren_depth: u32 = 0;
+    let mut seg_start = 0;
+    for (i, ch) in params_str.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            ',' if angle_depth == 0 && paren_depth == 0 => {
+                params.push(params_str[seg_start..i].trim());
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    params.push(params_str[seg_start..].trim());
+    // Filter out receiver params and empty segments
+    params
+        .into_iter()
+        .filter(|p| {
+            if p.is_empty() {
+                return false;
+            }
+            // Rust receiver variants
+            let base = p.split(':').next().unwrap_or(p).trim();
+            !matches!(base, "self" | "&self" | "&mut self" | "mut self" | "cls")
+        })
+        .count()
+}
+
 impl QartezServer {
+    /// Render call hierarchy as a Mermaid flowchart.
+    fn qartez_calls_mermaid(
+        &self,
+        target_name: &str,
+        func_symbols: &[&(
+            crate::storage::models::SymbolRow,
+            crate::storage::models::FileRow,
+        )],
+        all_files: &[crate::storage::models::FileRow],
+        want_callers: bool,
+        want_callees: bool,
+    ) -> Result<String, String> {
+        let max_nodes = 50;
+        let mut out = String::from("graph TD\n");
+        let target_id = helpers::mermaid_node_id(target_name);
+        let target_label = helpers::mermaid_label(target_name);
+        out.push_str(&format!("  {target_id}[\"{target_label}\"]\n"));
+
+        let mut count = 0usize;
+        let mut seen_edges = HashSet::new();
+
+        for (sym, def_file) in func_symbols {
+            if want_callers {
+                for file in all_files {
+                    if count >= max_nodes {
+                        break;
+                    }
+                    let source = match self.cached_source(&file.path) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if !source.contains(target_name) {
+                        continue;
+                    }
+                    let calls = self.cached_calls(&file.path);
+                    let has_call = calls.iter().any(|(name, _)| name == target_name);
+                    if !has_call {
+                        continue;
+                    }
+                    let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                    let file_syms = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
+                    drop(conn);
+                    let matching_lines: Vec<usize> = calls
+                        .iter()
+                        .filter(|(name, _)| name == target_name)
+                        .map(|(_, l)| *l)
+                        .collect();
+                    for line in &matching_lines {
+                        if count >= max_nodes {
+                            break;
+                        }
+                        let enclosing = file_syms
+                            .iter()
+                            .filter(|s| {
+                                s.line_start as usize <= *line
+                                    && *line <= s.line_end as usize
+                                    && matches!(
+                                        s.kind.as_str(),
+                                        "function" | "method" | "constructor"
+                                    )
+                            })
+                            .max_by_key(|s| s.line_start)
+                            .map(|s| s.name.clone());
+                        let caller = enclosing.as_deref().unwrap_or("(top-level)");
+                        let cid = helpers::mermaid_node_id(caller);
+                        let edge_key = format!("{cid}-->{target_id}");
+                        if !seen_edges.insert(edge_key) {
+                            continue;
+                        }
+                        let clabel = helpers::mermaid_label(caller);
+                        out.push_str(&format!("  {cid}[\"{clabel}\"] --> {target_id}\n"));
+                        count += 1;
+                    }
+                }
+            }
+
+            if want_callees {
+                let all_calls = self.cached_calls(&def_file.path);
+                let start = sym.line_start as usize;
+                let end = sym.line_end as usize;
+                let mut seen = HashSet::new();
+                for (name, line) in all_calls.iter() {
+                    if count >= max_nodes {
+                        break;
+                    }
+                    if *line < start || *line > end {
+                        continue;
+                    }
+                    if !seen.insert(name.clone()) {
+                        continue;
+                    }
+                    let cid = helpers::mermaid_node_id(name);
+                    let clabel = helpers::mermaid_label(name);
+                    out.push_str(&format!("  {target_id} --> {cid}[\"{clabel}\"]\n"));
+                    count += 1;
+                }
+            }
+        }
+
+        if count >= max_nodes {
+            out.push_str("  truncated[\"... truncated\"]\n");
+        }
+        Ok(out)
+    }
+
+    /// Render type hierarchy as a Mermaid flowchart.
+    fn qartez_hierarchy_mermaid(
+        &self,
+        symbol: &str,
+        direction: &str,
+        transitive: bool,
+        max_depth: u32,
+    ) -> Result<String, String> {
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+        let max_nodes = 50;
+        let mut count = 0usize;
+
+        match direction {
+            "sub" | "down" | "implementors" => {
+                let rows =
+                    read::get_subtypes(&conn, symbol).map_err(|e| format!("DB error: {e}"))?;
+                if rows.is_empty() {
+                    return Ok(format!(
+                        "No types found that implement or extend '{symbol}'."
+                    ));
+                }
+                let mut out = String::from("graph TD\n");
+                let root_id = helpers::mermaid_node_id(symbol);
+                let root_label = helpers::mermaid_label(symbol);
+                out.push_str(&format!("  {root_id}[\"{root_label}\"]\n"));
+
+                for (rel, _) in &rows {
+                    if count >= max_nodes {
+                        out.push_str("  truncated[\"... truncated\"]\n");
+                        break;
+                    }
+                    let sid = helpers::mermaid_node_id(&rel.sub_name);
+                    let slabel = helpers::mermaid_label(&rel.sub_name);
+                    out.push_str(&format!(
+                        "  {sid}[\"{slabel}\"] -->|{kind}| {root_id}\n",
+                        kind = rel.kind
+                    ));
+                    count += 1;
+                }
+
+                if transitive {
+                    let mut visited: HashSet<String> = HashSet::new();
+                    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+                    for (rel, _) in &rows {
+                        if visited.insert(rel.sub_name.clone()) {
+                            queue.push_back((rel.sub_name.clone(), 1));
+                        }
+                    }
+                    while let Some((name, depth)) = queue.pop_front() {
+                        if depth > max_depth || count >= max_nodes {
+                            break;
+                        }
+                        let sub_rows = read::get_subtypes(&conn, &name)
+                            .map_err(|e| format!("DB error: {e}"))?;
+                        for (rel, _) in sub_rows {
+                            if count >= max_nodes {
+                                out.push_str("  truncated[\"... truncated\"]\n");
+                                break;
+                            }
+                            if visited.insert(rel.sub_name.clone()) {
+                                queue.push_back((rel.sub_name.clone(), depth + 1));
+                                let sid = helpers::mermaid_node_id(&rel.sub_name);
+                                let slabel = helpers::mermaid_label(&rel.sub_name);
+                                let pid = helpers::mermaid_node_id(&name);
+                                out.push_str(&format!(
+                                    "  {sid}[\"{slabel}\"] -->|{kind}| {pid}\n",
+                                    kind = rel.kind
+                                ));
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+
+                Ok(out)
+            }
+            "super" | "up" | "supertypes" => {
+                let rows =
+                    read::get_supertypes(&conn, symbol).map_err(|e| format!("DB error: {e}"))?;
+                if rows.is_empty() {
+                    return Ok(format!("No supertypes found for '{symbol}'."));
+                }
+                let mut out = String::from("graph BT\n");
+                let root_id = helpers::mermaid_node_id(symbol);
+                let root_label = helpers::mermaid_label(symbol);
+                out.push_str(&format!("  {root_id}[\"{root_label}\"]\n"));
+
+                for (rel, _) in &rows {
+                    if count >= max_nodes {
+                        out.push_str("  truncated[\"... truncated\"]\n");
+                        break;
+                    }
+                    let sid = helpers::mermaid_node_id(&rel.super_name);
+                    let slabel = helpers::mermaid_label(&rel.super_name);
+                    out.push_str(&format!(
+                        "  {root_id} -->|{kind}| {sid}[\"{slabel}\"]\n",
+                        kind = rel.kind
+                    ));
+                    count += 1;
+                }
+
+                if transitive {
+                    let mut visited: HashSet<String> = HashSet::new();
+                    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+                    for (rel, _) in &rows {
+                        if visited.insert(rel.super_name.clone()) {
+                            queue.push_back((rel.super_name.clone(), 1));
+                        }
+                    }
+                    while let Some((name, depth)) = queue.pop_front() {
+                        if depth > max_depth || count >= max_nodes {
+                            break;
+                        }
+                        let sup_rows = read::get_supertypes(&conn, &name)
+                            .map_err(|e| format!("DB error: {e}"))?;
+                        for (rel, _) in sup_rows {
+                            if count >= max_nodes {
+                                out.push_str("  truncated[\"... truncated\"]\n");
+                                break;
+                            }
+                            if visited.insert(rel.super_name.clone()) {
+                                queue.push_back((rel.super_name.clone(), depth + 1));
+                                let sid = helpers::mermaid_node_id(&rel.super_name);
+                                let slabel = helpers::mermaid_label(&rel.super_name);
+                                let pid = helpers::mermaid_node_id(&name);
+                                out.push_str(&format!(
+                                    "  {pid} -->|{kind}| {sid}[\"{slabel}\"]\n",
+                                    kind = rel.kind
+                                ));
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+
+                Ok(out)
+            }
+            _ => Err(format!(
+                "Invalid direction '{direction}'. Use 'sub' or 'super'."
+            )),
+        }
+    }
+
     /// Dispatch a tool call by name with JSON arguments.
     ///
-    /// Provides a single in-process entry point so the benchmark harness can
-    /// invoke any tool without going through the rmcp stdio transport,
-    /// keeping latency measurements free of JSON-RPC framing overhead.
-    // The `qartez-mcp` binary itself never calls this — only the
-    // `benchmark` binary does — so per-bin dead_code analysis sees it as
-    // unused when compiling the main server. Suppressing at this scope.
-    #[allow(
-        dead_code,
-        reason = "called only from the feature-gated benchmark binary"
-    )]
+    /// Provides a single in-process entry point so the CLI and benchmark
+    /// harness can invoke any tool without going through the rmcp stdio
+    /// transport.
     pub fn call_tool_by_name(
         &self,
         name: &str,
@@ -4292,6 +5758,16 @@ impl QartezServer {
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
                 self.qartez_clones(Parameters(p))
             }
+            "qartez_smells" => {
+                let p: SoulSmellsParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_smells(Parameters(p))
+            }
+            "qartez_test_gaps" => {
+                let p: SoulTestGapsParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_test_gaps(Parameters(p))
+            }
             "qartez_boundaries" => {
                 let p: SoulBoundariesParams =
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -4314,6 +5790,11 @@ impl QartezServer {
             "qartez_semantic" => {
                 let p: SemanticParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
                 self.qartez_semantic(Parameters(p))
+            }
+            "qartez_knowledge" => {
+                let p: SoulKnowledgeParams =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                self.qartez_knowledge(Parameters(p))
             }
             "qartez_tools" => {
                 Err("qartez_tools is async-only (not available in benchmark mode)".to_owned())
@@ -4542,19 +6023,19 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_27() {
+    fn total_tool_count_is_30() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 27, "expected 27 tools, got {}", all.len());
+        assert_eq!(all.len(), 30, "expected 30 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 13, "analysis tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 16, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 3, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 2, "meta tier");
-        // 8 + 13 + 3 + 2 + 1 (qartez_tools) = 27
+        // 8 + 16 + 3 + 2 + 1 (qartez_tools) = 30
     }
 
     #[cfg(feature = "benchmark")]
@@ -4629,6 +6110,70 @@ mod safe_resolve_tests {
         let result = server.safe_resolve("../sibling/file.rs");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("escapes"));
+    }
+}
+
+#[cfg(test)]
+mod param_count_tests {
+    use super::count_signature_params;
+
+    #[test]
+    fn empty_params() {
+        assert_eq!(count_signature_params("fn foo()"), 0);
+    }
+
+    #[test]
+    fn simple_params() {
+        assert_eq!(count_signature_params("fn foo(a: i32, b: String)"), 2);
+    }
+
+    #[test]
+    fn excludes_self() {
+        assert_eq!(
+            count_signature_params("fn foo(&self, a: i32, b: String)"),
+            2
+        );
+        assert_eq!(count_signature_params("fn foo(&mut self, a: i32)"), 1);
+        assert_eq!(count_signature_params("fn foo(self)"), 0);
+        assert_eq!(count_signature_params("fn foo(mut self, x: u8)"), 1);
+    }
+
+    #[test]
+    fn nested_generics() {
+        assert_eq!(
+            count_signature_params("fn foo(map: HashMap<K, V>, list: Vec<String>)"),
+            2,
+        );
+        assert_eq!(
+            count_signature_params("fn foo(x: Result<Vec<u8>, Box<dyn Error>>)"),
+            1,
+        );
+    }
+
+    #[test]
+    fn many_params() {
+        assert_eq!(
+            count_signature_params("fn build(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32)"),
+            6,
+        );
+    }
+
+    #[test]
+    fn no_parens() {
+        assert_eq!(count_signature_params("struct Foo"), 0);
+    }
+
+    #[test]
+    fn excludes_python_cls() {
+        assert_eq!(count_signature_params("def foo(cls, bar, baz)"), 2);
+    }
+
+    #[test]
+    fn nested_parens_in_type() {
+        assert_eq!(
+            count_signature_params("fn foo(f: fn(i32) -> bool, x: i32)"),
+            2,
+        );
     }
 }
 

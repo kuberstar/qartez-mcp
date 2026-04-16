@@ -2,7 +2,7 @@
 set -e
 
 # Test suite for install.sh portability
-# Runs without Docker — tests error paths, edge cases, and POSIX compliance
+# Runs without Docker - tests error paths, edge cases, and POSIX compliance
 # Usage: ./tests/test-install.sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -100,7 +100,7 @@ check_no_pattern() {
     LABEL="$1"; PATTERN="$2"
     if grep -nE "$PATTERN" "$INSTALL_SH" >/dev/null 2>&1; then
         LINE=$(grep -nE "$PATTERN" "$INSTALL_SH" | head -1)
-        fail "bashism: $LABEL — $LINE"
+        fail "bashism: $LABEL - $LINE"
     else
         pass "no $LABEL"
     fi
@@ -341,7 +341,7 @@ HEREDOC
     fi
 else
     section "Docker tests"
-    skip "Docker not available — install Docker to run container tests"
+    skip "Docker not available - install Docker to run container tests"
 fi
 
 # ============================================================

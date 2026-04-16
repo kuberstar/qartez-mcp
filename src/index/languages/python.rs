@@ -5,6 +5,7 @@ use crate::index::symbols::{
     ExtractedImport, ExtractedReference, ExtractedRelation, ExtractedSymbol, ParseResult,
     ReferenceKind, RelationKind, SymbolKind,
 };
+use crate::str_utils::floor_char_boundary;
 
 pub struct PythonSupport;
 
@@ -177,7 +178,7 @@ fn extract_from_node(
 
 /// Emit a reference for the node shapes Python cares about. The Python
 /// grammar merges "function call" and "constructor call" into a single
-/// `call` node — there is no dedicated `new_expression` — so a single
+/// `call` node - there is no dedicated `new_expression` - so a single
 /// match arm covers both.
 fn record_reference(
     node: Node,
@@ -490,7 +491,7 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
         return None;
     }
     let truncated = if first_line.len() > 200 {
-        &first_line[..first_line.floor_char_boundary(200)]
+        &first_line[..floor_char_boundary(first_line, 200)]
     } else {
         first_line
     };

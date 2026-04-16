@@ -69,7 +69,7 @@ impl super::QartezServer {
             ));
         } else {
             out.push_str(&format!(
-                "# Codebase: {} ({} files, {} symbols indexed) -- by symbols\n\n",
+                "# Codebase: {} ({} files, {} symbols indexed) - by symbols\n\n",
                 self.project_name(),
                 file_count,
                 symbol_count,

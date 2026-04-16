@@ -50,7 +50,7 @@ pub struct SymbolRefRow {
     pub id: i64,
     pub from_symbol_id: i64,
     pub to_symbol_id: i64,
-    /// Either "call", "use", or "type" — matches `ReferenceKind::as_str`.
+    /// Either "call", "use", or "type" - matches `ReferenceKind::as_str`.
     pub kind: String,
 }
 
@@ -65,7 +65,7 @@ pub struct SymbolInsert {
     pub shape_hash: Option<String>,
     /// True when this symbol sits inside a `impl Trait for Type` block or
     /// `macro_invocation` span. These symbols should never be reported as
-    /// "unused" — trait-impl methods are called dynamically, macro-generated
+    /// "unused" - trait-impl methods are called dynamically, macro-generated
     /// items are hidden from file-level imports. Pre-computed here so
     /// `qartez_unused` does not re-walk the tree at query time.
     pub unused_excluded: bool,

@@ -168,7 +168,7 @@ pub fn render_wiki(conn: &Connection, config: &WikiConfig) -> Result<(String, Op
     out.push_str("## Table of contents\n\n");
     for (i, view) in views.iter().enumerate() {
         out.push_str(&format!(
-            "{}. [{}](#{}) — {} files, PageRank sum {:.3}\n",
+            "{}. [{}](#{}) - {} files, PageRank sum {:.3}\n",
             i + 1,
             view.label,
             anchor(&view.label),
@@ -331,7 +331,7 @@ fn collect_top_symbols(
 /// "misc"; otherwise the heuristic is, in order:
 ///
 /// 1. Longest common path prefix of depth ≥ 2 (so `src/graph` wins).
-/// 2. Most common second-level directory — when files straddle `src/`
+/// 2. Most common second-level directory - when files straddle `src/`
 ///    (e.g. a cluster containing `src/error.rs`, `src/storage/*`,
 ///    `src/graph/*`), this picks `src/storage` because that is the modal
 ///    subdirectory and a reader recognises it faster than the top file
@@ -514,7 +514,7 @@ fn current_date() -> String {
 fn format_ymd(epoch_secs: i64) -> String {
     // Conway's "Doomsday"-free rendering: convert UTC epoch to YYYY-MM-DD
     // without pulling a full date crate. The calendar is cheap because we
-    // only need days, not hours — the wiki header is static metadata.
+    // only need days, not hours - the wiki header is static metadata.
     let days = epoch_secs.div_euclid(86_400);
     let (year, month, day) = days_to_ymd(days);
     format!("{year:04}-{month:02}-{day:02}")

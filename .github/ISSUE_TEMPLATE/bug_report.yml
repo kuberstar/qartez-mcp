@@ -1,0 +1,112 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in Qartez MCP.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this bug. Please fill in the details below so we can investigate and fix it.
+
+  - type: checkboxes
+    id: existing-issue
+    attributes:
+      label: Pre-flight checklist
+      description: Please confirm the following before submitting.
+      options:
+        - label: I have searched the existing issues and this bug has not been reported yet.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Walk us through how to trigger this bug.
+      placeholder: |
+        1. Run `qartez ...`
+        2. Open an issue form in your editor
+        3. Observe the error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: What actually happened instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Which OS are you running Qartez on?
+      multiple: true
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: qartez-version
+    attributes:
+      label: Qartez version
+      description: Output of `qartez --version` or the version in your config.
+      placeholder: "e.g. 0.4.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: editor
+    attributes:
+      label: Editor or IDE
+      description: Which editor or IDE are you using Qartez with?
+      multiple: true
+      options:
+        - Claude Code (CLI)
+        - VS Code (Copilot / Continue / other)
+        - Cursor
+        - Windsurf
+        - Zed
+        - Neovim
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Paste any relevant log output or error messages. This will be formatted as a code block automatically.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else that might help us understand or reproduce the issue (screenshots, config snippets, related issues).
+    validations:
+      required: false

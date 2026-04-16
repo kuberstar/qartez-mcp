@@ -1,4 +1,4 @@
-//! `qartez-guard` — PreToolUse hook binary for Claude Code.
+//! `qartez-guard` - PreToolUse hook binary for Claude Code.
 //!
 //! Reads a Claude Code PreToolUse hook payload on stdin. If the target file
 //! is load-bearing (PageRank or transitive blast radius above the configured
@@ -121,7 +121,7 @@ fn run() -> anyhow::Result<()> {
         .map(|r| r.transitive_count as i64)
         .unwrap_or(0);
 
-    // Top hot symbols inside this file — powers the enriched deny message
+    // Top hot symbols inside this file - powers the enriched deny message
     // so Claude sees exactly which symbols the guard thinks are load-bearing
     // before it decides to call `qartez_impact`. Fail-open: an error here must
     // never block the edit, so swallow and continue with an empty list.
