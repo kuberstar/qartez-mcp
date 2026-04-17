@@ -27,11 +27,20 @@ section() { printf "\n${BLUE}--- %s ---${NC}\n" "$1"; }
 section "File integrity"
 # ============================================================
 
+INSTALL_PS1="$PROJECT_DIR/install.ps1"
+
 # 1. install.sh exists and is executable
 if [ -x "$INSTALL_SH" ]; then
     pass "install.sh is executable"
 else
     fail "install.sh is not executable (chmod +x install.sh)"
+fi
+
+# 1b. install.ps1 exists for native Windows install
+if [ -f "$INSTALL_PS1" ]; then
+    pass "install.ps1 exists (native Windows installer)"
+else
+    fail "install.ps1 missing (native Windows installer required)"
 fi
 
 # 2. Shebang is #!/bin/sh (not bash)
@@ -54,6 +63,8 @@ if command -v shellcheck >/dev/null 2>&1; then
     SC_OUT=$(shellcheck -s sh "$INSTALL_SH" 2>&1) || true
     if [ -z "$SC_OUT" ]; then
         pass "shellcheck clean (POSIX sh)"
+    elif echo "$SC_OUT" | grep -q 'openBinaryFile: does not exist'; then
+        skip "shellcheck unavailable for current path format"
     else
         fail "shellcheck issues: $SC_OUT"
     fi
@@ -141,6 +152,24 @@ check_error_path "cargo post-install check" "cargo not found.*after"
 check_error_path "binary not found"       "Binary not found"
 check_error_path "PATH warning"           "not on your PATH"
 check_error_path "PATH fix suggestion"    'export PATH='
+
+# Windows installer static checks
+check_ps1_path() {
+    LABEL="$1"; PATTERN="$2"
+    if grep -Fq "$PATTERN" "$INSTALL_PS1" 2>/dev/null; then
+        pass "install.ps1: $LABEL"
+    else
+        fail "install.ps1 missing: $LABEL"
+    fi
+}
+
+check_ps1_path "supports interactive flag" 'Interactive'
+check_ps1_path "supports skip-setup flag" 'SkipSetup'
+check_ps1_path "installs to LOCALAPPDATA" 'LOCALAPPDATA'
+check_ps1_path "adds install dir to user PATH" "SetEnvironmentVariable('PATH'"
+check_ps1_path "builds release binaries" "@('build', '--release')"
+check_ps1_path "installs qartez binaries" "foreach (\$bin in @('qartez-mcp', 'qartez-guard', 'qartez-setup'))"
+check_ps1_path "adds .exe suffix for installed binaries" "\$bin + '.exe'"
 
 # ============================================================
 section "Download safety"

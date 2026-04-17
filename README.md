@@ -49,12 +49,22 @@ The fix isn't a smarter model. It's a smarter index.
 
 ## Quickstart
 
-**Prerequisites:** macOS or Linux (Windows via [WSL 2](https://learn.microsoft.com/en-us/windows/wsl/install)). Rust toolchain is installed automatically if missing.
+**Prerequisites:**
+- **macOS / Linux**: curl + POSIX shell (`sh`)
+- **Windows (native)**: PowerShell 5.1+ (or PowerShell 7+)
+
+Rust toolchain is installed automatically if missing.
 
 One command to install:
 
 ```bash
 curl -sSfL https://qartez.dev/install | sh
+```
+
+Windows (native PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "iwr https://qartez.dev/install.ps1 -useb | iex"
 ```
 
 The installer checks for Rust (installs via [rustup](https://rustup.rs/) if missing), builds the release binaries, installs them to `~/.local/bin/`, and launches `qartez-setup` in non-interactive mode - it auto-detects every MCP-capable IDE on your machine and configures them all in one pass, including the modification-guard hooks for Claude Code.

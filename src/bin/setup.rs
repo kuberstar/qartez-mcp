@@ -19,8 +19,6 @@ use dialoguer::MultiSelect;
 
 // -- Embedded hook assets (source of truth lives in scripts/) ----------------
 
-const GUARD_HOOK_SH: &str = include_str!("../../scripts/qartez-guard.sh");
-const SESSION_START_SH: &str = include_str!("../../scripts/qartez-session-start.sh");
 const CLAUDE_MD_SNIPPET: &str = include_str!("../../scripts/CLAUDE.md.snippet");
 const AGENTS_MD_SNIPPET: &str = include_str!("../../scripts/AGENTS.md.snippet");
 const CURSOR_RULE_MDC: &str = include_str!("../../scripts/cursor-rule.mdc");
@@ -793,17 +791,9 @@ fn install_claude_one(claude_dir: &Path, bin: &str, _guard_bin: Option<&str>) ->
 
     info(&format!("» {}", claude_dir.display()));
 
-    // 1. Install hook scripts
-    fs::create_dir_all(&hooks_dir)?;
-    let guard_sh = hooks_dir.join("qartez-guard.sh");
-    fs::write(&guard_sh, GUARD_HOOK_SH)?;
-    make_executable(&guard_sh)?;
-    info(&format!("Hook installed: {}", guard_sh.display()));
-
-    let session_sh = hooks_dir.join("qartez-session-start.sh");
-    fs::write(&session_sh, SESSION_START_SH)?;
-    make_executable(&session_sh)?;
-    info(&format!("Hook installed: {}", session_sh.display()));
+    // Remove legacy shell hook wrappers. Hooks are configured to invoke
+    // binaries directly, so shell scripts are no longer required.
+    remove_legacy_hook_files(&hooks_dir)?;
 
     // 2. Configure settings.json
     ensure_parent(&settings_path)?;
@@ -1051,17 +1041,9 @@ fn install_gemini_one(gemini_dir: &Path, bin: &str, _guard_bin: Option<&str>) ->
 
     info(&format!("» {}", gemini_dir.display()));
 
-    // 1. Install hook scripts
-    fs::create_dir_all(&hooks_dir)?;
-    let guard_sh = hooks_dir.join("qartez-guard.sh");
-    fs::write(&guard_sh, GUARD_HOOK_SH)?;
-    make_executable(&guard_sh)?;
-    info(&format!("Hook installed: {}", guard_sh.display()));
-
-    let session_sh = hooks_dir.join("qartez-session-start.sh");
-    fs::write(&session_sh, SESSION_START_SH)?;
-    make_executable(&session_sh)?;
-    info(&format!("Hook installed: {}", session_sh.display()));
+    // Remove legacy shell hook wrappers. Hooks are configured to invoke
+    // binaries directly, so shell scripts are no longer required.
+    remove_legacy_hook_files(&hooks_dir)?;
 
     // 2. Configure settings.json
     ensure_parent(&settings_path)?;
@@ -1155,7 +1137,12 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
 
     info(&format!("» {}", gemini_dir.display()));
 
-    for name in ["qartez-guard.sh", "qartez-session-start.sh"] {
+    for name in [
+        "qartez-guard.sh",
+        "qartez-session-start.sh",
+        "qartez-guard.ps1",
+        "qartez-session-start.ps1",
+    ] {
         let path = hooks_dir.join(name);
         if path.is_file() {
             fs::remove_file(&path)?;
@@ -1496,7 +1483,12 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
     info(&format!("» {}", claude_dir.display()));
 
     // Remove hook files
-    for name in ["qartez-guard.sh", "qartez-session-start.sh"] {
+    for name in [
+        "qartez-guard.sh",
+        "qartez-session-start.sh",
+        "qartez-guard.ps1",
+        "qartez-session-start.ps1",
+    ] {
         let path = hooks_dir.join(name);
         if path.is_file() {
             fs::remove_file(&path)?;
@@ -1581,6 +1573,22 @@ fn remove_hook_entries_containing(
             settings["hooks"][hook_type] = serde_json::Value::Array(filtered);
         }
     }
+}
+
+fn remove_legacy_hook_files(hooks_dir: &Path) -> anyhow::Result<()> {
+    for name in [
+        "qartez-guard.sh",
+        "qartez-session-start.sh",
+        "qartez-guard.ps1",
+        "qartez-session-start.ps1",
+    ] {
+        let path = hooks_dir.join(name);
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            info(&format!("Legacy hook removed: {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 // -- Cursor / Windsurf (shared JSON mcpServers pattern) ----------------------
@@ -2441,21 +2449,6 @@ fn current_codex_binary(content: &str) -> Option<String> {
     None
 }
 
-// -- Platform helpers --------------------------------------------------------
-
-#[cfg(unix)]
-fn make_executable(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o755);
-    fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 // -- Main --------------------------------------------------------------------
 
 fn main() -> ExitCode {
@@ -2974,6 +2967,13 @@ mod tests {
     // Serializes tests that mutate process-global env vars ($HOME, $PATH).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     struct EnvGuard {
         key: &'static str,
         original: Option<std::ffi::OsString>,
@@ -3002,7 +3002,7 @@ mod tests {
 
     #[test]
     fn update_cache_missing_is_not_fresh() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         assert!(!update_cache_is_fresh());
@@ -3010,7 +3010,7 @@ mod tests {
 
     #[test]
     fn update_cache_fresh_after_touch() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         touch_update_cache();
@@ -3019,7 +3019,7 @@ mod tests {
 
     #[test]
     fn update_cache_stale_when_mtime_exceeds_ttl() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         touch_update_cache();
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[test]
     fn acquire_lock_succeeds_and_creates_file() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         let lock = acquire_update_lock();
@@ -3048,8 +3048,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn acquire_lock_returns_none_for_unwritable_lock_file() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         let dir = tmp.path().join(".qartez");
@@ -3072,7 +3073,7 @@ mod tests {
 
     #[test]
     fn lock_released_on_drop_allows_reacquire() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         {
@@ -3106,6 +3107,58 @@ mod tests {
         assert!(is_newer_version("v1.0.1-beta", "1.0.0"));
     }
 
+    #[test]
+    fn install_claude_removes_legacy_shell_hooks_and_uses_binary_session_start() {
+        let _mu = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+
+        let claude_dir = tmp.path().join(".claude");
+        let hooks = claude_dir.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("qartez-guard.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(hooks.join("qartez-session-start.sh"), "#!/bin/sh\n").unwrap();
+
+        install_claude_one(&claude_dir, "qartez-mcp", None).unwrap();
+
+        assert!(!hooks.join("qartez-guard.sh").exists());
+        assert!(!hooks.join("qartez-session-start.sh").exists());
+
+        let settings = read_json(&claude_dir.join("settings.json")).unwrap();
+        let session_cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(session_cmd.contains("qartez-setup"));
+        assert!(session_cmd.contains("--session-start"));
+        assert!(!session_cmd.contains(".sh"));
+    }
+
+    #[test]
+    fn install_gemini_removes_legacy_shell_hooks_and_uses_binary_session_start() {
+        let _mu = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+
+        let gemini_dir = tmp.path().join(".gemini");
+        let hooks = gemini_dir.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("qartez-guard.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(hooks.join("qartez-session-start.sh"), "#!/bin/sh\n").unwrap();
+
+        install_gemini_one(&gemini_dir, "qartez-mcp", None).unwrap();
+
+        assert!(!hooks.join("qartez-guard.sh").exists());
+        assert!(!hooks.join("qartez-session-start.sh").exists());
+
+        let settings = read_json(&gemini_dir.join("settings.json")).unwrap();
+        let session_cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(session_cmd.contains("qartez-setup"));
+        assert!(session_cmd.contains("--session-start"));
+        assert!(!session_cmd.contains(".sh"));
+    }
+
     // -- Mock curl for fetch_latest_release_tag ----------------------------
 
     #[cfg(unix)]
@@ -3127,7 +3180,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fetch_release_tag_parses_valid_github_response() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_mock_curl(tmp.path(), r#"{"tag_name": "v0.2.0"}"#);
         let orig = std::env::var("PATH").unwrap_or_default();
@@ -3138,7 +3191,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fetch_release_tag_rejects_invalid_json() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_mock_curl(tmp.path(), "not json");
         let orig = std::env::var("PATH").unwrap_or_default();
@@ -3149,7 +3202,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fetch_release_tag_rejects_missing_tag_name() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_mock_curl(tmp.path(), r#"{"name": "Release"}"#);
         let orig = std::env::var("PATH").unwrap_or_default();
@@ -3160,7 +3213,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fetch_release_tag_returns_error_on_curl_failure() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_mock_curl_failing(tmp.path(), 22);
         let orig = std::env::var("PATH").unwrap_or_default();

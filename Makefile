@@ -5,6 +5,7 @@ BENCH_RUN    = $(CARGO) run --quiet --release --features benchmark --bin benchma
 BENCH_LANGS := rust typescript python go java
 
 .PHONY: help test test-install build install deploy setup uninstall clean \
+        deploy-windows install-windows setup-windows \
         bench bench-all bench-fixtures
 
 help: ## Show this help
@@ -13,6 +14,9 @@ help: ## Show this help
 
 deploy: ## Full deploy: install deps, build, install, configure IDEs
 	@./install.sh
+
+deploy-windows: ## Full deploy on Windows PowerShell
+	@powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 test: ## Run all tests
 	$(CARGO) test
@@ -41,6 +45,12 @@ install: build ## Build and install binaries to ~/.local/bin
 
 setup: ## Interactive IDE setup wizard (install deps + build + choose IDEs)
 	@./install.sh --interactive
+
+setup-windows: ## Interactive setup on Windows PowerShell
+	@powershell -ExecutionPolicy Bypass -File .\install.ps1 -Interactive
+
+install-windows: ## Build/install only on Windows PowerShell (skip IDE setup)
+	@powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipSetup
 
 uninstall: ## Remove qartez from all IDEs and uninstall binaries
 	@$(INSTALL_DIR)/qartez-setup --uninstall 2>/dev/null || true
