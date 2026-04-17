@@ -131,7 +131,7 @@ Configure a specific subset of IDEs only. Detected paths:
 | Goose | `~/.config/goose/config.yaml` |
 | Warp | `~/.warp/mcp_settings.json` |
 | Augment | `~/.augment/settings.json` |
-| OpenCode | `~/.config/opencode/opencode.json` |
+| OpenCode | `~/.config/opencode/opencode.json` (or `opencode.jsonc`) |
 | Codex CLI | `~/.codex/config.toml` |
 | Antigravity | `~/.gemini/antigravity/mcp_config.json` |
 
