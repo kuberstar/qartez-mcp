@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.2] - 2026-04-17
+
+### Added
+
+- **Pre-built release binaries** - tagged `v*` pushes now trigger a GitHub Actions matrix that builds and attaches archives for macOS (arm64, x86_64), Linux (x86_64/aarch64, gnu and musl), and Windows (x86_64) plus a single `SHA256SUMS` manifest, so the installer no longer has to compile from source on every machine.
+
+### Changed
+
+- **`install.sh` / `install.ps1` bootstrap pre-built binaries first** - the installer detects the host target, downloads the matching archive from the latest GitHub Release, verifies the SHA-256 checksum, and installs atomically. First-run time drops from the old 2-5 minute cargo build to under 10 seconds on supported platforms. `--from-source` / `-FromSource` forces the previous cargo path, and any unsupported target or download failure falls through to cargo build automatically. A SHA-256 mismatch is treated as a hard failure (never falls through to source) so tampered or corrupted downloads cannot silently be masked.
+- **`install.ps1` binary list corrected** - the Windows installer now references the `qartez`, `qartez-guard`, `qartez-setup` binaries declared in `Cargo.toml` instead of a non-existent `qartez-mcp.exe`.
+
 ## [0.7.1] - 2026-04-17
 
 ### Added
@@ -37,6 +48,11 @@
 - **Windows index keys always forward-slash** - normalized every boundary that writes or resolves index paths (ingest/reingest/delete, TS/JS/Rust/Python/Go/Dart resolvers, walker), resolving 26 Windows-only test failures observed in v0.6.0 CI.
 - **MCP tool path input accepts either separator on Windows** - `get_file_by_path` and the file-path filters in `qartez_knowledge`, `qartez_read`, `qartez_security`, `qartez_smells`, and `qartez_test_gaps` now normalize user input so `src\foo.rs` matches the forward-slash DB key without a confusing "File not found".
 - **Guard tolerates Windows canonicalization variants** - the hot-file guard now probes `/`, `\`, and `./` prefix variants before fail-open, so the Edit/Write deny decision matches the indexed path on Windows.
+
+### Contributors
+
+- **Zir** ([@Zireael](https://github.com/Zireael)) - native Windows installer, hook portability, CI validation, and qartez-skill guard contract / host parity improvements (#10, #11)
+- **josh** ([@ninthhousestudios](https://github.com/ninthhousestudios)) - architecture, tools, configuration, and agent-guide documentation suite (#12)
 
 ## [0.6.0] - 2026-04-17
 
@@ -130,7 +146,7 @@
 
 ### Contributors
 
-- **Matt** ([@corbym](https://github.com/corbym)) - fix for unbounded database growth on large codebases
+- **Matt** ([@corbym](https://github.com/corbym)) - fix for unbounded database growth on large codebases (#9)
 
 ## [0.3.0] - 2026-04-15
 
@@ -167,8 +183,8 @@
 
 ### Contributors
 
-- **josh** ([@josh](https://github.com/josh)) - Dart/Flutter support, resolver improvements, background indexing
-- **Rudolf Troger** ([@DolphRoger](https://github.com/DolphRoger)) - Gemini CLI support
+- **josh** ([@ninthhousestudios](https://github.com/ninthhousestudios)) - Dart/Flutter support, resolver improvements, background indexing (#5, #6, #7)
+- **Rudolf Troger** ([@DolphRoger](https://github.com/DolphRoger)) - Gemini CLI support with automated setup and hooks (#1)
 
 ## [0.2.0] - 2026-04-15
 

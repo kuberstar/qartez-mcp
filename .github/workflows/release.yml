@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.7.2)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.xz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.xz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.xz
+          # musl targets disabled: libgit2-sys/libssh2-sys pull openssl-sys,
+          # which cannot find OpenSSL on the default musl builder. Users on
+          # Alpine/musl hit install.sh's source-build fallback automatically.
+          # TODO: enable by disabling git2 default features or using vendored
+          # openssl, then add back to the matrix.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Ensure Rust target installed
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Cache cargo registry / git / target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux musl targets)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::unexpected tag format '$ref' - expected vX.Y.Z"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bins
+
+      - name: Stage archive contents
+        id: stage
+        shell: bash
+        run: |
+          set -eu
+          stem="qartez-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          staging="staging/$stem"
+          mkdir -p "$staging"
+          case "${{ matrix.target }}" in
+            *windows*)
+              cp "target/${{ matrix.target }}/release/qartez.exe" "$staging/"
+              cp "target/${{ matrix.target }}/release/qartez-guard.exe" "$staging/"
+              cp "target/${{ matrix.target }}/release/qartez-setup.exe" "$staging/"
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/qartez" "$staging/"
+              cp "target/${{ matrix.target }}/release/qartez-guard" "$staging/"
+              cp "target/${{ matrix.target }}/release/qartez-setup" "$staging/"
+              ;;
+          esac
+          cp LICENSE "$staging/"
+          cp README.md "$staging/"
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          echo "staging=$staging" >> "$GITHUB_OUTPUT"
+
+      - name: Package archive (tar.xz)
+        if: matrix.archive == 'tar.xz'
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          tar -C staging -cJf "dist/${{ steps.stage.outputs.stem }}.tar.xz" "${{ steps.stage.outputs.stem }}"
+
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path "staging/${{ steps.stage.outputs.stem }}" -DestinationPath "dist/${{ steps.stage.outputs.stem }}.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.stage.outputs.stem }}
+          path: dist/${{ steps.stage.outputs.stem }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: Generate SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -eu
+          shopt -s nullglob
+          files=(qartez-*.tar.xz qartez-*.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no release archives found under dist/"
+            exit 1
+          fi
+          sha256sum "${files[@]}" | sort -k 2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Attach assets to GitHub Release
+    needs: checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lah dist/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          tag_name: ${{ needs.checksums.outputs.tag }}
+          files: |
+            dist/qartez-*.tar.xz
+            dist/qartez-*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          append_body: false
+          draft: false
+          prerelease: false

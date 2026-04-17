@@ -52,7 +52,7 @@ The fix isn't a smarter model. It's a smarter index.
 
 ## Quickstart
 
-**Platform support:** macOS 13+, Ubuntu 22.04+ (and other modern Linux), Windows (native PowerShell 5.1+/7+) and WSL 2. Architectures: x86_64 and arm64. Rust MSRV is **1.88** - the installer fetches it via [rustup](https://rustup.rs/) if missing.
+**Platform support:** macOS 13+, Ubuntu 22.04+ (and other modern Linux, gnu or musl), Windows (native PowerShell 5.1+/7+) and WSL 2. Architectures: x86_64 and arm64. Rust MSRV is **1.88** - only needed for unsupported platforms or the `--from-source` escape hatch.
 
 ### Install (recommended)
 
@@ -60,7 +60,7 @@ The fix isn't a smarter model. It's a smarter index.
 curl -sSfL https://qartez.dev/install | sh
 ```
 
-The installer checks for Rust, builds the three release binaries (`qartez`, `qartez-guard`, `qartez-setup`), installs them to `~/.local/bin/`, and launches `qartez-setup` in non-interactive mode. The setup wizard auto-detects every MCP-capable IDE on your machine and configures them all in one pass, including the modification-guard hooks for Claude Code.
+The installer downloads a pre-built binary for your platform (under 10 seconds), verifies the SHA-256 checksum against the release's `SHA256SUMS`, installs the three binaries (`qartez`, `qartez-guard`, `qartez-setup`) to `~/.local/bin/`, and launches `qartez-setup` in non-interactive mode. Unsupported platforms fall back to a local `cargo build` automatically; pass `--from-source` (`-FromSource` on Windows) to force that path. The setup wizard auto-detects every MCP-capable IDE on your machine and configures them all in one pass, including the modification-guard hooks for Claude Code.
 
 Windows (native PowerShell):
 

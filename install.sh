@@ -2,8 +2,8 @@
 set -e
 
 # Qartez MCP - zero-dependency installer
-# Works on macOS (arm64/x86_64) and Linux (amd64/arm64/riscv64)
-# Only needs: curl or wget
+# Works on macOS (arm64/x86_64) and Linux (x86_64/aarch64, gnu or musl).
+# Only needs: curl or wget, plus tar.
 #
 # Usage:
 #   curl -sSfL https://qartez.dev/install | sh
@@ -11,8 +11,9 @@ set -e
 # Or from a checked-out repo:
 #   ./install.sh
 #
-# In curl|sh mode, the script downloads the latest source tarball into a
-# temp directory and builds from there.
+# By default this installer downloads a pre-built release binary for the
+# current platform. If no matching asset exists, or --from-source is passed,
+# it falls back to building from source with cargo.
 
 QARTEZ_REPO="kuberstar/qartez-mcp"
 QARTEZ_BRANCH="main"
@@ -30,12 +31,268 @@ ok()    { printf "${GREEN}[+]${NC} %s\n" "$1"; }
 warn()  { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
 err()   { printf "${RED}[!]${NC} %s\n" "$1" >&2; }
 
-# --- Preflight checks ---
+# --- Argument parsing ---
+FROM_SOURCE=0
+SETUP_MODE="yes"
+for arg in "$@"; do
+    case "$arg" in
+        --from-source) FROM_SOURCE=1 ;;
+        --interactive) SETUP_MODE="interactive" ;;
+        --skip-setup)  SETUP_MODE="skip" ;;
+    esac
+done
+
+# --- Preflight: network client ---
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     err "Neither curl nor wget found. Install one of them first."
     exit 1
 fi
 
+download() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSfL -o "$2" "$1"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
+# stdout-capturing fetch for small API responses and SHA files.
+fetch_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSfL "$1"
+    else
+        wget -qO - "$1"
+    fi
+}
+
+# --- Platform detection ---
+# Returns the Rust target triple for the running host, or empty if unknown.
+detect_target() {
+    uname_s=$(uname -s 2>/dev/null || echo unknown)
+    uname_m=$(uname -m 2>/dev/null || echo unknown)
+    case "$uname_s" in
+        Darwin)
+            case "$uname_m" in
+                arm64|aarch64) echo "aarch64-apple-darwin" ;;
+                x86_64)        echo "x86_64-apple-darwin" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        Linux)
+            libc="gnu"
+            if command -v ldd >/dev/null 2>&1; then
+                if ldd --version 2>&1 | grep -qi musl; then
+                    libc="musl"
+                fi
+            elif [ -f /etc/alpine-release ]; then
+                libc="musl"
+            fi
+            case "${uname_m}-${libc}" in
+                x86_64-gnu|amd64-gnu)   echo "x86_64-unknown-linux-gnu" ;;
+                x86_64-musl|amd64-musl) echo "x86_64-unknown-linux-musl" ;;
+                aarch64-gnu|arm64-gnu)   echo "aarch64-unknown-linux-gnu" ;;
+                aarch64-musl|arm64-musl) echo "aarch64-unknown-linux-musl" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# --- Binary install from release archive ---
+# Atomic: extract to temp, then `mv` onto the final path so concurrent
+# invocations never observe a half-written binary.
+install_binary() {
+    src="$1"; dst="$2"
+    cp "$src" "${dst}.new"
+    if [ "$(uname)" = "Darwin" ]; then
+        codesign -s - -f "${dst}.new" 2>/dev/null || true
+    fi
+    chmod +x "${dst}.new"
+    mv -f "${dst}.new" "$dst"
+}
+
+install_from_prebuilt() {
+    target="$1"
+
+    if ! command -v tar >/dev/null 2>&1; then
+        warn "tar not found - cannot extract release archive, falling back to source build."
+        return 1
+    fi
+
+    sha_cmd=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha_cmd="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        sha_cmd="shasum -a 256"
+    else
+        warn "Neither sha256sum nor shasum found - cannot verify checksum, falling back to source build."
+        return 1
+    fi
+
+    info "Resolving latest release tag for ${QARTEZ_REPO}..."
+    api_json=$(fetch_stdout "https://api.github.com/repos/${QARTEZ_REPO}/releases/latest" 2>/dev/null) || api_json=""
+    tag=$(printf '%s' "$api_json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -z "$tag" ]; then
+        warn "Could not resolve latest release tag (network error or API rate limit)."
+        return 1
+    fi
+    version=${tag#v}
+    ok "Latest release: ${tag}"
+
+    archive="qartez-${version}-${target}.tar.xz"
+    base_url="https://github.com/${QARTEZ_REPO}/releases/download/${tag}"
+    archive_url="${base_url}/${archive}"
+    sums_url="${base_url}/SHA256SUMS"
+
+    tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t qartez-install)
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$tmpdir\"" EXIT INT TERM
+
+    info "Downloading ${archive}..."
+    if ! download "$archive_url" "${tmpdir}/${archive}" 2>/dev/null; then
+        warn "No pre-built binary for target ${target} at ${tag} - falling back to source build."
+        return 1
+    fi
+
+    info "Verifying checksum..."
+    if ! download "$sums_url" "${tmpdir}/SHA256SUMS" 2>/dev/null; then
+        warn "SHA256SUMS not available at ${tag} - falling back to source build."
+        return 1
+    fi
+
+    expected=$(grep -E "  ${archive}\$" "${tmpdir}/SHA256SUMS" | awk '{print $1}')
+    if [ -z "$expected" ]; then
+        warn "Checksum for ${archive} missing from SHA256SUMS - falling back to source build."
+        return 1
+    fi
+
+    actual=$(cd "$tmpdir" && $sha_cmd "$archive" | awk '{print $1}')
+    if [ "$expected" != "$actual" ]; then
+        err "Checksum mismatch for ${archive}:"
+        err "  expected: $expected"
+        err "  actual:   $actual"
+        err "Refusing to install. This can indicate a corrupted download"
+        err "or a tampered release asset. Re-run to retry, or pass"
+        err "--from-source to build from source instead."
+        exit 1
+    fi
+    ok "Checksum verified"
+
+    info "Extracting archive..."
+    (cd "$tmpdir" && tar -xJf "$archive")
+    extract_dir="${tmpdir}/qartez-${version}-${target}"
+    if [ ! -d "$extract_dir" ]; then
+        err "Archive layout unexpected: ${extract_dir} not found"
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    for bin in qartez qartez-guard qartez-setup; do
+        if [ ! -f "${extract_dir}/${bin}" ]; then
+            err "Missing binary in archive: ${bin}"
+            return 1
+        fi
+        install_binary "${extract_dir}/${bin}" "${INSTALL_DIR}/${bin}"
+        size=$(wc -c < "${extract_dir}/${bin}" | awk '{printf "%.1f MB", $1/1048576}')
+        ok "Installed: ${INSTALL_DIR}/${bin} (${size})"
+    done
+    ln -sf qartez "${INSTALL_DIR}/qartez-mcp"
+    ok "Symlink: ${INSTALL_DIR}/qartez-mcp -> qartez"
+
+    trap - EXIT INT TERM
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# --- Source acquisition (curl|sh mode) ---
+# When invoked via `curl ... | sh`, $0 is "sh" and SCRIPT_DIR has no Cargo.toml.
+# Download the source tarball into a temp dir and build from there.
+fetch_source_tarball() {
+    if ! command -v tar >/dev/null 2>&1; then
+        err "tar not found - required to extract source tarball."
+        return 1
+    fi
+    info "Source not found locally - downloading from github.com/${QARTEZ_REPO}..."
+    QARTEZ_TMPDIR="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$QARTEZ_TMPDIR\"" EXIT INT TERM
+    download "https://codeload.github.com/${QARTEZ_REPO}/tar.gz/refs/heads/${QARTEZ_BRANCH}" "${QARTEZ_TMPDIR}/qartez.tar.gz" || return 1
+    tar -xzf "${QARTEZ_TMPDIR}/qartez.tar.gz" -C "$QARTEZ_TMPDIR" || return 1
+    SCRIPT_DIR="${QARTEZ_TMPDIR}/qartez-mcp-${QARTEZ_BRANCH}"
+    if [ ! -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+        err "Tarball layout unexpected: ${SCRIPT_DIR}/Cargo.toml not found"
+        return 1
+    fi
+    ok "Source extracted to ${SCRIPT_DIR}"
+}
+
+run_setup() {
+    case "$SETUP_MODE" in
+        interactive)
+            info "Launching interactive IDE setup..."
+            "${INSTALL_DIR}/qartez-setup"
+            ;;
+        skip)
+            info "Skipping IDE setup (--skip-setup)."
+            ;;
+        *)
+            info "Configuring all detected IDEs..."
+            "${INSTALL_DIR}/qartez-setup" --yes
+            ;;
+    esac
+}
+
+warn_path() {
+    case ":${PATH}:" in
+        *":${INSTALL_DIR}:"*) ;;
+        *)
+            warn "${INSTALL_DIR} is not on your PATH."
+            SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+            case "$SHELL_NAME" in
+                zsh)  PROFILE="\$HOME/.zshrc" ;;
+                bash) PROFILE="\$HOME/.bashrc" ;;
+                fish) PROFILE="\$HOME/.config/fish/config.fish" ;;
+                *)    PROFILE="\$HOME/.profile" ;;
+            esac
+            warn "Add to ${PROFILE}:"
+            warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+    esac
+}
+
+# --- Pre-built fast path ---
+# Running from a checked-out repo with `./install.sh` always builds from
+# source - that is the dev workflow, and downloading pre-builts would mask
+# the local tree. For remote `curl|sh` invocations, try the pre-built
+# archive first and fall through to source if anything goes wrong.
+LOCAL_REPO=0
+if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+    LOCAL_REPO=1
+fi
+
+if [ "$FROM_SOURCE" -eq 0 ] && [ "$LOCAL_REPO" -eq 0 ]; then
+    TARGET=$(detect_target)
+    if [ -z "$TARGET" ]; then
+        warn "Could not detect a supported target triple for this platform - falling back to source build."
+    else
+        info "Detected target: ${TARGET}"
+        if install_from_prebuilt "$TARGET"; then
+            run_setup
+            ok "Deploy complete. Restart your IDEs to pick up MCP changes."
+            warn_path
+            exit 0
+        fi
+    fi
+else
+    if [ "$FROM_SOURCE" -eq 1 ]; then
+        info "Forced source build (--from-source)."
+    fi
+fi
+
+# --- Source build path (fallback and local dev) ---
 if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
     err "No C compiler found (cc, gcc, or clang)."
     err "Rust needs a linker to build. Install one first:"
@@ -58,33 +315,8 @@ if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! comm
     exit 1
 fi
 
-download() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -sSfL -o "$2" "$1"
-    else
-        wget -qO "$2" "$1"
-    fi
-}
-
-# --- Source acquisition (curl|sh mode) ---
-# When invoked via `curl ... | sh`, $0 is "sh" and SCRIPT_DIR has no Cargo.toml.
-# Download the source tarball into a temp dir and build from there.
-if [ -z "$SCRIPT_DIR" ] || [ ! -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-    if ! command -v tar >/dev/null 2>&1; then
-        err "tar not found - required to extract source tarball."
-        exit 1
-    fi
-    info "Source not found locally - downloading from github.com/${QARTEZ_REPO}..."
-    QARTEZ_TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$QARTEZ_TMPDIR"' EXIT INT TERM
-    download "https://codeload.github.com/${QARTEZ_REPO}/tar.gz/refs/heads/${QARTEZ_BRANCH}" "${QARTEZ_TMPDIR}/qartez.tar.gz"
-    tar -xzf "${QARTEZ_TMPDIR}/qartez.tar.gz" -C "$QARTEZ_TMPDIR"
-    SCRIPT_DIR="${QARTEZ_TMPDIR}/qartez-mcp-${QARTEZ_BRANCH}"
-    if [ ! -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-        err "Tarball layout unexpected: ${SCRIPT_DIR}/Cargo.toml not found"
-        exit 1
-    fi
-    ok "Source extracted to ${SCRIPT_DIR}"
+if [ "$LOCAL_REPO" -eq 0 ]; then
+    fetch_source_tarball || { err "Failed to download source tarball."; exit 1; }
 fi
 
 # --- Rust ---
@@ -98,7 +330,8 @@ elif [ -x "${HOME}/.cargo/bin/cargo" ]; then
 else
     info "Rust not found. Installing via rustup..."
     RUSTUP_INIT="$(mktemp)"
-    trap 'rm -f "$RUSTUP_INIT"' EXIT
+    # shellcheck disable=SC2064
+    trap "rm -f \"$RUSTUP_INIT\"" EXIT
     download https://sh.rustup.rs "$RUSTUP_INIT"
     sh "$RUSTUP_INIT" -y
     rm -f "$RUSTUP_INIT"
@@ -176,35 +409,9 @@ ln -sf qartez "${INSTALL_DIR}/qartez-mcp"
 ok "Symlink: ${INSTALL_DIR}/qartez-mcp -> qartez"
 
 # --- Configure IDEs ---
-case "${1:-}" in
-    --interactive)
-        info "Launching interactive IDE setup..."
-        "${INSTALL_DIR}/qartez-setup"
-        ;;
-    --skip-setup)
-        info "Skipping IDE setup (--skip-setup)."
-        ;;
-    *)
-        info "Configuring all detected IDEs..."
-        "${INSTALL_DIR}/qartez-setup" --yes
-        ;;
-esac
+run_setup
 
 ok "Deploy complete. Restart your IDEs to pick up MCP changes."
 
 # --- PATH check ---
-case ":${PATH}:" in
-    *":${INSTALL_DIR}:"*) ;;
-    *)
-        warn "${INSTALL_DIR} is not on your PATH."
-        SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
-        case "$SHELL_NAME" in
-            zsh)  PROFILE="\$HOME/.zshrc" ;;
-            bash) PROFILE="\$HOME/.bashrc" ;;
-            fish) PROFILE="\$HOME/.config/fish/config.fish" ;;
-            *)    PROFILE="\$HOME/.profile" ;;
-        esac
-        warn "Add to ${PROFILE}:"
-        warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-        ;;
-esac
+warn_path

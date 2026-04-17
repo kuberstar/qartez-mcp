@@ -153,6 +153,31 @@ check_error_path "binary not found"       "Binary not found"
 check_error_path "PATH warning"           "not on your PATH"
 check_error_path "PATH fix suggestion"    'export PATH='
 
+# ============================================================
+section "Pre-built release bootstrap"
+# ============================================================
+
+# Target-triple detection covers every target the release workflow builds.
+for target in aarch64-apple-darwin x86_64-apple-darwin \
+              x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+              x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+    if grep -Fq "$target" "$INSTALL_SH" 2>/dev/null; then
+        pass "target triple: $target"
+    else
+        fail "install.sh missing target triple: $target"
+    fi
+done
+
+check_error_path "latest-release API lookup"    'api.github.com/repos/.*/releases/latest'
+check_error_path "archive naming scheme"        'qartez-.*-.*.tar.xz'
+check_error_path "checksum verification"        'SHA256SUMS'
+check_error_path "sha256sum or shasum"          'sha256sum\|shasum'
+check_error_path "musl libc detection"          'ldd --version.*musl'
+check_error_path "from-source escape hatch"     'FROM_SOURCE=1'
+check_error_path "source-build fallback"        'falling back to source build'
+check_error_path "checksum mismatch hard fail"  'Checksum mismatch for'
+check_error_path "checksum hard fail exits"     'Refusing to install'
+
 # Windows installer static checks
 check_ps1_path() {
     LABEL="$1"; PATTERN="$2"
@@ -165,11 +190,16 @@ check_ps1_path() {
 
 check_ps1_path "supports interactive flag" 'Interactive'
 check_ps1_path "supports skip-setup flag" 'SkipSetup'
+check_ps1_path "supports from-source flag" 'FromSource'
 check_ps1_path "installs to LOCALAPPDATA" 'LOCALAPPDATA'
 check_ps1_path "adds install dir to user PATH" "SetEnvironmentVariable('PATH'"
 check_ps1_path "builds release binaries" "@('build', '--release')"
-check_ps1_path "installs qartez binaries" "foreach (\$bin in @('qartez-mcp', 'qartez-guard', 'qartez-setup'))"
+check_ps1_path "binary list matches Cargo.toml" "\$BinaryNames = @('qartez', 'qartez-guard', 'qartez-setup')"
 check_ps1_path "adds .exe suffix for installed binaries" "\$bin + '.exe'"
+check_ps1_path "windows target triple" 'x86_64-pc-windows-msvc'
+check_ps1_path "latest-release API lookup" 'api.github.com/repos'
+check_ps1_path "Get-FileHash checksum verification" 'Get-FileHash'
+check_ps1_path "SHA256SUMS download" 'SHA256SUMS'
 
 # ============================================================
 section "Download safety"
@@ -305,10 +335,13 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     section "Docker integration tests"
 
     # Test preflight error: no curl, no wget
+    # Alpine's busybox provides a wget applet, so removing the apk packages
+    # is not enough - we also strip the busybox symlinks so `command -v wget`
+    # returns non-zero and the preflight check triggers.
     RESULT=$(docker run --rm alpine:3.19 sh -c '
         apk del curl wget 2>/dev/null
+        rm -f /usr/bin/wget /bin/wget /usr/bin/curl /bin/curl
         printf "#!/bin/sh\nset -e\n" > /tmp/test.sh
-        # Copy just the preflight check
         cat >> /tmp/test.sh << "HEREDOC"
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     echo "PREFLIGHT_FAIL_CURL_WGET"
