@@ -247,10 +247,33 @@ fn expand_roots_with_workspaces(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     expanded
 }
 
+/// Cross-platform home directory detection.
+/// Checks HOME (Unix), USERPROFILE (Windows), HOMEDRIVE+HOMEPATH (Windows).
+fn cross_platform_home() -> Option<PathBuf> {
+    // Try HOME (Unix)
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    // Try USERPROFILE (Windows)
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    // Try HOMEDRIVE+HOMEPATH (Windows fallback)
+    if let (Some(drive), Some(path)) = (
+        std::env::var_os("HOMEDRIVE"),
+        std::env::var_os("HOMEPATH"),
+    ) {
+        let mut combined = PathBuf::from(drive);
+        combined.push(path);
+        if combined.is_dir() {
+            return Some(combined);
+        }
+    }
+    None
+}
+
 fn is_home_dir(path: &Path) -> bool {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .is_some_and(|home| path == home)
+    cross_platform_home().is_some_and(|home| path == home)
 }
 
 impl Config {

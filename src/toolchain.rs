@@ -178,19 +178,33 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
     toolchains
 }
 
-/// Checks whether a binary is available on PATH.
+/// Checks whether a binary is available on PATH using pure Rust PATH search.
+/// Works on both Unix and Windows without shelling out to `which`.
 pub fn binary_available(name: &str) -> bool {
     // Skip path-relative binaries like ./gradlew - they are project-local.
     if name.starts_with('.') || name.contains('/') {
         return true;
     }
-    Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let path_var = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+        // On Windows, also try with common executable extensions
+        if cfg!(windows) {
+            for ext in &["exe", "cmd", "bat", "com"] {
+                let with_ext = dir.join(format!("{}.{}", name, ext));
+                if with_ext.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn pubspec_uses_flutter(pubspec: &str) -> bool {

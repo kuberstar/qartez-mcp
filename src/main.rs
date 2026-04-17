@@ -194,10 +194,25 @@ fn schedule_update_check() {
         return;
     }
 
-    let Some(setup) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("qartez-setup")))
-        .filter(|p| p.is_file())
+let Some(setup) = std::env::current_exe()
+    .ok()
+    .and_then(|p| p.parent().map(|d| {
+        let bare = d.join("qartez-setup");
+        if bare.is_file() {
+            Some(bare)
+        } else if cfg!(windows) {
+            // On Windows, try with .exe suffix
+            let with_exe = d.join("qartez-setup.exe");
+            if with_exe.is_file() {
+                Some(with_exe)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }))
+    .flatten()
     else {
         return;
     };
@@ -213,13 +228,37 @@ fn schedule_update_check() {
     });
 }
 
+/// Cross-platform home directory lookup.
+/// Checks HOME (Unix), USERPROFILE (Windows), HOMEDRIVE+HOMEPATH (Windows),
+/// then falls back to current directory.
+fn cross_platform_home() -> Option<PathBuf> {
+    // Try HOME (Unix)
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    // Try USERPROFILE (Windows)
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    // Try HOMEDRIVE+HOMEPATH (Windows fallback)
+    if let (Some(drive), Some(path)) = (
+        std::env::var_os("HOMEDRIVE"),
+        std::env::var_os("HOMEPATH"),
+    ) {
+        let mut combined = PathBuf::from(drive);
+        combined.push(path);
+        if combined.is_dir() {
+            return Some(combined);
+        }
+    }
+    None
+}
+
 fn update_cache_is_fresh() -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = cross_platform_home() else {
         return false;
     };
-    let cache = PathBuf::from(home)
-        .join(".qartez")
-        .join("last-update-check");
+    let cache = home.join(".qartez").join("last-update-check");
     let Ok(meta) = std::fs::metadata(&cache) else {
         return false;
     };

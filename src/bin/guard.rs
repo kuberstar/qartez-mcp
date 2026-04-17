@@ -77,6 +77,42 @@ fn run() -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
 
+    let tool_name_lower = hook.tool_name.to_lowercase();
+
+    // Glob/Grep guard: deny when .qartez exists (qartez tools should be used instead)
+    // Supports both Claude (Glob, Grep) and Gemini (glob, grep_search) tool names
+    if matches!(
+        tool_name_lower.as_str(),
+        "glob" | "grep" | "grep_search"
+    ) {
+        let hook_cwd = hook.cwd.clone();
+        let project_root = match cli.project_root.clone() {
+            Some(r) => Some(r),
+            None => hook_cwd
+                .as_ref()
+                .and_then(|cwd| guard::find_project_root(std::path::Path::new(cwd))),
+        };
+        if let Some(root) = project_root {
+            if root.join(".qartez").is_dir() {
+                let reason = if tool_name_lower == "glob" || tool_name_lower == "grep_search" {
+                    "STOP: qartez MCP is available. Use `qartez_map` for project structure or `qartez_find` to locate symbols. Use Glob ONLY for non-code file patterns (e.g., *.toml, *.json) — if so, use Bash find/ls instead."
+                } else {
+                    "STOP: qartez MCP is available. Use `qartez_grep` for symbol search or `qartez_find` for definitions. Use Grep ONLY for non-symbol text search (e.g., TODO comments, string literals) — if so, use Bash grep instead."
+                };
+                if let Some(json) = guard::render_stdout(
+                    &guard::GuardDecision::Deny {
+                        reason: reason.to_string(),
+                    },
+                    hook.hook_event_name.as_deref(),
+                ) {
+                    println!("{json}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Modification guard: only handle Edit/Write/MultiEdit and variants
     if !matches!(
         hook.tool_name.as_str(),
         "Edit" | "Write" | "MultiEdit" | "replace" | "write_file"
@@ -104,16 +140,55 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let Some(rel_path) = guard::relativize_file_path(&project_root, &file_path) else {
+    let Some(rel_path_raw) = guard::relativize_file_path(&project_root, &file_path) else {
         return Ok(());
     };
+    // Normalize to repo-style logical path for messaging + ack hashing.
+    // Keep lookup tolerant by probing multiple variants below.
+    let rel_path = rel_path_raw
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
 
     let conn = match open_read_only(&db_path) {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
 
-    let Some(file_row) = read::get_file_by_path(&conn, &rel_path).ok().flatten() else {
+    // Windows path canonicalization can yield backslashes while the index may
+    // store forward slashes. Probe both normalized variants before fail-open.
+    // Also handle db rows prefixed with "./".
+    let slash = rel_path.clone();
+    let backslash = rel_path.replace('/', "\\");
+    let slash_dot = format!("./{slash}");
+    let backslash_dot = format!(".\\{backslash}");
+    let candidates = [
+        rel_path.as_str(),
+        slash.as_str(),
+        backslash.as_str(),
+        slash_dot.as_str(),
+        backslash_dot.as_str(),
+    ];
+    let mut file_row = candidates
+        .iter()
+        .find_map(|candidate| read::get_file_by_path(&conn, candidate).ok().flatten());
+    if file_row.is_none()
+        && let Ok(files) = read::get_all_files(&conn)
+    {
+        let norm = |s: &str| {
+            s.replace('\\', "/")
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string()
+        };
+        let targets: Vec<String> = candidates.iter().map(|c| norm(c)).collect();
+        file_row = files.into_iter().find(|f| {
+            let p = norm(&f.path);
+            targets.iter().any(|t| p == *t || p.ends_with(&format!("/{t}")))
+        });
+    }
+    let Some(file_row) = file_row else {
         return Ok(());
     };
 

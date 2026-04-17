@@ -1449,11 +1449,12 @@ mod guard_binary {
     fn denies_hot_file_without_ack() {
         let (dir, _db, hub) = indexed_project();
         let abs = dir.path().join(&hub);
-        let payload = format!(
-            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
-            abs.display(),
-            dir.path().display()
-        );
+        let payload = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": abs},
+            "cwd": dir.path(),
+        })
+        .to_string();
         // Thresholds set low so a 2-importer fixture trips the guard
         // deterministically, independent of actual PageRank values.
         let out = run_guard(
@@ -1476,11 +1477,12 @@ mod guard_binary {
         guard::touch_ack(dir.path(), &hub);
 
         let abs = dir.path().join(&hub);
-        let payload = format!(
-            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
-            abs.display(),
-            dir.path().display()
-        );
+        let payload = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": abs},
+            "cwd": dir.path(),
+        })
+        .to_string();
         let out = run_guard(
             dir.path(),
             &payload,
@@ -1496,11 +1498,12 @@ mod guard_binary {
     fn allows_non_edit_tools() {
         let (dir, _db, hub) = indexed_project();
         let abs = dir.path().join(&hub);
-        let payload = format!(
-            r#"{{"tool_name":"Bash","tool_input":{{"command":"ls {}"}},"cwd":"{}"}}"#,
-            abs.display(),
-            dir.path().display()
-        );
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": format!("ls {}", abs.display())},
+            "cwd": dir.path(),
+        })
+        .to_string();
         let out = run_guard(
             dir.path(),
             &payload,
@@ -1513,11 +1516,12 @@ mod guard_binary {
     fn allows_unindexed_file() {
         let (dir, _db, _hub) = indexed_project();
         let abs = dir.path().join("src/new_file.rs");
-        let payload = format!(
-            r#"{{"tool_name":"Write","tool_input":{{"file_path":"{}"}},"cwd":"{}"}}"#,
-            abs.display(),
-            dir.path().display()
-        );
+        let payload = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": abs},
+            "cwd": dir.path(),
+        })
+        .to_string();
         let out = run_guard(
             dir.path(),
             &payload,

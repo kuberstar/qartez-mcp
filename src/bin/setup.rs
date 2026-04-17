@@ -63,6 +63,13 @@ struct Cli {
     /// (24h TTL) and silent on no-op. Used by qartez-mcp on startup.
     #[arg(long, hide = true)]
     update_background: bool,
+
+    /// Internal flag: session-start hook entry point.
+    /// Implements the auto-indexing behavior from qartez-session-start.sh in Rust.
+    /// Detects project, checks for .qartez marker, validates repo markers,
+    /// locates qartez-mcp binary, and spawns a detached background reindex.
+    #[arg(long, hide = true)]
+    session_start: bool,
 }
 
 // -- IDE registry ------------------------------------------------------------
@@ -330,10 +337,30 @@ fn home_dir() -> PathBuf {
 }
 
 /// Portable home directory lookup without pulling in the `dirs` crate.
+/// Checks HOME (Unix), USERPROFILE (Windows), HOMEDRIVE+HOMEPATH (Windows),
+/// then falls back to current directory.
 fn dirs_replacement() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("$HOME is not set")
+    // Try HOME (Unix)
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home);
+    }
+    // Try USERPROFILE (Windows)
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile);
+    }
+    // Try HOMEDRIVE+HOMEPATH (Windows fallback)
+    if let (Some(drive), Some(path)) = (
+        std::env::var_os("HOMEDRIVE"),
+        std::env::var_os("HOMEPATH"),
+    ) {
+        let mut combined = PathBuf::from(drive);
+        combined.push(path);
+        if combined.is_dir() {
+            return combined;
+        }
+    }
+    // Fallback to current directory
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Claude Desktop's config directory varies by platform.
@@ -576,6 +603,7 @@ fn strip_jsonc(text: &str) -> String {
 /// Find the qartez-mcp binary, checking standard locations.
 fn find_binary(name: &str) -> Option<PathBuf> {
     let home = home_dir();
+
     let candidates = [
         home.join(".local").join("bin").join(name),
         // Also try the cargo target dir relative to this binary
@@ -588,6 +616,13 @@ fn find_binary(name: &str) -> Option<PathBuf> {
         if c.is_file() {
             return Some(c.clone());
         }
+        // On Windows, try with .exe suffix
+        if cfg!(windows) {
+            let with_exe = c.with_extension("exe");
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
+        }
     }
     // Check PATH
     which_in_path(name)
@@ -596,9 +631,19 @@ fn find_binary(name: &str) -> Option<PathBuf> {
 fn which_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
+        // Try the bare name first
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+        // On Windows, also try with common executable extensions
+        if cfg!(windows) {
+            for ext in &["exe", "cmd", "bat", "com"] {
+                let with_ext = dir.join(format!("{}.{}", name, ext));
+                if with_ext.is_file() {
+                    return Some(with_ext);
+                }
+            }
         }
     }
     None
@@ -742,7 +787,7 @@ fn install_claude(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn install_claude_one(claude_dir: &Path, bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
+fn install_claude_one(claude_dir: &Path, bin: &str, _guard_bin: Option<&str>) -> anyhow::Result<()> {
     let hooks_dir = claude_dir.join("hooks");
     let settings_path = claude_dir.join("settings.json");
 
@@ -769,23 +814,31 @@ fn install_claude_one(claude_dir: &Path, bin: &str, guard_bin: Option<&str>) -> 
         settings["hooks"] = serde_json::json!({});
     }
 
-    // Absolute hook commands so they resolve regardless of which claude
-    // home the shell's `~` currently refers to.
-    let guard_cmd = format!("bash {}", guard_sh.display());
-    let session_cmd = format!("bash {}", session_sh.display());
+    // Use qartez-guard binary directly (no bash dependency)
+    let guard_bin_path = find_binary("qartez-guard").map(|p| p.to_string_lossy().into_owned());
+
+    // Use qartez-setup --session-start for session start hook (no bash dependency)
+    let setup_bin_path = find_binary("qartez-setup")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "qartez-setup".to_string());
+    let session_cmd = format!("{} --session-start", setup_bin_path);
 
     // PreToolUse: Glob|Grep guard
-    ensure_hook_entry(
-        &mut settings,
-        "PreToolUse",
-        "Glob|Grep",
-        "qartez-guard",
-        &guard_cmd,
-        3000,
-    );
+    if let Some(guard) = guard_bin_path.as_deref() {
+        ensure_hook_entry(
+            &mut settings,
+            "PreToolUse",
+            "Glob|Grep",
+            "qartez-guard",
+            guard,
+            3000,
+        );
+    } else {
+        warn("qartez-guard binary not found; glob/grep guard hook skipped");
+    }
 
     // PreToolUse: Edit|Write|MultiEdit modification guard
-    if let Some(guard) = guard_bin {
+    if let Some(guard) = guard_bin_path.as_deref() {
         ensure_hook_entry(
             &mut settings,
             "PreToolUse",
@@ -992,7 +1045,7 @@ fn install_gemini(bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn install_gemini_one(gemini_dir: &Path, bin: &str, guard_bin: Option<&str>) -> anyhow::Result<()> {
+fn install_gemini_one(gemini_dir: &Path, bin: &str, _guard_bin: Option<&str>) -> anyhow::Result<()> {
     let hooks_dir = gemini_dir.join("hooks");
     let settings_path = gemini_dir.join("settings.json");
 
@@ -1018,21 +1071,31 @@ fn install_gemini_one(gemini_dir: &Path, bin: &str, guard_bin: Option<&str>) -> 
         settings["hooks"] = serde_json::json!({});
     }
 
-    let guard_cmd = format!("bash {}", guard_sh.display());
-    let session_cmd = format!("bash {}", session_sh.display());
+    // Use qartez-guard binary directly (no bash dependency)
+    let guard_bin_path = find_binary("qartez-guard").map(|p| p.to_string_lossy().into_owned());
+
+    // Use qartez-setup --session-start for session start hook (no bash dependency)
+    let setup_bin_path = find_binary("qartez-setup")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "qartez-setup".to_string());
+    let session_cmd = format!("{} --session-start", setup_bin_path);
 
     // BeforeTool: glob|grep_search guard
-    ensure_hook_entry(
-        &mut settings,
-        "BeforeTool",
-        "glob|grep_search",
-        "qartez-guard",
-        &guard_cmd,
-        3000,
-    );
+    if let Some(guard) = guard_bin_path.as_deref() {
+        ensure_hook_entry(
+            &mut settings,
+            "BeforeTool",
+            "glob|grep_search",
+            "qartez-guard",
+            guard,
+            3000,
+        );
+    } else {
+        warn("qartez-guard binary not found; glob/grep guard hook skipped");
+    }
 
     // BeforeTool: replace|write_file modification guard
-    if let Some(guard) = guard_bin {
+    if let Some(guard) = guard_bin_path.as_deref() {
         ensure_hook_entry(
             &mut settings,
             "BeforeTool",
@@ -1041,6 +1104,8 @@ fn install_gemini_one(gemini_dir: &Path, bin: &str, guard_bin: Option<&str>) -> 
             guard,
             3000,
         );
+    } else {
+        warn("qartez-guard binary not found; modification guard hook skipped");
     }
 
     // SessionStart: auto-indexing
@@ -2406,6 +2471,10 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if cli.session_start {
+        return run_session_start();
+    }
+
     if cli.update || cli.update_background {
         return run_update(cli.update_background);
     }
@@ -2546,6 +2615,7 @@ fn download_semantic_model() -> anyhow::Result<()> {
 // -- Auto-update -------------------------------------------------------------
 
 const QARTEZ_UPDATE_REPO: &str = "kuberstar/qartez-mcp";
+#[cfg(unix)]
 const QARTEZ_INSTALL_URL: &str =
     "https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.sh";
 const UPDATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -2707,31 +2777,48 @@ fn run_update(background: bool) -> anyhow::Result<()> {
         latest.trim_start_matches('v'),
     );
 
-    let install_cmd = format!("curl -sSfL {QARTEZ_INSTALL_URL} | sh");
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&install_cmd)
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn installer: {e}"))?;
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("installer wait failed: {e}"))?;
+#[cfg(unix)]
+    {
+        let install_cmd = format!("curl -sSfL {QARTEZ_INSTALL_URL} | sh");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&install_cmd)
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn installer: {e}"))?;
+        let status = child
+            .wait()
+            .map_err(|e| anyhow::anyhow!("installer wait failed: {e}"))?;
 
-    if !status.success() {
-        anyhow::bail!(
-            "installer exited with status {}",
-            status.code().unwrap_or(-1)
+        if !status.success() {
+            anyhow::bail!(
+                "installer exited with status {}",
+                status.code().unwrap_or(-1)
+            );
+        }
+
+        touch_update_cache();
+        eprintln!(
+            " {} Update complete: {} → {}",
+            style("✓").green().bold(),
+            current,
+            latest.trim_start_matches('v'),
         );
     }
 
-    touch_update_cache();
-    eprintln!(
-        "  {} Update complete: {} → {}",
-        style("✓").green().bold(),
-        current,
-        latest.trim_start_matches('v'),
-    );
+    #[cfg(windows)]
+    {
+        eprintln!(
+            " {} Auto-update on Windows requires WSL or Git Bash.",
+            style("[!]").yellow()
+        );
+        eprintln!(
+            " {} Visit https://github.com/kuberstar/qartez-mcp/releases to download v{} manually.",
+            style("[i]").cyan(),
+            latest.trim_start_matches('v'),
+        );
+    }
+
     Ok(())
 }
 
