@@ -52,6 +52,13 @@ pub struct SoulPreMergeArgs {
     pub files: String,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SoulArchReviewArgs {
+    /// Optional area to focus on (e.g., "auth", "data pipeline", "external integrations").
+    pub focus: Option<String>,
+}
+
 fn user_text(text: String) -> Vec<PromptMessage> {
     vec![PromptMessage::new_text(PromptMessageRole::User, text)]
 }
@@ -278,5 +285,110 @@ impl QartezServer {
         };
         GetPromptResult::new(user_text(text))
             .with_description("Qartez pre-merge safety-check workflow".to_string())
+    }
+
+    /// Architecture risk audit: structural risks that emerge from module relationships.
+    #[prompt(
+        name = "qartez_arch_review",
+        description = "Architecture risk audit: single points of failure, unguarded entry points, abstraction leaks, silent degradation, and coupling hotspots. Optional argument: `focus` (area keyword)."
+    )]
+    pub fn qartez_arch_review_prompt(
+        &self,
+        Parameters(args): Parameters<SoulArchReviewArgs>,
+    ) -> GetPromptResult {
+        let focus = args
+            .focus
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let (map_step, focus_note) = match focus {
+            Some(f) => (
+                format!(
+                    "1. Call `qartez_map` with `boost_terms=[\"{f}\"]`, `top_n=20`, and `format=\"detailed\"` \
+                     to get the PageRank-ranked project skeleton biased toward `{f}`."
+                ),
+                format!(" focused on `{f}`"),
+            ),
+            None => (
+                "1. Call `qartez_map` with `top_n=20` and `format=\"detailed\"` \
+                 to get the PageRank-ranked project skeleton."
+                    .to_string(),
+                String::new(),
+            ),
+        };
+
+        let text = format!(
+            "Perform an architecture risk audit of this codebase{focus_note} using Qartez.\n\
+             \n\
+             Run these tools in order. Steps 1-3 can run in parallel, then 4-6 sequentially:\n\
+             \n\
+             {map_step}\n\
+             2. Call `qartez_stats` (no arguments) for language mix, LOC, and symbol count.\n\
+             3. Call `qartez_security` (no arguments) for known security surface findings.\n\
+             4. Call `qartez_hotspots` with `top_n=10` to find where complexity, coupling, and churn concentrate.\n\
+             5. Call `qartez_boundaries` with `suggest=true` to see the Leiden-derived module clusters \
+                and where the natural architectural seams are.\n\
+             6. For the top 3 hotspot files from step 4, call `qartez_deps` with `file_path=<file>` \
+                to see their dependency fan-in and fan-out.\n\
+             7. Identify any files that look like network-facing entry points (HTTP handlers, server \
+                startup, route registration, CLI commands that start servers). For each, call \
+                `qartez_calls` with `name=<entry_symbol>` and `direction=\"callees\"`, `depth=3` \
+                to trace the call chain inward from the external surface.\n\
+             \n\
+             With all that data, analyze the codebase for these architectural risks:\n\
+             \n\
+             **Single points of failure** - High-PageRank modules with many dependents but no \
+             redundancy, fallback, or retry visible in their call chain. Ask: if this module \
+             fails or is unreachable, what degrades?\n\
+             \n\
+             **Unguarded entry points** - Symbols reachable from network-facing handlers where \
+             the call chain between handler and business logic has no authentication, authorization, \
+             or input validation step visible.\n\
+             \n\
+             **Abstraction leaks** - Protocols, traits, or interfaces where some concrete \
+             implementations skip methods, return stubs, or silently no-op. Look for abstract \
+             definitions whose call chains reach a concrete impl that does less than callers expect.\n\
+             \n\
+             **Silent degradation** - Error handling that swallows failures and returns defaults \
+             instead of propagating. Especially dangerous on external boundaries (API calls, \
+             database queries, network I/O) where a silent fallback hides an outage.\n\
+             \n\
+             **Coupling hotspots** - Modules that appear in multiple Leiden communities, or that \
+             have high fan-in from unrelated clusters. These are architectural bottlenecks that \
+             make changes risky and hard to test in isolation.\n\
+             \n\
+             **Missing resilience** - External API calls (HTTP clients, database connections, \
+             third-party SDKs) with no retry, backoff, timeout, or circuit-breaking visible \
+             in the call chain.\n\
+             \n\
+             Return a structured report:\n\
+             \n\
+             ## Architecture Risk Review\n\
+             \n\
+             ### Scope\n\
+             State what was analyzed: entry points identified, module count, language mix.\n\
+             \n\
+             ### Findings\n\
+             \n\
+             | # | Risk | Severity | Evidence | Recommendation |\n\
+             |---|------|----------|----------|----------------|\n\
+             \n\
+             For each finding:\n\
+             - **Risk**: one-line description of the structural problem\n\
+             - **Severity**: high / medium / low\n\
+             - **Evidence**: which Qartez tool surfaced it, with the specific file and symbol\n\
+             - **Recommendation**: concrete next step (not \"consider\" or \"evaluate\" - say what to do)\n\
+             \n\
+             ### Health summary\n\
+             Two to three sentences: overall architectural health, the single highest-priority \
+             risk, and whether the codebase is in good shape for its current scale.\n\
+             \n\
+             Only report findings you have evidence for from the tool output. Do not speculate \
+             about risks the tools did not surface. If an area looks clean, say so briefly and \
+             move on."
+        );
+        GetPromptResult::new(user_text(text))
+            .with_description("Qartez architecture risk audit workflow".to_string())
     }
 }
