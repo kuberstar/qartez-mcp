@@ -15,6 +15,7 @@
 ### Fixed
 
 - **`install.sh` SC2015 anti-pattern** - replaced `cd ... && pwd || true` with an explicit `|| SCRIPT_DIR=""` fallback so a failing `pwd` can no longer mask a failing `cd`.
+- **Windows one-liner installer URL** - switched PowerShell docs/comments from `https://qartez.dev/install.ps1` to the working `https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1` endpoint.
 
 ## [0.7.0] - 2026-04-17
 

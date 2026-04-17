@@ -65,7 +65,7 @@ The installer checks for Rust, builds the three release binaries (`qartez`, `qar
 Windows (native PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "iwr https://qartez.dev/install.ps1 -useb | iex"
+powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1 -useb | iex"
 ```
 
 Open any project in your IDE - Qartez indexes it automatically on session start. No manual step needed. The file watcher keeps the index fresh as you edit.

@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 # Qartez MCP — native Windows installer
 # Usage:
-#   powershell -ExecutionPolicy Bypass -c "iwr https://qartez.dev/install.ps1 -useb | iex"
+#   powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1 -useb | iex"
 #
 # From a checked-out repo:
 #   .\install.ps1
