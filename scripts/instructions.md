@@ -31,6 +31,15 @@ Qartez is an AST-based code intelligence MCP server. Use its tools instead of bu
 4. **`qartez_impact`** BEFORE modifying any heavily-imported file
 5. **`qartez_context`** before multi-file changes to surface files you might miss
 
+### Denial recovery protocol
+
+Guards emit a machine-readable JSON payload alongside denial messages.
+
+1. Parse payload field `qartez.replacement`.
+2. Retry immediately with replacement qartez tool(s).
+3. If `reason_code` is `INDEX_NOT_READY`, wait until `.qartez/status.json` shows `READY`.
+4. If payload type is `RISK_ACK_REQUIRED`, call `qartez_impact` for the target file, then retry edit.
+
 ### Modification guard
 
 Before editing a file that is central to the codebase, call `qartez_impact` with `file_path=<the file>` first. A file is considered load-bearing when its PageRank >= 0.05 or its transitive blast radius >= 10. Editing without checking impact risks breaking downstream dependents.

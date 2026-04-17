@@ -34,6 +34,23 @@ const INSTRUCTIONS_MD: &str = include_str!("../../scripts/instructions.md");
 const SKILL_MD: &str = include_str!("../../scripts/skill/SKILL.md");
 const SKILL_TOOLS_MD: &str = include_str!("../../scripts/skill/references/tools.md");
 const SKILL_GUARD_MD: &str = include_str!("../../scripts/skill/references/guard.md");
+const SKILL_RUNTIME_CONTRACT_MD: &str =
+    include_str!("../../scripts/skill/references/runtime-contract.md");
+const SKILL_SUBAGENT_CONTRACT_MD: &str =
+    include_str!("../../scripts/skill/references/subagent-contract.md");
+const SKILL_HOST_MATRIX_MD: &str = include_str!("../../scripts/skill/references/host-matrix.md");
+const SKILL_CONFIDENCE_MODEL_MD: &str =
+    include_str!("../../scripts/skill/references/confidence-model.md");
+const SKILL_DOCTRINE_EXPLORE_MD: &str =
+    include_str!("../../scripts/skill/references/doctrine-explore.md");
+const SKILL_DOCTRINE_DEBUG_MD: &str =
+    include_str!("../../scripts/skill/references/doctrine-debug.md");
+const SKILL_DOCTRINE_REVIEW_MD: &str =
+    include_str!("../../scripts/skill/references/doctrine-review.md");
+const SKILL_DOCTRINE_REFACTOR_MD: &str =
+    include_str!("../../scripts/skill/references/doctrine-refactor.md");
+const SKILL_DOCTRINE_PREMERGE_MD: &str =
+    include_str!("../../scripts/skill/references/doctrine-premerge.md");
 
 // -- CLI ---------------------------------------------------------------------
 
@@ -1264,10 +1281,28 @@ fn install_skill(claude_dir: &Path) -> anyhow::Result<()> {
     let skill_path = skill_dir.join("SKILL.md");
     let tools_path = refs_dir.join("tools.md");
     let guard_path = refs_dir.join("guard.md");
+    let runtime_contract_path = refs_dir.join("runtime-contract.md");
+    let subagent_contract_path = refs_dir.join("subagent-contract.md");
+    let host_matrix_path = refs_dir.join("host-matrix.md");
+    let confidence_model_path = refs_dir.join("confidence-model.md");
+    let doctrine_explore_path = refs_dir.join("doctrine-explore.md");
+    let doctrine_debug_path = refs_dir.join("doctrine-debug.md");
+    let doctrine_review_path = refs_dir.join("doctrine-review.md");
+    let doctrine_refactor_path = refs_dir.join("doctrine-refactor.md");
+    let doctrine_premerge_path = refs_dir.join("doctrine-premerge.md");
 
     fs::write(&skill_path, SKILL_MD)?;
     fs::write(&tools_path, SKILL_TOOLS_MD)?;
     fs::write(&guard_path, SKILL_GUARD_MD)?;
+    fs::write(&runtime_contract_path, SKILL_RUNTIME_CONTRACT_MD)?;
+    fs::write(&subagent_contract_path, SKILL_SUBAGENT_CONTRACT_MD)?;
+    fs::write(&host_matrix_path, SKILL_HOST_MATRIX_MD)?;
+    fs::write(&confidence_model_path, SKILL_CONFIDENCE_MODEL_MD)?;
+    fs::write(&doctrine_explore_path, SKILL_DOCTRINE_EXPLORE_MD)?;
+    fs::write(&doctrine_debug_path, SKILL_DOCTRINE_DEBUG_MD)?;
+    fs::write(&doctrine_review_path, SKILL_DOCTRINE_REVIEW_MD)?;
+    fs::write(&doctrine_refactor_path, SKILL_DOCTRINE_REFACTOR_MD)?;
+    fs::write(&doctrine_premerge_path, SKILL_DOCTRINE_PREMERGE_MD)?;
 
     info(&format!("Skill installed: {}", skill_dir.display()));
     Ok(())
