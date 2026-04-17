@@ -3744,7 +3744,10 @@ mod tests {
         install_opencode("qartez-mcp").unwrap();
 
         let json_path = opencode_dir.join("opencode.json");
-        assert!(!json_path.exists(), "should not create opencode.json when only .jsonc exists");
+        assert!(
+            !json_path.exists(),
+            "should not create opencode.json when only .jsonc exists"
+        );
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&jsonc_path).unwrap()).unwrap();

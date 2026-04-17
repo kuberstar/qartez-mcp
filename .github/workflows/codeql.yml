@@ -30,7 +30,7 @@ jobs:
       matrix:
         include:
           - language: rust
-            build-mode: manual
+            build-mode: none
           - language: actions
             build-mode: none
 
@@ -60,7 +60,7 @@ jobs:
           queries: security-and-quality
 
       - name: Build (Rust)
-        if: matrix.language == 'rust'
+        if: matrix.language == 'rust' && matrix.build-mode == 'manual'
         run: cargo build --locked
 
       - name: Perform CodeQL analysis
