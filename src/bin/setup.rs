@@ -2605,6 +2605,93 @@ fn download_semantic_model() -> anyhow::Result<()> {
     Ok(())
 }
 
+// -- Session-start hook (Rust equivalent of qartez-session-start.sh) ----------
+
+/// Repo markers that indicate this is a real code project (not a random folder).
+const REPO_MARKERS: &[&str] = &[
+    ".git",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+];
+
+/// Rust implementation of the session-start hook behavior.
+/// Mirrors `scripts/qartez-session-start.sh` but requires no bash.
+fn run_session_start() -> anyhow::Result<()> {
+    let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+
+    if project_dir.as_os_str().is_empty() || !project_dir.is_dir() {
+        return Ok(());
+    }
+
+    // Skip dangerous roots
+    let home = home_dir();
+    if project_dir == home || project_dir == PathBuf::from("/") {
+        return Ok(());
+    }
+
+    // Already indexed
+    if project_dir.join(".qartez").is_dir() {
+        return Ok(());
+    }
+
+    // Require at least one repo marker
+    let has_marker = REPO_MARKERS.iter().any(|m| project_dir.join(m).exists());
+    if !has_marker {
+        return Ok(());
+    }
+
+    // Locate qartez-mcp binary
+    let binary = find_binary("qartez-mcp").or_else(|| {
+        // Fallback: check QARTEZ_BINARY env var
+        std::env::var("QARTEZ_BINARY")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+    });
+
+    let Some(binary) = binary else {
+        return Ok(());
+    };
+
+    // Spawn detached background reindex
+    let log_dir = home.join(".cache").join("qartez-mcp");
+    let _ = fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("session-index.log");
+
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new(&binary)
+            .arg("--root")
+            .arg(&project_dir)
+            .arg("--reindex")
+            .stdout(fs::OpenOptions::new().create(true).append(true).open(&log_file)?)
+            .stderr(fs::OpenOptions::new().create(true).append(true).open(&log_file)?)
+            .stdin(Stdio::null())
+            .spawn();
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED: u32 = 0x00000008;
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("--root")
+            .arg(&project_dir)
+            .arg("--reindex")
+            .stdout(fs::OpenOptions::new().create(true).append(true).open(&log_file)?)
+            .stderr(fs::OpenOptions::new().create(true).append(true).open(&log_file)?)
+            .stdin(Stdio::null())
+            .creation_flags(DETACHED);
+        cmd.spawn().ok();
+    }
+
+    Ok(())
+}
+
 // -- Auto-update -------------------------------------------------------------
 
 const QARTEZ_UPDATE_REPO: &str = "kuberstar/qartez-mcp";
