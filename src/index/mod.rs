@@ -245,6 +245,7 @@ fn resolve_and_write_import_edges(
     path_to_id: &HashMap<String, i64>,
     go_module: Option<&str>,
     dart_packages: &HashMap<String, String>,
+    python_packages: &[PythonPackage],
 ) -> Result<HashMap<i64, HashSet<i64>>> {
     let mut imports_by_file: HashMap<i64, HashSet<i64>> = HashMap::new();
     for entry in indexed {
@@ -258,6 +259,7 @@ fn resolve_and_write_import_edges(
                 known_paths,
                 go_module,
                 Some(dart_packages),
+                Some(python_packages),
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -465,6 +467,7 @@ pub fn full_index_root(
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
+    let python_packages = read_python_packages(root);
     let max_bytes = max_file_bytes();
 
     tracing::info!("found {} source files on disk", files.len());
@@ -513,6 +516,7 @@ pub fn full_index_root(
         &path_to_id,
         go_module.as_deref(),
         &dart_packages,
+        &python_packages,
     )?;
 
     resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
@@ -842,12 +846,13 @@ fn resolve_targets(
     known_files: &HashSet<String>,
     go_module: Option<&str>,
     dart_packages: Option<&HashMap<String, String>>,
+    python_packages: Option<&[PythonPackage]>,
 ) -> Vec<String> {
     match language {
         "rust" => resolve_rust_import(rel_path, specifier, known_files)
             .into_iter()
             .collect(),
-        "python" => resolve_python_import(rel_path, specifier, known_files)
+        "python" => resolve_python_import(rel_path, specifier, known_files, python_packages)
             .into_iter()
             .collect(),
         "go" => resolve_go_import(specifier, known_files, go_module),
@@ -1052,12 +1057,35 @@ fn try_rust_module_file(dir: &Path, known_files: &HashSet<String>) -> Option<Str
 
 // --- Python ---
 
+struct PythonPackage {
+    name: String,
+    src_root: String,
+}
+
 fn resolve_python_import(
     rel_path: &str,
     specifier: &str,
     known_files: &HashSet<String>,
+    python_packages: Option<&[PythonPackage]>,
 ) -> Option<String> {
     if !specifier.starts_with('.') {
+        let packages = python_packages?;
+        let top_module = specifier.split('.').next()?;
+        let pkg = packages.iter().find(|p| p.name == top_module)?;
+
+        let module_path = specifier.replace('.', "/");
+        let target = if pkg.src_root.is_empty() {
+            module_path
+        } else {
+            format!("{}/{module_path}", pkg.src_root)
+        };
+
+        for suffix in [".py", "/__init__.py"] {
+            let candidate = format!("{target}{suffix}");
+            if known_files.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
         return None;
     }
 
@@ -1136,6 +1164,196 @@ fn read_go_module(root: &Path) -> Option<String> {
             .strip_prefix("module ")
             .map(|m| m.trim().to_string())
     })
+}
+
+fn read_python_packages(root: &Path) -> Vec<PythonPackage> {
+    let mut packages = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("pyproject.toml") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let rel_dir = match path.parent().and_then(|p| p.strip_prefix(root).ok()) {
+            Some(p) => to_forward_slash(p.to_string_lossy().into_owned()),
+            None => continue,
+        };
+
+        if let Some(mut found) = parse_pyproject_packages(&content) {
+            for pkg in &mut found {
+                if !rel_dir.is_empty() {
+                    pkg.src_root = if pkg.src_root.is_empty() {
+                        rel_dir.clone()
+                    } else {
+                        format!("{rel_dir}/{}", pkg.src_root)
+                    };
+                }
+            }
+            packages.extend(found);
+        }
+    }
+
+    if packages.is_empty() {
+        packages.extend(discover_python_packages_by_init(root));
+    }
+
+    packages
+}
+
+fn parse_pyproject_packages(content: &str) -> Option<Vec<PythonPackage>> {
+    let doc: toml_edit::DocumentMut = content.parse().ok()?;
+
+    // Poetry: [tool.poetry] packages = [{include = "foo", from = "src"}]
+    if let Some(poetry) = doc
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+    {
+        if let Some(pkgs) = poetry.get("packages").and_then(|p| p.as_array()) {
+            let mut result = Vec::new();
+            for item in pkgs {
+                let table = item.as_inline_table()?;
+                let name = table.get("include")?.as_str()?;
+                let from = table
+                    .get("from")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("");
+                result.push(PythonPackage {
+                    name: name.to_string(),
+                    src_root: from.to_string(),
+                });
+            }
+            if !result.is_empty() {
+                return Some(result);
+            }
+        }
+
+        // Poetry without explicit packages: use [tool.poetry] name
+        if let Some(name) = poetry.get("name").and_then(|n| n.as_str()) {
+            let pkg_name = name.replace('-', "_");
+            return Some(vec![PythonPackage {
+                name: pkg_name,
+                src_root: String::new(),
+            }]);
+        }
+    }
+
+    // Setuptools: [tool.setuptools.packages.find] where = ["src"]
+    if let Some(setuptools) = doc
+        .get("tool")
+        .and_then(|t| t.get("setuptools"))
+    {
+        let src_root = setuptools
+            .get("packages")
+            .and_then(|p| p.get("find"))
+            .and_then(|f| f.get("where"))
+            .and_then(|w| w.as_array())
+            .and_then(|a| a.get(0))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // [tool.setuptools] package-dir = {"" = "src"}
+        let src_root = if src_root.is_empty() {
+            setuptools
+                .get("package-dir")
+                .and_then(|pd| pd.as_inline_table())
+                .and_then(|t| t.get(""))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        } else {
+            src_root
+        };
+
+        if let Some(name) = doc
+            .get("project")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            let pkg_name = name.replace('-', "_");
+            return Some(vec![PythonPackage {
+                name: pkg_name,
+                src_root: src_root.to_string(),
+            }]);
+        }
+    }
+
+    None
+}
+
+fn discover_python_packages_by_init(root: &Path) -> Vec<PythonPackage> {
+    let mut packages = Vec::new();
+    let mut seen = HashSet::new();
+
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .max_depth(Some(3))
+        .build();
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("__init__.py") {
+            continue;
+        }
+
+        let rel = match path.parent().and_then(|p| p.strip_prefix(root).ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let components: Vec<_> = rel.components().collect();
+        if components.is_empty() {
+            continue;
+        }
+
+        // src/chitta/__init__.py → name="chitta", src_root="src"
+        // chitta/__init__.py → name="chitta", src_root=""
+        let (pkg_name, src_root) = if components.len() >= 2 {
+            let first = components[0].as_os_str().to_string_lossy();
+            let second = components[1].as_os_str().to_string_lossy();
+            if first == "src" || first == "lib" {
+                (second.to_string(), first.to_string())
+            } else {
+                (first.to_string(), String::new())
+            }
+        } else {
+            let name = components[0].as_os_str().to_string_lossy().to_string();
+            (name, String::new())
+        };
+
+        if pkg_name.starts_with('_') || pkg_name.starts_with('.') {
+            continue;
+        }
+
+        let key = (pkg_name.clone(), src_root.clone());
+        if seen.insert(key) {
+            packages.push(PythonPackage {
+                name: pkg_name,
+                src_root,
+            });
+        }
+    }
+
+    packages
 }
 
 // --- Dart ---
@@ -1397,6 +1615,7 @@ pub fn incremental_index(
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
     let dart_packages = read_dart_packages(root);
+    let python_packages = read_python_packages(root);
     let max_bytes = max_file_bytes();
 
     let tx = conn.unchecked_transaction()?;
@@ -1435,6 +1654,7 @@ pub fn incremental_index(
         &path_to_id,
         go_module.as_deref(),
         &dart_packages,
+        &python_packages,
     )?;
 
     resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
@@ -1907,7 +2127,7 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/utils.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".utils", &known);
+        let result = resolve_python_import("pkg/main.py", ".utils", &known, None);
         assert_eq!(result, Some("pkg/utils.py".to_string()));
     }
 
@@ -1916,7 +2136,7 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/models.py".to_string());
 
-        let result = resolve_python_import("pkg/sub/module.py", "..models", &known);
+        let result = resolve_python_import("pkg/sub/module.py", "..models", &known, None);
         assert_eq!(result, Some("pkg/models.py".to_string()));
     }
 
@@ -1925,15 +2145,90 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/utils/__init__.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".utils", &known);
+        let result = resolve_python_import("pkg/main.py", ".utils", &known, None);
         assert_eq!(result, Some("pkg/utils/__init__.py".to_string()));
     }
 
     #[test]
-    fn test_python_absolute_skipped() {
+    fn test_python_absolute_no_packages() {
         let known = HashSet::new();
-        let result = resolve_python_import("pkg/main.py", "os", &known);
+        let result = resolve_python_import("pkg/main.py", "os", &known, None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_python_absolute_stdlib_ignored() {
+        let known = HashSet::new();
+        let pkgs = vec![PythonPackage {
+            name: "myapp".to_string(),
+            src_root: String::new(),
+        }];
+        let result = resolve_python_import("myapp/main.py", "os", &known, Some(&pkgs));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_python_absolute_flat_layout() {
+        let mut known = HashSet::new();
+        known.insert("myapp/config.py".to_string());
+
+        let pkgs = vec![PythonPackage {
+            name: "myapp".to_string(),
+            src_root: String::new(),
+        }];
+        let result =
+            resolve_python_import("myapp/main.py", "myapp.config", &known, Some(&pkgs));
+        assert_eq!(result, Some("myapp/config.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_src_layout() {
+        let mut known = HashSet::new();
+        known.insert("src/chitta/config.py".to_string());
+
+        let pkgs = vec![PythonPackage {
+            name: "chitta".to_string(),
+            src_root: "src".to_string(),
+        }];
+        let result =
+            resolve_python_import("src/chitta/main.py", "chitta.config", &known, Some(&pkgs));
+        assert_eq!(result, Some("src/chitta/config.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_init_package() {
+        let mut known = HashSet::new();
+        known.insert("src/chitta/backends/__init__.py".to_string());
+
+        let pkgs = vec![PythonPackage {
+            name: "chitta".to_string(),
+            src_root: "src".to_string(),
+        }];
+        let result = resolve_python_import(
+            "src/chitta/main.py",
+            "chitta.backends",
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, Some("src/chitta/backends/__init__.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_deep_dotted() {
+        let mut known = HashSet::new();
+        known.insert("src/chitta/db/postgres.py".to_string());
+
+        let pkgs = vec![PythonPackage {
+            name: "chitta".to_string(),
+            src_root: "src".to_string(),
+        }];
+        let result = resolve_python_import(
+            "src/chitta/main.py",
+            "chitta.db.postgres",
+            &known,
+            Some(&pkgs),
+        );
+        assert_eq!(result, Some("src/chitta/db/postgres.py".to_string()));
     }
 
     #[test]
@@ -1941,8 +2236,75 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/sub/helpers.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".sub.helpers", &known);
+        let result = resolve_python_import("pkg/main.py", ".sub.helpers", &known, None);
         assert_eq!(result, Some("pkg/sub/helpers.py".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pyproject_setuptools_with_find() {
+        let toml = r#"
+[project]
+name = "chitta-mcp"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+"#;
+        let pkgs = parse_pyproject_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "chitta_mcp");
+        assert_eq!(pkgs[0].src_root, "src");
+    }
+
+    #[test]
+    fn test_parse_pyproject_poetry_packages() {
+        let toml = r#"
+[tool.poetry]
+name = "my-lib"
+packages = [{include = "mylib", from = "src"}]
+"#;
+        let pkgs = parse_pyproject_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "mylib");
+        assert_eq!(pkgs[0].src_root, "src");
+    }
+
+    #[test]
+    fn test_parse_pyproject_poetry_name_only() {
+        let toml = r#"
+[tool.poetry]
+name = "my-app"
+version = "1.0"
+"#;
+        let pkgs = parse_pyproject_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "my_app");
+        assert_eq!(pkgs[0].src_root, "");
+    }
+
+    #[test]
+    fn test_parse_pyproject_pep621_minimal_defers_to_init() {
+        let toml = r#"
+[project]
+name = "simple-pkg"
+version = "0.1.0"
+"#;
+        let result = parse_pyproject_packages(toml);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_pyproject_setuptools_package_dir() {
+        let toml = r#"
+[project]
+name = "my-project"
+
+[tool.setuptools]
+package-dir = {"" = "lib"}
+"#;
+        let pkgs = parse_pyproject_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "my_project");
+        assert_eq!(pkgs[0].src_root, "lib");
     }
 
     // --- Go resolver ---
