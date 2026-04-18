@@ -87,6 +87,7 @@ mod tests {
     #[test]
     fn changed_files_between_commits() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit(&repo, dir.path(), &[("a.txt", "hello")], "first");
         make_commit(
@@ -105,6 +106,7 @@ mod tests {
     #[test]
     fn single_ref_implies_to_head() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit(&repo, dir.path(), &[("a.txt", "v1")], "first");
         make_commit(&repo, dir.path(), &[("b.txt", "v1")], "second");
@@ -117,6 +119,7 @@ mod tests {
     #[test]
     fn no_changes_returns_empty() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit(&repo, dir.path(), &[("a.txt", "v1")], "first");
 
@@ -127,6 +130,7 @@ mod tests {
     #[test]
     fn invalid_revspec_returns_error() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let _repo = init_repo(dir.path());
         let result = changed_files_in_range(dir.path(), "nonexistent..HEAD");
         assert!(result.is_err());
@@ -135,6 +139,7 @@ mod tests {
     #[test]
     fn not_a_git_repo_returns_error() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let result = changed_files_in_range(dir.path(), "main..HEAD");
         assert!(result.is_err());
     }

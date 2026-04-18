@@ -855,3 +855,22 @@ pub(super) struct ToolsParams {
     )]
     pub disable: Option<Vec<String>>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum WorkspaceAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SoulWorkspaceParams {
+    #[schemars(description = "Action to perform: add or remove a project domain")]
+    pub action: WorkspaceAction,
+    #[schemars(description = "The alias (domain name) for the project")]
+    pub alias: String,
+    #[schemars(
+        description = "The path to the project directory (required for 'add', optional for 'remove')"
+    )]
+    pub path: Option<String>,
+}

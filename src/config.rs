@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
@@ -5,6 +6,7 @@ use crate::error::Result;
 
 pub struct Config {
     pub project_roots: Vec<PathBuf>,
+    pub root_aliases: HashMap<PathBuf, String>,
     pub primary_root: PathBuf,
     pub db_path: PathBuf,
     pub reindex: bool,
@@ -57,19 +59,58 @@ fn detect_child_project_roots(dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn detect_qartez_workspace(root: &Path) -> (Vec<PathBuf>, HashMap<PathBuf, String>) {
+    let config_path = root.join(".qartez").join("workspace.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return (Vec::new(), HashMap::new()),
+    };
+
+    let doc: toml_edit::DocumentMut = match content.parse() {
+        Ok(v) => v,
+        Err(_) => return (Vec::new(), HashMap::new()),
+    };
+
+    let mut roots = Vec::new();
+    let mut aliases = HashMap::new();
+
+    if let Some(workspaces) = doc.get("workspaces").and_then(|w| w.as_table()) {
+        for (alias, value) in workspaces.iter() {
+            let path_str = match value.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let path = expand_path(path_str, root);
+
+            if let Ok(canonical) = path.canonicalize() {
+                roots.push(canonical.clone());
+                aliases.insert(canonical, alias.to_string());
+            } else if path.is_dir() {
+                roots.push(path.clone());
+                aliases.insert(path, alias.to_string());
+            }
+        }
+    }
+
+    (roots, aliases)
+}
+
 /// Detect workspace member directories from workspace config files.
 ///
 /// Checks for npm/yarn/pnpm (`package.json` `"workspaces"`), Cargo
 /// (`Cargo.toml` `[workspace] members`), and Go (`go.work` `use`
 /// directives). Returned paths are absolute and sorted.
-fn detect_workspace_members(root: &Path) -> Vec<PathBuf> {
+fn detect_workspace_members(root: &Path) -> (Vec<PathBuf>, HashMap<PathBuf, String>) {
     let mut members = Vec::new();
+    let (qartez_roots, qartez_aliases) = detect_qartez_workspace(root);
+    members.extend(qartez_roots);
     members.extend(detect_npm_workspace(root));
     members.extend(detect_cargo_workspace(root));
     members.extend(detect_go_workspace(root));
     members.sort();
     members.dedup();
-    members
+    (members, qartez_aliases)
 }
 
 /// Parse `package.json` `"workspaces"` field and expand globs.
@@ -229,28 +270,40 @@ fn expand_workspace_globs(root: &Path, patterns: &[&str]) -> Vec<PathBuf> {
 /// into additional roots. The original root is kept (it may contain shared
 /// config, scripts, etc.), and members are appended after it. Duplicates
 /// are removed.
-fn expand_roots_with_workspaces(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+fn expand_roots_with_workspaces(roots: Vec<PathBuf>) -> (Vec<PathBuf>, HashMap<PathBuf, String>) {
     let mut expanded = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut all_aliases = HashMap::new();
     for root in &roots {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
         if seen.insert(canonical.clone()) {
             expanded.push(root.clone());
         }
-        for member in detect_workspace_members(root) {
+        let (members, aliases) = detect_workspace_members(root);
+        all_aliases.extend(aliases);
+        for member in members {
             let member_canonical = member.canonicalize().unwrap_or_else(|_| member.clone());
             if seen.insert(member_canonical) {
                 expanded.push(member);
             }
         }
     }
-    expanded
+    (expanded, all_aliases)
+}
+
+/// Expand a path string relative to `base`, handling `~/` home expansion.
+pub(crate) fn expand_path(path_str: &str, base: &Path) -> PathBuf {
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home) = cross_platform_home() {
+            return home.join(rest);
+        }
+    }
+    base.join(path_str)
 }
 
 /// Cross-platform home directory detection.
 /// Checks HOME (Unix), USERPROFILE (Windows), HOMEDRIVE+HOMEPATH (Windows).
-fn cross_platform_home() -> Option<PathBuf> {
-    // Try HOME (Unix)
+pub fn cross_platform_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         return Some(PathBuf::from(home));
     }
@@ -301,7 +354,7 @@ impl Config {
 
         // Expand workspace members: if any root has a workspace config
         // (npm, Cargo, Go), add member directories as additional roots.
-        let project_roots = expand_roots_with_workspaces(project_roots);
+        let (project_roots, root_aliases) = expand_roots_with_workspaces(project_roots);
 
         let primary_root = project_roots[0].clone();
 
@@ -322,11 +375,57 @@ impl Config {
 
         Ok(Config {
             project_roots,
+            root_aliases,
             primary_root,
             db_path,
             reindex: cli.reindex,
             git_depth: cli.git_depth,
             has_project,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_qartez_workspace_expansion() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let other = TempDir::new().unwrap();
+        let other_path = other.path();
+
+        let qartez_dir = root.join(".qartez");
+        std::fs::create_dir_all(&qartez_dir).unwrap();
+
+        let config_toml = format!(
+            r#"
+[workspaces]
+Other = "{}"
+Relative = "subproject"
+"#,
+            other_path.to_string_lossy().replace('\\', "/")
+        );
+        std::fs::write(qartez_dir.join("workspace.toml"), config_toml).unwrap();
+
+        let subproject = root.join("subproject");
+        std::fs::create_dir_all(&subproject).unwrap();
+
+        let (roots, aliases) = detect_qartez_workspace(root);
+
+        assert_eq!(roots.len(), 2);
+
+        let other_canonical = other_path
+            .canonicalize()
+            .unwrap_or(other_path.to_path_buf());
+        let sub_canonical = subproject.canonicalize().unwrap_or(subproject);
+
+        assert!(roots.contains(&other_canonical));
+        assert!(roots.contains(&sub_canonical));
+
+        assert_eq!(aliases.get(&other_canonical).unwrap(), "Other");
+        assert_eq!(aliases.get(&sub_canonical).unwrap(), "Relative");
     }
 }

@@ -6,13 +6,51 @@ use std::collections::HashMap;
 
 use crate::str_utils::floor_char_boundary;
 
+/// Resolve a prefixed multi-root path (e.g. `"MyAlias/src/lib.rs"`) to an
+/// absolute path by matching its first component against known roots and
+/// aliases. Returns `None` when there is only one root or no prefix matches.
+pub(super) fn resolve_prefixed_path(
+    path: &std::path::Path,
+    roots: &[std::path::PathBuf],
+    aliases: &HashMap<std::path::PathBuf, String>,
+) -> Option<std::path::PathBuf> {
+    if roots.len() <= 1 {
+        return None;
+    }
+    let first = match path.components().next() {
+        Some(std::path::Component::Normal(n)) => n,
+        _ => return None,
+    };
+    let first_str = first.to_string_lossy();
+    for root in roots {
+        let alias = aliases.get(root).map(|s| s.as_str());
+        let matches = if let Some(a) = alias {
+            first_str == a
+        } else {
+            root.file_name()
+                .map(|n| n.to_string_lossy() == first_str)
+                .unwrap_or(false)
+        };
+        if matches {
+            let remainder: std::path::PathBuf = path.components().skip(1).collect();
+            return Some(root.join(remainder));
+        }
+    }
+    None
+}
+
 pub(super) fn elide_file_source(
     project_root: &std::path::Path,
+    project_roots: &[std::path::PathBuf],
+    root_aliases: &HashMap<std::path::PathBuf, String>,
     file_path: &str,
     symbols: &[crate::storage::models::SymbolRow],
     token_budget_remaining: usize,
 ) -> Option<String> {
-    let abs_path = project_root.join(file_path);
+    let path = std::path::Path::new(file_path);
+    let abs_path = resolve_prefixed_path(path, project_roots, root_aliases)
+        .unwrap_or_else(|| project_root.join(file_path));
+
     let source = std::fs::read_to_string(&abs_path).ok()?;
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {

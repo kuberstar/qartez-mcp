@@ -1,5 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceAction {
+    Add,
+    Remove,
+}
 
 /// Output format for CLI commands.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -219,5 +227,14 @@ pub enum Command {
         /// Optional task description to help prioritize
         #[arg(long)]
         task: Option<String>,
+    },
+
+    /// Manage project domains (workspaces) dynamically
+    Workspace {
+        action: WorkspaceAction,
+        /// The alias (domain name) for the project
+        alias: String,
+        /// The path to the project directory (required for 'add')
+        path: Option<String>,
     },
 }

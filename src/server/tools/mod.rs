@@ -37,10 +37,12 @@ mod tools_meta;
 mod trend;
 mod unused;
 mod wiki;
+mod workspace;
 
 impl QartezServer {
     pub(super) fn tool_router() -> ToolRouter<Self> {
         Self::qartez_map_router()
+            + Self::qartez_workspace_router()
             + Self::qartez_find_router()
             + Self::qartez_read_router()
             + Self::qartez_impact_router()

@@ -83,7 +83,11 @@ impl QartezServer {
                 .file_path
                 .as_ref()
                 .map(|s| crate::index::to_forward_slash(s.clone())),
-            project_roots: self.project_roots.clone(),
+            project_roots: self
+                .project_roots
+                .read()
+                .map_err(|e| e.to_string())?
+                .clone(),
         };
 
         let findings = scan(&conn, &rules, &opts);

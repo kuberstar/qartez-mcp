@@ -302,6 +302,7 @@ mod tests {
     #[test]
     fn analyze_single_author_repo() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit(
             &repo,
@@ -320,6 +321,7 @@ mod tests {
     #[test]
     fn analyze_two_authors() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit_as(
             &repo,
@@ -350,6 +352,7 @@ mod tests {
     #[test]
     fn author_filter_excludes_unmatched() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit_as(
             &repo,
@@ -405,6 +408,7 @@ mod tests {
     #[test]
     fn analyze_empty_file_list() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let _repo = init_repo(dir.path());
         let result = analyze_knowledge(dir.path(), &[], None).unwrap();
         assert!(result.is_empty());
@@ -413,6 +417,7 @@ mod tests {
     #[test]
     fn analyze_nonexistent_file_skipped() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit(&repo, dir.path(), &[("exists.rs", "fn f() {}\n")], "init");
         let result = analyze_knowledge(
@@ -428,6 +433,7 @@ mod tests {
     #[test]
     fn analyze_non_git_directory_returns_error() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let result = analyze_knowledge(dir.path(), &["any.rs".into()], None);
         assert!(result.is_err(), "should fail on non-git directory");
     }
@@ -435,6 +441,7 @@ mod tests {
     #[test]
     fn author_filter_case_insensitive() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit_as(
             &repo,
@@ -519,6 +526,7 @@ mod tests {
     #[test]
     fn analyze_total_lines_matches_file_content() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         let content = "line1\nline2\nline3\nline4\nline5\n";
         make_commit(&repo, dir.path(), &[("five_lines.rs", content)], "init");
@@ -533,6 +541,7 @@ mod tests {
     #[test]
     fn analyze_multiple_files_independent() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let repo = init_repo(dir.path());
         make_commit_as(
             &repo,

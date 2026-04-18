@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -41,7 +41,8 @@ use crate::toolchain;
 pub struct QartezServer {
     db: Arc<Mutex<Connection>>,
     project_root: PathBuf,
-    project_roots: Vec<PathBuf>,
+    project_roots: Arc<RwLock<Vec<PathBuf>>>,
+    root_aliases: Arc<RwLock<HashMap<PathBuf, String>>>,
     git_depth: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -52,13 +53,14 @@ pub struct QartezServer {
 impl QartezServer {
     pub fn new(conn: Connection, project_root: PathBuf, git_depth: u32) -> Self {
         let project_roots = vec![project_root.clone()];
-        Self::with_roots(conn, project_root, project_roots, git_depth)
+        Self::with_roots(conn, project_root, project_roots, HashMap::new(), git_depth)
     }
 
     pub fn with_roots(
         conn: Connection,
         project_root: PathBuf,
         project_roots: Vec<PathBuf>,
+        root_aliases: HashMap<PathBuf, String>,
         git_depth: u32,
     ) -> Self {
         // Self-heal the body FTS index. Existing `.qartez/index.db` files
@@ -97,7 +99,8 @@ impl QartezServer {
         Self {
             db: Arc::new(Mutex::new(conn)),
             project_root,
-            project_roots,
+            project_roots: Arc::new(RwLock::new(project_roots)),
+            root_aliases: Arc::new(RwLock::new(root_aliases)),
             git_depth,
             tool_router: router,
             parse_cache: Arc::new(Mutex::new(ParseCache::default())),
@@ -135,20 +138,11 @@ impl QartezServer {
             }
         }
 
-        if self.project_roots.len() > 1
-            && let Some(std::path::Component::Normal(first)) = path.components().next()
-        {
-            let first_str = first.to_string_lossy();
-            for root in &self.project_roots {
-                let root_name = root
-                    .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
-                if first_str == root_name {
-                    let remainder: PathBuf = path.components().skip(1).collect();
-                    return Ok(root.join(remainder));
-                }
-            }
+        let roots = self.project_roots.read().map_err(|e| e.to_string())?;
+        let aliases = self.root_aliases.read().map_err(|e| e.to_string())?;
+
+        if let Some(resolved) = helpers::resolve_prefixed_path(path, &roots, &aliases) {
+            return Ok(resolved);
         }
 
         Ok(self.project_root.join(user_path))
@@ -226,6 +220,7 @@ impl QartezServer {
             }
             fallible {
                 "qartez_find"        => qartez_find:        SoulFindParams,
+                "qartez_workspace"   => qartez_workspace:   SoulWorkspaceParams,
                 "qartez_read"        => qartez_read:        SoulReadParams,
                 "qartez_impact"      => qartez_impact:      SoulImpactParams,
                 "qartez_diff_impact" => qartez_diff_impact: SoulDiffImpactParams,
@@ -477,15 +472,15 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_30() {
+    fn total_tool_count_is_31() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 30, "expected 30 tools, got {}", all.len());
+        assert_eq!(all.len(), 31, "expected 31 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
-        assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
+        assert_eq!(tiers::TIER_CORE.len(), 9, "core tier");
         assert_eq!(tiers::TIER_ANALYSIS.len(), 16, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 3, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 2, "meta tier");

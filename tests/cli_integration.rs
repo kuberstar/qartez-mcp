@@ -38,6 +38,7 @@ impl Formatter for Settings {
 
     let config = Config {
         project_roots: vec![dir.path().to_path_buf()],
+        root_aliases: std::collections::HashMap::new(),
         primary_root: dir.path().to_path_buf(),
         db_path: db_dir.join("index.db"),
         reindex: false,
@@ -289,6 +290,7 @@ fn cli_stats_no_project() {
     fs::create_dir_all(&db_dir).unwrap();
     let config = Config {
         project_roots: vec![dir.path().to_path_buf()],
+        root_aliases: std::collections::HashMap::new(),
         primary_root: dir.path().to_path_buf(),
         db_path: db_dir.join("index.db"),
         reindex: false,

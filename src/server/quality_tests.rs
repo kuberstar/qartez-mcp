@@ -271,6 +271,7 @@ fn populate_db(conn: &Connection) {
 
 fn setup() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     write_test_files(dir.path());
     let conn = setup_db();
     populate_db(&conn);
@@ -282,6 +283,7 @@ fn setup() -> (QartezServer, TempDir) {
 /// Used to stress-test unbounded output tools.
 fn setup_scale(leaf_count: usize) -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 
@@ -541,7 +543,14 @@ fn elision_function_body_replaced() {
         owner_type: None,
     }];
 
-    let result = elide_file_source(dir.path(), "src/utils.rs", &symbols, 10000);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/utils.rs",
+        &symbols,
+        10000,
+    );
     assert!(
         result.is_some(),
         "should produce output for exported function"
@@ -576,7 +585,14 @@ fn elision_short_struct_shown_in_full() {
         owner_type: None,
     }];
 
-    let result = elide_file_source(dir.path(), "src/models.rs", &symbols, 10000);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/models.rs",
+        &symbols,
+        10000,
+    );
     assert!(result.is_some());
     let output = result.unwrap();
     // 4 lines (<=5), so full content should be shown
@@ -605,7 +621,14 @@ fn elision_long_type_truncated() {
         owner_type: None,
     }];
 
-    let result = elide_file_source(dir.path(), "src/models.rs", &symbols, 10000);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/models.rs",
+        &symbols,
+        10000,
+    );
     assert!(result.is_some());
     let output = result.unwrap();
     // 5 lines exactly (<=5 threshold), should show in full
@@ -634,7 +657,14 @@ fn elision_no_exported_symbols() {
         owner_type: None,
     }];
 
-    let result = elide_file_source(dir.path(), "src/utils.rs", &symbols, 10000);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/utils.rs",
+        &symbols,
+        10000,
+    );
     assert!(result.is_none(), "no exported symbols should return None");
 }
 
@@ -674,7 +704,14 @@ fn elision_budget_zero_minimal_output() {
         },
     ];
 
-    let result = elide_file_source(dir.path(), "src/utils.rs", &symbols, 0);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/utils.rs",
+        &symbols,
+        0,
+    );
     // With budget 0, the first symbol is still added (budget check is after),
     // then the loop breaks. Verify output doesn't grow unbounded.
     if let Some(output) = result {
@@ -722,7 +759,14 @@ fn elision_gap_marker_between_symbols() {
         },
     ];
 
-    let result = elide_file_source(dir.path(), "src/utils.rs", &symbols, 10000);
+    let result = elide_file_source(
+        dir.path(),
+        &[],
+        &std::collections::HashMap::new(),
+        "src/utils.rs",
+        &symbols,
+        10000,
+    );
     assert!(result.is_some());
     let output = result.unwrap();
     assert!(
@@ -1286,6 +1330,7 @@ fn qartez_read_accepts_offset_alias() {
 #[test]
 fn qartez_grep_search_bodies_hits_identifier_inside_body() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(
@@ -1571,6 +1616,7 @@ fn qartez_outline_concise_smaller() {
 #[test]
 fn qartez_outline_shows_struct_fields_nested_under_parent() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(
@@ -1621,6 +1667,7 @@ fn qartez_outline_shows_struct_fields_nested_under_parent() {
 #[test]
 fn qartez_outline_shows_tuple_struct_fields() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(
@@ -2340,6 +2387,7 @@ fn scale_qartez_find_common_name() {
 #[test]
 fn edge_empty_db_qartez_map() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let output = server.build_overview(20, 4000, None, None, false, false);
@@ -2350,6 +2398,7 @@ fn edge_empty_db_qartez_map() {
 #[test]
 fn edge_empty_db_qartez_stats() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let result = server
@@ -2361,6 +2410,7 @@ fn edge_empty_db_qartez_stats() {
 #[test]
 fn edge_empty_db_qartez_grep() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let result = server
@@ -2378,6 +2428,7 @@ fn edge_empty_db_qartez_grep() {
 #[test]
 fn edge_empty_db_qartez_unused() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let result = server
@@ -2660,6 +2711,7 @@ fn monotonicity_qartez_grep() {
 /// touch the local alias spelling or its call sites.
 fn setup_aliased_rename() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 
@@ -2930,6 +2982,7 @@ fn rewrite_mod_decl_word_boundary_safe() {
 #[test]
 fn find_parent_mod_file_flat_sibling() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "mod foo;\n").unwrap();
     fs::write(dir.path().join("src/foo.rs"), "").unwrap();
@@ -2941,6 +2994,7 @@ fn find_parent_mod_file_flat_sibling() {
 #[test]
 fn find_parent_mod_file_nested_mod_rs() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     fs::create_dir_all(dir.path().join("src/a")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "mod a;\n").unwrap();
     fs::write(dir.path().join("src/a/mod.rs"), "mod b;\n").unwrap();
@@ -2953,6 +3007,7 @@ fn find_parent_mod_file_nested_mod_rs() {
 #[test]
 fn find_parent_mod_file_rejects_non_rust() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     assert!(find_parent_mod_file(dir.path(), "src/config.toml").is_none());
 }
 
@@ -3025,6 +3080,7 @@ fn qartez_wiki_assigns_every_file_to_exactly_one_cluster() {
 
 fn setup_with_complexity() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     write_test_files(dir.path());
     let conn = setup_db();
 
@@ -3205,6 +3261,7 @@ fn qartez_hotspots_concise_smaller() {
 #[test]
 fn qartez_hotspots_empty_db_no_panic() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let out = server
@@ -3752,6 +3809,7 @@ fn qartez_hotspots_threshold_above_10_clamped() {
 
 fn setup_with_clones() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 
@@ -3882,6 +3940,7 @@ fn qartez_clones_concise_smaller() {
 #[test]
 fn qartez_clones_no_clones_message() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let out = server
@@ -4154,6 +4213,7 @@ fn qartez_boundaries_detects_violation() {
 #[test]
 fn qartez_trend_no_git_depth_returns_error() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
     let result = server.qartez_trend(Parameters(SoulTrendParams {
@@ -4169,6 +4229,7 @@ fn qartez_trend_no_git_depth_returns_error() {
 #[test]
 fn qartez_trend_nonexistent_file_returns_empty() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     // Need at least one commit so HEAD exists.
     fs::write(dir.path().join("dummy.rs"), "pub fn x() {}\n").unwrap();
@@ -4193,6 +4254,7 @@ fn qartez_trend_nonexistent_file_returns_empty() {
 #[test]
 fn qartez_trend_with_git_history() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
 
     // Commit 1: simple function.
@@ -4236,6 +4298,7 @@ fn qartez_trend_with_git_history() {
 #[test]
 fn qartez_trend_concise_format() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
 
     fs::write(dir.path().join("lib.rs"), "pub fn f() -> bool { true }\n").unwrap();
@@ -4334,6 +4397,7 @@ fn all_tools_have_dispatch_entries() {
 /// runs full_index, and constructs a QartezServer ready for destructive ops.
 fn setup_destructive() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 
@@ -4683,6 +4747,7 @@ fn rename_file_apply_into_subdirectory() {
 
 fn setup_with_risk() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     let tests_dir = dir.path().join("tests");
     fs::create_dir_all(&src).unwrap();
@@ -5321,6 +5386,7 @@ fn qartez_diff_impact_risk_highest_risk_has_reason() {
 #[test]
 fn qartez_knowledge_no_git_depth_returns_error() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
@@ -5337,6 +5403,7 @@ fn qartez_knowledge_no_git_depth_returns_error() {
 #[test]
 fn qartez_knowledge_empty_db_returns_no_files() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
@@ -5357,6 +5424,7 @@ fn qartez_knowledge_empty_db_returns_no_files() {
 #[test]
 fn qartez_knowledge_file_level_with_repo() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     // Create a git repo with a file
     let repo = git2::Repository::init(dir.path()).unwrap();
     let src = dir.path().join("src");
@@ -5398,6 +5466,7 @@ fn qartez_knowledge_file_level_with_repo() {
 #[test]
 fn qartez_knowledge_module_level() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -5437,6 +5506,7 @@ fn qartez_knowledge_module_level() {
 #[test]
 fn qartez_knowledge_concise_format() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
     let mut index = repo.index().unwrap();
@@ -5472,6 +5542,7 @@ fn qartez_knowledge_concise_format() {
 #[test]
 fn qartez_knowledge_output_format_detailed_validated() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -5530,6 +5601,7 @@ fn qartez_knowledge_output_format_detailed_validated() {
 #[test]
 fn qartez_knowledge_file_path_prefix_filter() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     let src = dir.path().join("src");
     let tests_dir = dir.path().join("tests");
@@ -5834,6 +5906,7 @@ fn qartez_calls_no_symbol_errors() {
 
 fn setup_test_gaps_fixture() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     let tests_dir = dir.path().join("tests");
     fs::create_dir_all(&src).unwrap();
@@ -6147,6 +6220,7 @@ fn qartez_test_gaps_limit_truncates() {
 
 fn setup_smells_fixture() -> (QartezServer, TempDir) {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 

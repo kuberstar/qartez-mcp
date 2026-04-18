@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 /// sufficient for the vast majority of code-exploration sessions.
 pub(super) const TIER_CORE: &[&str] = &[
     "qartez_map",
+    "qartez_workspace",
     "qartez_find",
     "qartez_grep",
     "qartez_read",

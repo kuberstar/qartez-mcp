@@ -132,6 +132,30 @@ pub fn delete_file_data(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Delete all files whose path starts with `alias/` (e.g. a workspace domain),
+/// cleaning up FTS and embedding tables before the cascade removes symbols.
+pub fn delete_files_by_prefix(conn: &Connection, alias: &str) -> Result<usize> {
+    let pattern = format!("{alias}/%");
+    conn.execute(
+        "DELETE FROM symbols_fts WHERE rowid IN \
+         (SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path LIKE ?1)",
+        [&pattern],
+    )?;
+    conn.execute(
+        "DELETE FROM symbols_body_fts WHERE rowid IN \
+         (SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path LIKE ?1)",
+        [&pattern],
+    )?;
+    #[cfg(feature = "semantic")]
+    conn.execute(
+        "DELETE FROM symbol_embeddings WHERE rowid IN \
+         (SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path LIKE ?1)",
+        [&pattern],
+    )?;
+    let n = conn.execute("DELETE FROM files WHERE path LIKE ?1", [&pattern])?;
+    Ok(n)
+}
+
 /// Clear a file's derived content (symbols, outgoing edges, FTS entries,
 /// unused-export markers) without deleting the file row itself. This
 /// preserves the `file_id` and incoming edges from other files, which is

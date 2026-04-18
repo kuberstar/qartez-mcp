@@ -246,6 +246,8 @@ impl super::QartezServer {
         }
 
         if !concise {
+            let roots = self.project_roots.read().unwrap();
+            let aliases = self.root_aliases.read().unwrap();
             for (path, symbols) in &file_symbols {
                 let exported: Vec<&crate::storage::models::SymbolRow> =
                     symbols.iter().filter(|s| s.is_exported).collect();
@@ -260,9 +262,15 @@ impl super::QartezServer {
                 out.push_str(&section_header);
 
                 let remaining = token_budget.saturating_sub(estimate_tokens(&out));
-                if let Some(elided) =
-                    elide_file_source(&self.project_root, path, symbols, remaining)
-                {
+
+                if let Some(elided) = elide_file_source(
+                    &self.project_root,
+                    &roots,
+                    &aliases,
+                    path,
+                    symbols,
+                    remaining,
+                ) {
                     out.push_str(&elided);
                 } else {
                     for sym in &exported {

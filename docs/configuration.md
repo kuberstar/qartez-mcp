@@ -33,6 +33,25 @@ When a root contains a workspace config, qartez expands it automatically:
 Each workspace member becomes an additional root. The original root is kept
 (it often contains shared config, scripts, etc.).
 
+### Explicit workspaces (`.qartez/workspace.toml`)
+
+For cases where you want to include unrelated directories or use custom prefixes
+(domains) for your projects, create a `.qartez/workspace.toml` file in your
+project root:
+
+```toml
+[workspaces]
+# Key = Alias/Prefix used in path results
+# Value = Path to the project (absolute, relative, or ~/ expansion)
+Core = "../qartez-core"
+Legacy = "~/old-projects/v1"
+```
+
+Files within these roots will be prefixed with the alias (e.g.,
+`Core/src/lib.rs`) instead of their directory name. This is the recommended
+way to handle multi-app porting or monorepo-style development across
+disparate folders.
+
 ## Database location
 
 - **Single-root** — `.qartez/index.db` inside the project root

@@ -63,7 +63,12 @@ pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
 /// collision on the UNIQUE `files.path` column.
 ///
 /// For single-root mode, delegates to `full_index` with no prefix.
-pub fn full_index_multi(conn: &Connection, roots: &[PathBuf], force: bool) -> Result<()> {
+pub fn full_index_multi(
+    conn: &Connection,
+    roots: &[PathBuf],
+    aliases: &HashMap<PathBuf, String>,
+    force: bool,
+) -> Result<()> {
     if roots.len() <= 1 {
         if let Some(root) = roots.first() {
             return full_index(conn, root, force);
@@ -78,11 +83,15 @@ pub fn full_index_multi(conn: &Connection, roots: &[PathBuf], force: bool) -> Re
     // We insert BOTH the prefixed form (for DB lookups and stale-file
     // detection) and the unprefixed raw form (for import resolvers, which
     // generate candidates relative to a single root).
+    let roots_with_prefixes: Vec<(&PathBuf, String)> = roots
+        .iter()
+        .map(|r| (r, root_prefix(r, aliases.get(r).map(|s| s.as_str()))))
+        .collect();
+
     let mut all_known: HashSet<String> = HashSet::new();
-    for root in roots {
-        let prefix = root_prefix(root);
+    for (root, prefix) in &roots_with_prefixes {
         for file_path in walker::walk_source_files(root) {
-            let raw_rel = match file_path.strip_prefix(root) {
+            let raw_rel = match file_path.strip_prefix(*root) {
                 Ok(p) => to_forward_slash(p.to_string_lossy().into_owned()),
                 Err(_) => to_forward_slash(file_path.to_string_lossy().into_owned()),
             };
@@ -90,17 +99,19 @@ pub fn full_index_multi(conn: &Connection, roots: &[PathBuf], force: bool) -> Re
             all_known.insert(raw_rel);
         }
     }
-    for root in roots {
-        let prefix = root_prefix(root);
+    for (root, prefix) in &roots_with_prefixes {
         tracing::info!("Indexing root: {} (prefix: {prefix})", root.display());
-        full_index_root(conn, root, force, &prefix, &all_known)?;
+        full_index_root(conn, root, force, prefix, &all_known)?;
     }
     Ok(())
 }
 
 /// Extract the directory name of a root, used as the path prefix in
 /// multi-root mode (e.g. `/home/user/repo-a` -> `"repo-a"`).
-fn root_prefix(root: &Path) -> String {
+fn root_prefix(root: &Path, alias: Option<&str>) -> String {
+    if let Some(a) = alias {
+        return a.to_string();
+    }
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "root".to_string())

@@ -23,7 +23,12 @@ pub fn run(config: &Config, command: &Command, format: OutputFormat) -> Result<(
 
     if config.has_project {
         eprintln!("Indexing...");
-        index::full_index_multi(&conn, &config.project_roots, config.reindex)?;
+        index::full_index_multi(
+            &conn,
+            &config.project_roots,
+            &config.root_aliases,
+            config.reindex,
+        )?;
         graph::pagerank::compute_pagerank(&conn, &Default::default())?;
         graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
         git::cochange::analyze_cochanges(
@@ -37,7 +42,13 @@ pub fn run(config: &Config, command: &Command, format: OutputFormat) -> Result<(
         eprintln!("Index ready.");
     }
 
-    let server = QartezServer::new(conn, config.primary_root.clone(), config.git_depth);
+    let server = QartezServer::with_roots(
+        conn,
+        config.primary_root.clone(),
+        config.project_roots.clone(),
+        config.root_aliases.clone(),
+        config.git_depth,
+    );
 
     let (tool_name, args) = build_tool_call(command);
 
@@ -204,6 +215,19 @@ fn build_tool_call(command: &Command) -> (String, serde_json::Value) {
                 args["task"] = json!(t);
             }
             ("qartez_context".into(), args)
+        }
+
+        Command::Workspace {
+            action,
+            alias,
+            path,
+        } => {
+            let args = json!({
+                "action": action,
+                "alias": alias,
+                "path": path,
+            });
+            ("qartez_workspace".into(), args)
         }
     }
 }
