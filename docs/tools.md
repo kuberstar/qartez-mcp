@@ -376,6 +376,29 @@ of total. Bus factor 1 means a single person owns most of the code.
 
 Requires `git_depth > 0`.
 
+### `qartez_blame`
+
+Symbol-level git blame: resolves a symbol to its file and line range, then
+runs `git blame` scoped to those lines. Shows who last touched each hunk
+and the associated commit message. Use `aggregate=true` for a per-author
+summary with line counts and percentages.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol` | string | — | Symbol name to blame (aliases: `name`, `symbol_name`) |
+| `file_path` | string | — | Disambiguate when multiple files define the same symbol |
+| `aggregate` | bool | false | Group by author with summed line counts |
+| `limit` | u32 | 20 | Max entries to return |
+| `token_budget` | u32 | 4000 | Approximate token budget for output |
+| `format` | enum | detailed | `detailed` or `concise` |
+
+Unlike `qartez_knowledge` (which gives a project-wide bus-factor overview),
+`qartez_blame` drills into a single symbol to show exactly who wrote which
+lines and when. Use `qartez_knowledge` for the big picture, `qartez_blame`
+for per-function forensics.
+
+Requires `git_depth > 0`.
+
 ---
 
 ## Refactor tools

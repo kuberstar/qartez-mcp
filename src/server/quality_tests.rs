@@ -6924,6 +6924,84 @@ fn qartez_health_empty_db_no_panic() {
     );
 }
 
+// =========================================================================
+// qartez_blame
+// =========================================================================
+
+#[test]
+fn qartez_blame_no_git_depth_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup_db();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+    let result = server.qartez_blame(Parameters(SoulBlameParams {
+        symbol: "hub_fn".into(),
+        file_path: None,
+        aggregate: None,
+        limit: None,
+        token_budget: None,
+        format: None,
+    }));
+    assert!(result.is_err(), "should error when git_depth is 0");
+    assert!(result.unwrap_err().contains("git history"));
+}
+
+#[test]
+fn qartez_blame_unknown_symbol_returns_error() {
+    let (server, _dir) = setup();
+    let result = server.qartez_blame(Parameters(SoulBlameParams {
+        symbol: "no_such_symbol_xyz".into(),
+        file_path: None,
+        aggregate: None,
+        limit: None,
+        token_budget: None,
+        format: None,
+    }));
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+}
+
+#[test]
+fn qartez_blame_multi_file_disambiguation_error() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup_db();
+
+    let mk_sym = || SymbolInsert {
+        name: "dup_fn".into(),
+        kind: "function".into(),
+        line_start: 1,
+        line_end: 10,
+        signature: Some("pub fn dup_fn()".into()),
+        is_exported: true,
+        shape_hash: None,
+        unused_excluded: false,
+        parent_idx: None,
+        complexity: None,
+        owner_type: None,
+    };
+
+    let f1 = write::upsert_file(&conn, "src/a.rs", 500, 50, "rust", 1).unwrap();
+    write::insert_symbols(&conn, f1, &[mk_sym()]).unwrap();
+
+    let f2 = write::upsert_file(&conn, "src/b.rs", 500, 50, "rust", 1).unwrap();
+    write::insert_symbols(&conn, f2, &[mk_sym()]).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+    let result = server.qartez_blame(Parameters(SoulBlameParams {
+        symbol: "dup_fn".into(),
+        file_path: None,
+        aggregate: None,
+        limit: None,
+        token_budget: None,
+        format: None,
+    }));
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("disambiguate"),
+        "multi-file should ask to disambiguate: {err}"
+    );
+}
+
 #[test]
 fn qartez_refactor_plan_limit_caps_steps() {
     // Exactly two smells are seeded (huge_fn + many_args implicit LP). With
@@ -7131,6 +7209,18 @@ fn qartez_health_buckets_match_intersection_rule() {
         out.contains("## Medium") || out.contains("Medium"),
         "low-pagerank smells must fall into Medium bucket:\n{out}",
     );
+}
+
+#[test]
+#[cfg(feature = "benchmark")]
+fn qartez_blame_dispatch_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup_db();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    let result = server.call_tool_by_name("qartez_blame", serde_json::json!({"symbol": "main"}));
+    assert!(result.is_err(), "git_depth=0 should error through dispatch");
+    assert!(result.unwrap_err().contains("git history"));
 }
 
 // =========================================================================

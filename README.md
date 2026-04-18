@@ -10,7 +10,7 @@
   </p>
   <p align="center">
     <a href="#quickstart">Quickstart</a> ·
-    <a href="#the-37-tools">37 Tools</a> ·
+    <a href="#the-38-tools">38 Tools</a> ·
     <a href="#modification-guard">Guard</a> ·
     <a href="#benchmarks">Benchmarks</a> ·
     <a href="#comparison-with-alternatives">Comparison</a> ·
@@ -24,7 +24,7 @@
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg"></a>
     <img alt="MSRV 1.88" src="https://img.shields.io/badge/MSRV-1.88-orange.svg">
     <img alt="37 languages" src="https://img.shields.io/badge/languages-37-green.svg">
-    <img alt="37 MCP tools" src="https://img.shields.io/badge/MCP_tools-37-purple.svg">
+    <img alt="38 MCP tools" src="https://img.shields.io/badge/MCP_tools-38-purple.svg">
   </p>
 </p>
 
@@ -197,7 +197,7 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ---
 
-## The 37 tools
+## The 38 tools
 
 Think of these as the **standard library for AI code understanding**. Each one replaces a multi-step human workflow with a single, token-efficient call the agent can reason about.
 
@@ -237,6 +237,7 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 | `qartez_refactor_plan` | Ordered, safety-annotated refactor plan for one file. Each step names a technique (Extract Method, Introduce Parameter Object), an estimated CC impact category (High/Medium/Low) with a range, and safety signals from impact, test coverage, and caller count. |
 | `qartez_test_gaps` | Test coverage gap analysis via the import graph. Three modes: `gaps` ranks untested source files by risk, `map` shows test-to-source mappings, `suggest` recommends tests to run for a git diff range. |
 | `qartez_knowledge` | **Bus-factor analysis.** Git-blame-based authorship at file and module level. Surfaces single-author files and modules where knowledge is concentrated in one contributor. |
+| `qartez_blame` | **Symbol-level git blame.** Resolves a symbol to its file and line range, runs `git blame` scoped to those lines. Per-hunk detail or per-author aggregate with `aggregate=true`. |
 | `qartez_semantic` | Semantic search using a local embedding model. Natural-language queries ranked by hybrid FTS5 + vector similarity (RRF). Requires the `semantic` cargo feature and a one-time model download (~270 MB). |
 
 ### Refactor (unlock via `qartez_tools`)
@@ -338,9 +339,9 @@ Not claims. Measured. Reproducible. Run `make bench` and verify yourself.
 | `qartez_hierarchy` | 735 | 2,056 | **+64.3%** | **127x** |
 | `qartez_rename` | 439 | 648 | **+32.3%** | 11x |
 
-10 additional analytical tools have no meaningful grep/read equivalent - they solve problems the non-MCP stack cannot solve at all:
+11 additional analytical tools have no meaningful grep/read equivalent - they solve problems the non-MCP stack cannot solve at all:
 
-`qartez_hotspots`, `qartez_clones`, `qartez_smells`, `qartez_test_gaps`, `qartez_wiki`, `qartez_boundaries`, `qartez_trend`, `qartez_knowledge`, `qartez_diff_impact`, `qartez_security`.
+`qartez_hotspots`, `qartez_clones`, `qartez_smells`, `qartez_test_gaps`, `qartez_wiki`, `qartez_boundaries`, `qartez_trend`, `qartez_knowledge`, `qartez_blame`, `qartez_diff_impact`, `qartez_security`.
 
 <details>
 <summary>Multi-language bench</summary>
@@ -551,7 +552,7 @@ Qartez gives you the same structural intelligence these platforms sell - running
 
 **1. Quad-signal impact analysis.** `qartez_impact`, `qartez_diff_impact`, `qartez_context`, and `qartez_hotspots` fuse PageRank importance, static blast radius, git co-change, and cyclomatic complexity into one ranked answer. No other project combines all four.
 
-**2. Hotspots, clones, boundaries, security, smells, test gaps, knowledge, and trends in one server.** `qartez_hotspots` ranks the most dangerous functions in the repo by complexity x coupling x churn. `qartez_clones` finds duplicated logic via AST shape hashing. `qartez_boundaries` enforces architecture rules declared in `.qartez/boundaries.toml`. `qartez_security` scans for vulnerability patterns scored by PageRank. `qartez_smells` detects god functions, long parameter lists, and feature envy. `qartez_test_gaps` finds untested source files ranked by risk. `qartez_knowledge` surfaces bus-factor risks from git blame. `qartez_trend` tracks how a function's complexity evolved commit by commit. These are eight separate commercial products elsewhere, one MCP call each here.
+**2. Hotspots, clones, boundaries, security, smells, test gaps, knowledge, and trends in one server.** `qartez_hotspots` ranks the most dangerous functions in the repo by complexity x coupling x churn. `qartez_clones` finds duplicated logic via AST shape hashing. `qartez_boundaries` enforces architecture rules declared in `.qartez/boundaries.toml`. `qartez_security` scans for vulnerability patterns scored by PageRank. `qartez_smells` detects god functions, long parameter lists, and feature envy. `qartez_test_gaps` finds untested source files ranked by risk. `qartez_knowledge` surfaces bus-factor risks from git blame. `qartez_blame` drills into per-symbol authorship with line-level detail. `qartez_trend` tracks how a function's complexity evolved commit by commit. These are nine separate commercial products elsewhere, one MCP call each here.
 
 **3. Refactoring through MCP with preview and apply.** `qartez_rename`, `qartez_move`, and `qartez_rename_file` give the assistant atomic, reviewable refactors in a single MCP call. Serena offers rename via LSP (requires per-language server install); the remaining servers ship no refactoring tools at all.
 
@@ -627,6 +628,7 @@ src/
     cochange.rs            Co-change pair mining
     diff.rs                Diff range analysis (for qartez_diff_impact)
     trend.rs               Complexity trend over git history
+    blame.rs               Symbol-level git blame
     knowledge.rs           Code authorship and bus-factor analysis
   storage/
     mod.rs                 Storage module root
