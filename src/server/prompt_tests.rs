@@ -8,7 +8,7 @@
 //!   * the caller-supplied argument interpolated back into the recipe
 //!   * references to every Qartez tool the recipe promises to invoke
 //!
-//! The `prompt_router()` assertion at the bottom verifies that all five
+//! The `prompt_router()` assertion at the bottom verifies that all six
 //! prompts are actually registered so a missing `#[prompt(name = ...)]`
 //! attribute cannot silently drop a slash command.
 
@@ -19,7 +19,8 @@ use tempfile::TempDir;
 
 use super::QartezServer;
 use super::prompts::{
-    SoulArchitectureArgs, SoulDebugArgs, SoulOnboardArgs, SoulPreMergeArgs, SoulReviewArgs,
+    SoulArchReviewArgs, SoulArchitectureArgs, SoulDebugArgs, SoulOnboardArgs, SoulPreMergeArgs,
+    SoulReviewArgs,
 };
 use crate::storage::schema;
 
@@ -160,7 +161,28 @@ fn qartez_pre_merge_prompt_handles_empty_file_list() {
 }
 
 #[test]
-fn prompt_router_registers_all_five_canned_prompts() {
+fn qartez_arch_review_prompt_biases_map_on_focus_keyword() {
+    let (server, _dir) = make_server();
+
+    let untargeted =
+        server.qartez_arch_review_prompt(Parameters(SoulArchReviewArgs { focus: None }));
+    let text_untargeted = user_text(&untargeted);
+    assert!(text_untargeted.contains("qartez_map"));
+    assert!(text_untargeted.contains("qartez_hotspots"));
+    assert!(text_untargeted.contains("qartez_boundaries"));
+    assert!(text_untargeted.contains("qartez_security"));
+    assert!(!text_untargeted.contains("boost_terms"));
+
+    let targeted = server.qartez_arch_review_prompt(Parameters(SoulArchReviewArgs {
+        focus: Some("auth".into()),
+    }));
+    let text_targeted = user_text(&targeted);
+    assert!(text_targeted.contains("boost_terms=[\"auth\"]"));
+    assert!(text_targeted.contains("focused on `auth`"));
+}
+
+#[test]
+fn prompt_router_registers_all_six_canned_prompts() {
     let router = QartezServer::prompt_router();
     let names: Vec<String> = router.list_all().into_iter().map(|p| p.name).collect();
 
@@ -170,6 +192,7 @@ fn prompt_router_registers_all_five_canned_prompts() {
         "qartez_debug",
         "qartez_onboard",
         "qartez_pre_merge",
+        "qartez_arch_review",
     ] {
         assert!(
             names.iter().any(|n| n == expected),

@@ -262,7 +262,7 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 
 ## Workflow prompts
 
-Five ready-to-use recipes that chain the tools above in the right order. Invoke them as slash commands in Claude Code or any MCP client that supports prompts.
+Six ready-to-use recipes that chain the tools above in the right order. Invoke them as slash commands in Claude Code or any MCP client that supports prompts.
 
 | Prompt | What it does |
 |---|---|
@@ -271,6 +271,7 @@ Five ready-to-use recipes that chain the tools above in the right order. Invoke 
 | `/qartez_debug <symbol>` | Definition + callers + callees + references in one shot. |
 | `/qartez_onboard [area]` | Five-file reading list for new contributors, ranked by importance. |
 | `/qartez_pre_merge <files>` | Pre-merge safety check with a ship/hold recommendation. |
+| `/qartez_arch_review [focus]` | Architecture risk audit: single points of failure, coupling hotspots, unguarded entry points. |
 
 ---
 
@@ -484,7 +485,7 @@ Nine projects share the "MCP server for codebase intelligence" niche, sorted by 
 | **Toolchain command runner (test / build / lint)** | **Yes** | Shell only | No | No | No | No | No | No | No |
 | **Smart multi-signal context builder** | **Yes** | No | Partial | No | No | No | No | No | No |
 | **Batch diff impact analysis** | **Yes** | No | No | No | No | No | No | No | No |
-| **MCP prompt templates** | **Yes (5)** | No | Yes (5) | No | No | No | No | No | No |
+| **MCP prompt templates** | **Yes (6)** | No | Yes (5) | No | No | No | No | No | No |
 | **One-command multi-IDE install** | **Yes (19 IDEs, Rust wizard)** | No (manual) | Yes (9 IDEs) | No (manual) | Yes (10 IDEs) | Yes (10 agents) | No | No | No |
 | **Security scanning (regex + PageRank scoring)** | **Yes** | No | No | No | No | No | No | No | No |
 | **Complexity trend over git history** | **Yes** | No | No | No | No | No | No | No | No |
@@ -593,7 +594,7 @@ src/
   server/
     mod.rs                 MCP server entrypoint - dispatches to per-tool handlers
     tools/                 30 per-tool handler modules (one file per MCP tool)
-    prompts.rs             5 workflow prompt templates
+    prompts.rs             6 workflow prompt templates
     tiers.rs               Progressive tool disclosure (core/analysis/refactor/meta)
     cache.rs               Tree-sitter parse cache
     helpers.rs             Shared handler utilities

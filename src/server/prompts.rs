@@ -328,7 +328,9 @@ impl QartezServer {
              3. Call `qartez_security` (no arguments) for known security surface findings.\n\
              4. Call `qartez_hotspots` with `top_n=10` to find where complexity, coupling, and churn concentrate.\n\
              5. Call `qartez_boundaries` with `suggest=true` to see the Leiden-derived module clusters \
-                and where the natural architectural seams are.\n\
+                and where the natural architectural seams are. If this returns a \"no cluster \
+                assignment\" message, run `qartez_wiki` first to generate the clusters, then \
+                retry `qartez_boundaries`.\n\
              6. For the top 3 hotspot files from step 4, call `qartez_deps` with `file_path=<file>` \
                 to see their dependency fan-in and fan-out.\n\
              7. Identify any files that look like network-facing entry points (HTTP handlers, server \
