@@ -119,8 +119,16 @@ fn extract_from_node(
         "class_definition" => {
             if let Some(sym) = extract_class(node, source) {
                 let idx = symbols.len();
+                let class_name = sym.name.clone();
                 symbols.push(sym);
-                extract_class_methods(node, source, symbols, imports, references);
+                extract_class_methods(
+                    node,
+                    source,
+                    Some(&class_name),
+                    symbols,
+                    imports,
+                    references,
+                );
                 new_enclosing = Some(idx);
                 // Still walk the class body for references at class scope
                 // (base class name, decorators). Methods were already walked
@@ -334,6 +342,7 @@ fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
 fn extract_class_methods(
     class_node: Node,
     source: &[u8],
+    class_name: Option<&str>,
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
@@ -342,8 +351,17 @@ fn extract_class_methods(
         Some(b) => b,
         None => return,
     };
+    let before = symbols.len();
     for child in children(body) {
         extract_from_node(child, source, true, None, symbols, imports, references);
+    }
+    if let Some(owner) = class_name {
+        let owner = Some(owner.to_string());
+        for sym in &mut symbols[before..] {
+            if matches!(sym.kind, SymbolKind::Method) {
+                sym.owner_type = owner.clone();
+            }
+        }
     }
 }
 
@@ -378,11 +396,22 @@ fn extract_decorated(
                 }
             }
             "class_definition" => {
-                if let Some(mut sym) = extract_class(child, source) {
+                let class_name = if let Some(mut sym) = extract_class(child, source) {
                     sym.line_start = node.start_position().row as u32 + 1;
+                    let name = sym.name.clone();
                     symbols.push(sym);
-                }
-                extract_class_methods(child, source, symbols, imports, references);
+                    Some(name)
+                } else {
+                    None
+                };
+                extract_class_methods(
+                    child,
+                    source,
+                    class_name.as_deref(),
+                    symbols,
+                    imports,
+                    references,
+                );
             }
             "decorated_definition" => {
                 extract_decorated(child, source, inside_class, symbols, imports, references);
@@ -537,8 +566,10 @@ mod tests {
         assert_eq!(methods.len(), 2);
         assert_eq!(methods[0].name, "__init__");
         assert!(methods[0].is_exported); // dunder = exported
+        assert_eq!(methods[0].owner_type.as_deref(), Some("MyService"));
         assert_eq!(methods[1].name, "get_data");
         assert!(methods[1].is_exported);
+        assert_eq!(methods[1].owner_type.as_deref(), Some("MyService"));
     }
 
     #[test]
