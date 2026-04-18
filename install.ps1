@@ -331,7 +331,7 @@ if (Test-Path -Path (Join-Path $repoCandidate 'Cargo.toml') -PathType Leaf) {
     $LocalRepo = $true
 }
 
-Write-Info 'Installing qartez-mcp (Windows native)...'
+Write-Info 'Installing qartez (Windows native)...'
 
 $installed = $false
 if (-not $FromSource -and -not $LocalRepo) {

@@ -301,7 +301,7 @@ fn main() -> Result<()> {
 
     if !db_path.exists() {
         anyhow::bail!(
-            "database not found at {}. Run `qartez-mcp index` first.",
+            "database not found at {}. Run `qartez index` first.",
             db_path.display()
         );
     }

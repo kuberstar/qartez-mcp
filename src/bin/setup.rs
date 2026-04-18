@@ -975,7 +975,7 @@ fn install_claude_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "qartez-session-start",
+        "--session-start",
         &session_cmd,
         5000,
     );
@@ -1030,6 +1030,8 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
         timeout,
     } = entry;
 
+    let search_term_lc = search_term.to_ascii_lowercase();
+
     let hooks_arr = settings["hooks"][hook_type]
         .as_array()
         .cloned()
@@ -1044,7 +1046,7 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
                     arr.iter().any(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains(search_term))
+                            .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                     })
                 })
     });
@@ -1059,7 +1061,7 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
                 for h in arr.iter_mut() {
                     if h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                     {
                         h["command"] = serde_json::Value::String(command.to_string());
                     }
@@ -1089,6 +1091,8 @@ fn ensure_hook_entry_no_matcher(
     command: &str,
     timeout: u64,
 ) {
+    let search_term_lc = search_term.to_ascii_lowercase();
+
     let hooks_arr = settings["hooks"][hook_type]
         .as_array()
         .cloned()
@@ -1102,7 +1106,7 @@ fn ensure_hook_entry_no_matcher(
                 arr.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                 })
             })
     });
@@ -1115,7 +1119,7 @@ fn ensure_hook_entry_no_matcher(
                 for h in arr.iter_mut() {
                     if h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                     {
                         h["command"] = serde_json::Value::String(command.to_string());
                     }
@@ -1240,7 +1244,7 @@ fn install_gemini_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "qartez-session-start",
+        "--session-start",
         &session_cmd,
         5000,
     );
@@ -1301,7 +1305,7 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
         let mut settings = read_json(&settings_path)?;
 
         remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
-        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+        remove_hook_entries_containing(&mut settings, "SessionStart", "--session-start");
 
         if let Some(hooks) = settings.get("hooks")
             && hooks.as_object().is_some_and(|o| o.is_empty())
@@ -1670,7 +1674,7 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         // Remove qartez hook entries from PreToolUse
         remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
         // Remove qartez session start hook
-        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+        remove_hook_entries_containing(&mut settings, "SessionStart", "--session-start");
 
         // Clean up empty hooks object
         if let Some(hooks) = settings.get("hooks")
@@ -1715,6 +1719,8 @@ fn remove_hook_entries_containing(
     hook_type: &str,
     search_term: &str,
 ) {
+    let search_term_lc = search_term.to_ascii_lowercase();
+
     if let Some(arr) = settings["hooks"][hook_type].as_array() {
         let filtered: Vec<_> = arr
             .iter()
@@ -1726,7 +1732,7 @@ fn remove_hook_entries_containing(
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.contains(search_term))
+                                .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                         })
                     })
             })
