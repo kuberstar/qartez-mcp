@@ -975,7 +975,7 @@ fn install_claude_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "--session-start",
+        SESSION_START_SEARCH_TERMS,
         &session_cmd,
         5000,
     );
@@ -1021,6 +1021,8 @@ struct HookEntry<'a> {
     command: &'a str,
     timeout: u64,
 }
+
+const SESSION_START_SEARCH_TERMS: &[&str] = &["--session-start", "qartez-session-start"];
 
 fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: HookEntry<'_>) {
     let HookEntry {
@@ -1087,11 +1089,21 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
 fn ensure_hook_entry_no_matcher(
     settings: &mut serde_json::Value,
     hook_type: &str,
-    search_term: &str,
+    search_terms: &[&str],
     command: &str,
     timeout: u64,
 ) {
-    let search_term_lc = search_term.to_ascii_lowercase();
+    let search_terms_lc: Vec<String> = search_terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+
+    let command_matches = |candidate: &str| {
+        let candidate_lc = candidate.to_ascii_lowercase();
+        search_terms_lc
+            .iter()
+            .any(|term| candidate_lc.contains(term))
+    };
 
     let hooks_arr = settings["hooks"][hook_type]
         .as_array()
@@ -1106,7 +1118,7 @@ fn ensure_hook_entry_no_matcher(
                 arr.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
+                        .is_some_and(command_matches)
                 })
             })
     });
@@ -1119,7 +1131,7 @@ fn ensure_hook_entry_no_matcher(
                 for h in arr.iter_mut() {
                     if h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
+                        .is_some_and(command_matches)
                     {
                         h["command"] = serde_json::Value::String(command.to_string());
                     }
@@ -1244,7 +1256,7 @@ fn install_gemini_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "--session-start",
+        SESSION_START_SEARCH_TERMS,
         &session_cmd,
         5000,
     );
@@ -1305,7 +1317,9 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
         let mut settings = read_json(&settings_path)?;
 
         remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
-        remove_hook_entries_containing(&mut settings, "SessionStart", "--session-start");
+        for term in SESSION_START_SEARCH_TERMS {
+            remove_hook_entries_containing(&mut settings, "SessionStart", term);
+        }
 
         if let Some(hooks) = settings.get("hooks")
             && hooks.as_object().is_some_and(|o| o.is_empty())
@@ -1674,7 +1688,9 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         // Remove qartez hook entries from PreToolUse
         remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
         // Remove qartez session start hook
-        remove_hook_entries_containing(&mut settings, "SessionStart", "--session-start");
+        for term in SESSION_START_SEARCH_TERMS {
+            remove_hook_entries_containing(&mut settings, "SessionStart", term);
+        }
 
         // Clean up empty hooks object
         if let Some(hooks) = settings.get("hooks")
@@ -3560,6 +3576,64 @@ mod tests {
         assert!(session_cmd.contains("qartez-setup"));
         assert!(session_cmd.contains("--session-start"));
         assert!(!session_cmd.contains(".sh"));
+    }
+
+    #[test]
+    fn ensure_hook_entry_no_matcher_refreshes_legacy_session_start_command() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "hooks/qartez-session-start.sh",
+                        "timeout": 5000
+                    }]
+                }]
+            }
+        });
+
+        ensure_hook_entry_no_matcher(
+            &mut settings,
+            "SessionStart",
+            SESSION_START_SEARCH_TERMS,
+            "qartez-setup --session-start",
+            5000,
+        );
+
+        let hooks = settings["hooks"]["SessionStart"]
+            .as_array()
+            .expect("SessionStart hooks must exist");
+        assert_eq!(hooks.len(), 1, "legacy entry should be refreshed, not duplicated");
+
+        let cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(cmd, "qartez-setup --session-start");
+    }
+
+    #[test]
+    fn remove_hook_entries_containing_removes_legacy_session_start_command() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "hooks/qartez-session-start.sh",
+                        "timeout": 5000
+                    }]
+                }]
+            }
+        });
+
+        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+
+        assert!(
+            settings
+                .get("hooks")
+                .and_then(|h| h.get("SessionStart"))
+                .is_none(),
+            "legacy SessionStart hook entry should be removed"
+        );
     }
 
     // -- Mock curl for fetch_latest_release_tag ----------------------------
