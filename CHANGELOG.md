@@ -9,7 +9,7 @@
 ### Changed
 
 - **`install.sh` / `install.ps1` bootstrap pre-built binaries first** - the installer detects the host target, downloads the matching archive from the latest GitHub Release, verifies the SHA-256 checksum, and installs atomically. First-run time drops from the old 2-5 minute cargo build to under 10 seconds on supported platforms. `--from-source` / `-FromSource` forces the previous cargo path, and any unsupported target or download failure falls through to cargo build automatically. A SHA-256 mismatch is treated as a hard failure (never falls through to source) so tampered or corrupted downloads cannot silently be masked.
-- **`install.ps1` binary list corrected** - the Windows installer now references the `qartez.exe`, `qartez-guard.exe`, and `qartez-setup.exe` binaries declared in `Cargo.toml`.
+- **`install.ps1` binary list corrected** - the Windows installer now references the `qartez`, `qartez-guard`, `qartez-setup` binaries declared in `Cargo.toml` instead of a non-existent `qartez-mcp.exe`.
 
 ## [0.7.1] - 2026-04-17
 
@@ -26,7 +26,6 @@
 ### Fixed
 
 - **`install.sh` SC2015 anti-pattern** - replaced `cd ... && pwd || true` with an explicit `|| SCRIPT_DIR=""` fallback so a failing `pwd` can no longer mask a failing `cd`.
-- **Windows one-liner installer URL** - switched PowerShell docs/comments from `https://qartez.dev/install.ps1` to the working `https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1` endpoint.
 
 ## [0.7.0] - 2026-04-17
 
