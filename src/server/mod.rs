@@ -108,13 +108,72 @@ impl QartezServer {
         }
     }
 
+    /// Normalize common wrapper syntax around a tool path argument.
+    ///
+    /// Some MCP clients (or copied tool traces) may pass values like:
+    /// - `` `src/main.rs` ``
+    /// - `"src/main.rs"`
+    /// - `'src/main.rs'`
+    /// - `[file_path=src/main.rs]`
+    /// - `file_path=src/main.rs`
+    ///
+    /// This helper strips one or more wrapper layers before path validation.
+    fn normalize_user_path_arg(raw: &str) -> String {
+        let mut s = raw.trim().to_string();
+
+        loop {
+            let before = s.clone();
+
+            // Strip one bracket layer for copied tool-log assignments:
+            // [file_path=...], [path=...], [file=...]
+            if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+                let inner = s[1..s.len() - 1].trim();
+                if inner.starts_with("file_path=")
+                    || inner.starts_with("path=")
+                    || inner.starts_with("file=")
+                {
+                    s = inner.to_string();
+                }
+            }
+
+            // Strip common key prefixes copied from tool logs.
+            if let Some(rest) = s.strip_prefix("file_path=") {
+                s = rest.trim().to_string();
+            } else if let Some(rest) = s.strip_prefix("path=") {
+                s = rest.trim().to_string();
+            } else if let Some(rest) = s.strip_prefix("file=") {
+                s = rest.trim().to_string();
+            }
+
+            // Strip one matching quote/backtick layer.
+            if s.len() >= 2 {
+                let first = s.as_bytes()[0] as char;
+                let last = s.as_bytes()[s.len() - 1] as char;
+                if first == last && matches!(first, '\'' | '"' | '`') {
+                    s = s[1..s.len() - 1].trim().to_string();
+                }
+            }
+
+            if s == before {
+                break;
+            }
+        }
+
+        s
+    }
+
     /// Resolve a user-supplied relative path against the project root(s),
     /// rejecting absolute paths and directory traversal beyond the root.
     fn safe_resolve(&self, user_path: &str) -> Result<PathBuf, String> {
-        let path = std::path::Path::new(user_path);
+        let normalized = Self::normalize_user_path_arg(user_path);
+        if normalized.is_empty() {
+            return Err("Path must not be empty".to_string());
+        }
+
+        let path = std::path::Path::new(&normalized);
         if path.is_absolute() {
             return Err(format!(
-                "Path '{user_path}' must be relative to the project root"
+                "Path '{normalized}' must be relative to the project root"
             ));
         }
         let mut depth: isize = 0;
@@ -123,7 +182,7 @@ impl QartezServer {
                 std::path::Component::ParentDir => {
                     depth -= 1;
                     if depth < 0 {
-                        return Err(format!("Path '{user_path}' escapes the project root"));
+                        return Err(format!("Path '{normalized}' escapes the project root"));
                     }
                 }
                 std::path::Component::Normal(_) => {
@@ -132,7 +191,7 @@ impl QartezServer {
                 std::path::Component::CurDir => {}
                 _ => {
                     return Err(format!(
-                        "Path '{user_path}' must be relative to the project root"
+                        "Path '{normalized}' must be relative to the project root"
                     ));
                 }
             }
@@ -145,7 +204,7 @@ impl QartezServer {
             return Ok(resolved);
         }
 
-        Ok(self.project_root.join(user_path))
+        Ok(self.project_root.join(&normalized))
     }
 
     /// Acquire the server's shared SQLite connection under its mutex.
@@ -637,6 +696,47 @@ mod safe_resolve_tests {
         let result = server.safe_resolve("../sibling/file.rs");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("escapes"));
+    }
+
+    #[test]
+    fn accepts_backtick_wrapped_path() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("`src/main.rs`");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/project/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn accepts_bracketed_file_path_assignment() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("[file_path=src/main.rs]");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/project/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn wrapped_traversal_is_still_rejected() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("`../secret.txt`");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes"));
+    }
+
+    #[test]
+    fn preserves_literal_bracket_filename() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("[notes].md");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/project/[notes].md")
+        );
     }
 }
 
