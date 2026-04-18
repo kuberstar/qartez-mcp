@@ -82,7 +82,8 @@ struct Cli {
     /// Internal flag: session-start hook entry point.
     /// Implements the auto-indexing behavior from qartez-session-start.sh in Rust.
     /// Detects project, checks for .qartez marker, validates repo markers,
-    /// locates qartez-mcp binary, and spawns a detached background reindex.
+    /// locates the server binary (`qartez.exe` on Windows), and spawns a
+    /// detached background reindex.
     #[arg(long, hide = true)]
     session_start: bool,
 }
@@ -620,7 +621,7 @@ fn strip_jsonc(text: &str) -> String {
     re.replace_all(&out, "$1").into_owned()
 }
 
-/// Find the qartez-mcp binary, checking standard locations.
+/// Find a binary by name, checking standard locations first.
 fn find_binary(name: &str) -> Option<PathBuf> {
     let home = home_dir();
 
@@ -646,6 +647,37 @@ fn find_binary(name: &str) -> Option<PathBuf> {
     }
     // Check PATH
     which_in_path(name)
+}
+
+/// Preferred qartez server binary names by platform.
+///
+/// - Windows release/install names the server binary `qartez.exe`
+/// - Unix keeps backward compatibility via `qartez-mcp` symlink
+fn qartez_server_binary_names() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("qartez", "qartez-mcp")
+    } else {
+        ("qartez-mcp", "qartez")
+    }
+}
+
+fn find_qartez_server_binary() -> Option<PathBuf> {
+    let (primary, fallback) = qartez_server_binary_names();
+    find_binary(primary).or_else(|| find_binary(fallback))
+}
+
+fn qartez_server_binary_not_found_help() -> &'static str {
+    if cfg!(windows) {
+        "qartez.exe binary not found. Searched:\n\
+         \x20   - %LOCALAPPDATA%\\Programs\\qartez\\bin\\qartez.exe\n\
+         \x20   - $PATH\n\n\
+         \x20   Run install.ps1 first."
+    } else {
+        "qartez-mcp binary not found. Searched:\n\
+         \x20   - ~/.local/bin/qartez-mcp\n\
+         \x20   - $PATH\n\n\
+         \x20   Run 'make build && make deploy' first."
+    }
 }
 
 fn which_in_path(name: &str) -> Option<PathBuf> {
@@ -2722,16 +2754,11 @@ fn run() -> anyhow::Result<()> {
     }
 
     // Resolve binaries
-    let bin = find_binary("qartez-mcp").map(|p| p.to_string_lossy().into_owned());
+    let bin = find_qartez_server_binary().map(|p| p.to_string_lossy().into_owned());
     let guard_bin = find_binary("qartez-guard").map(|p| p.to_string_lossy().into_owned());
 
     if bin.is_none() && !cli.uninstall {
-        anyhow::bail!(
-            "qartez-mcp binary not found. Searched:\n\
-             \x20   - ~/.local/bin/qartez-mcp\n\
-             \x20   - $PATH\n\n\
-             \x20   Run 'make build && make deploy' first."
-        );
+        anyhow::bail!(qartez_server_binary_not_found_help());
     }
     let bin_path = bin.unwrap_or_default();
 
@@ -2897,8 +2924,8 @@ fn run_session_start() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Locate qartez-mcp binary
-    let binary = find_binary("qartez-mcp").or_else(|| {
+    // Locate qartez server binary (`qartez.exe` on Windows).
+    let binary = find_qartez_server_binary().or_else(|| {
         // Fallback: check QARTEZ_BINARY env var
         std::env::var("QARTEZ_BINARY")
             .ok()
@@ -3741,7 +3768,7 @@ mod tests {
         )
         .unwrap();
 
-        install_opencode("qartez-mcp").unwrap();
+        install_opencode("qartez").unwrap();
 
         let json_path = opencode_dir.join("opencode.json");
         assert!(
@@ -3754,7 +3781,7 @@ mod tests {
         assert_eq!(parsed["mcp"]["qartez"]["enabled"], serde_json::json!(true));
         assert_eq!(
             parsed["mcp"]["qartez"]["command"],
-            serde_json::json!(["qartez-mcp"])
+            serde_json::json!(["qartez"])
         );
     }
 
@@ -3772,7 +3799,7 @@ mod tests {
         fs::write(&json_path, r#"{"mcp":{}}"#).unwrap();
         fs::write(&jsonc_path, "// comment\n{\n  \"mcp\": {}\n}\n").unwrap();
 
-        install_opencode("qartez-mcp").unwrap();
+        install_opencode("qartez").unwrap();
 
         let parsed_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
@@ -3781,11 +3808,11 @@ mod tests {
 
         assert_eq!(
             parsed_json["mcp"]["qartez"]["command"],
-            serde_json::json!(["qartez-mcp"])
+            serde_json::json!(["qartez"])
         );
         assert_eq!(
             parsed_jsonc["mcp"]["qartez"]["command"],
-            serde_json::json!(["qartez-mcp"])
+            serde_json::json!(["qartez"])
         );
     }
 

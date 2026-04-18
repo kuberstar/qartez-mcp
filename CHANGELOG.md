@@ -9,7 +9,7 @@
 ### Changed
 
 - **`install.sh` / `install.ps1` bootstrap pre-built binaries first** - the installer detects the host target, downloads the matching archive from the latest GitHub Release, verifies the SHA-256 checksum, and installs atomically. First-run time drops from the old 2-5 minute cargo build to under 10 seconds on supported platforms. `--from-source` / `-FromSource` forces the previous cargo path, and any unsupported target or download failure falls through to cargo build automatically. A SHA-256 mismatch is treated as a hard failure (never falls through to source) so tampered or corrupted downloads cannot silently be masked.
-- **`install.ps1` binary list corrected** - the Windows installer now references the `qartez`, `qartez-guard`, `qartez-setup` binaries declared in `Cargo.toml` instead of a non-existent `qartez-mcp.exe`.
+- **`install.ps1` binary list corrected** - the Windows installer now references the `qartez.exe`, `qartez-guard.exe`, and `qartez-setup.exe` binaries declared in `Cargo.toml`.
 
 ## [0.7.1] - 2026-04-17
 
