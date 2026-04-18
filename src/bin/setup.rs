@@ -3603,7 +3603,11 @@ mod tests {
         let hooks = settings["hooks"]["SessionStart"]
             .as_array()
             .expect("SessionStart hooks must exist");
-        assert_eq!(hooks.len(), 1, "legacy entry should be refreshed, not duplicated");
+        assert_eq!(
+            hooks.len(),
+            1,
+            "legacy entry should be refreshed, not duplicated"
+        );
 
         let cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
