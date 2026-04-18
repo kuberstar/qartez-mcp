@@ -1057,6 +1057,9 @@ fn try_rust_module_file(dir: &Path, known_files: &HashSet<String>) -> Option<Str
 
 // --- Python ---
 
+// root + src/lib layout dir + package dir
+const PYTHON_INIT_DISCOVERY_MAX_DEPTH: usize = 3;
+
 struct PythonPackage {
     name: String,
     src_root: String,
@@ -1071,6 +1074,7 @@ fn resolve_python_import(
     if !specifier.starts_with('.') {
         let packages = python_packages?;
         let top_module = specifier.split('.').next()?;
+        // First-package-in-walk-order wins when multiple pyproject.tomls declare the same name
         let pkg = packages.iter().find(|p| p.name == top_module)?;
 
         let module_path = specifier.replace('.', "/");
@@ -1219,19 +1223,13 @@ fn parse_pyproject_packages(content: &str) -> Option<Vec<PythonPackage>> {
     let doc: toml_edit::DocumentMut = content.parse().ok()?;
 
     // Poetry: [tool.poetry] packages = [{include = "foo", from = "src"}]
-    if let Some(poetry) = doc
-        .get("tool")
-        .and_then(|t| t.get("poetry"))
-    {
+    if let Some(poetry) = doc.get("tool").and_then(|t| t.get("poetry")) {
         if let Some(pkgs) = poetry.get("packages").and_then(|p| p.as_array()) {
             let mut result = Vec::new();
             for item in pkgs {
                 let table = item.as_inline_table()?;
                 let name = table.get("include")?.as_str()?;
-                let from = table
-                    .get("from")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or("");
+                let from = table.get("from").and_then(|f| f.as_str()).unwrap_or("");
                 result.push(PythonPackage {
                     name: name.to_string(),
                     src_root: from.to_string(),
@@ -1253,10 +1251,7 @@ fn parse_pyproject_packages(content: &str) -> Option<Vec<PythonPackage>> {
     }
 
     // Setuptools: [tool.setuptools.packages.find] where = ["src"]
-    if let Some(setuptools) = doc
-        .get("tool")
-        .and_then(|t| t.get("setuptools"))
-    {
+    if let Some(setuptools) = doc.get("tool").and_then(|t| t.get("setuptools")) {
         let src_root = setuptools
             .get("packages")
             .and_then(|p| p.get("find"))
@@ -1303,7 +1298,7 @@ fn discover_python_packages_by_init(root: &Path) -> Vec<PythonPackage> {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .max_depth(Some(3))
+        .max_depth(Some(PYTHON_INIT_DISCOVERY_MAX_DEPTH))
         .build();
 
     for entry in walker.flatten() {
@@ -2176,8 +2171,7 @@ mod tests {
             name: "myapp".to_string(),
             src_root: String::new(),
         }];
-        let result =
-            resolve_python_import("myapp/main.py", "myapp.config", &known, Some(&pkgs));
+        let result = resolve_python_import("myapp/main.py", "myapp.config", &known, Some(&pkgs));
         assert_eq!(result, Some("myapp/config.py".to_string()));
     }
 
@@ -2204,12 +2198,8 @@ mod tests {
             name: "chitta".to_string(),
             src_root: "src".to_string(),
         }];
-        let result = resolve_python_import(
-            "src/chitta/main.py",
-            "chitta.backends",
-            &known,
-            Some(&pkgs),
-        );
+        let result =
+            resolve_python_import("src/chitta/main.py", "chitta.backends", &known, Some(&pkgs));
         assert_eq!(result, Some("src/chitta/backends/__init__.py".to_string()));
     }
 

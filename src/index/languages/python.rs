@@ -121,7 +121,14 @@ fn extract_from_node(
                 let idx = symbols.len();
                 let class_name = sym.name.clone();
                 symbols.push(sym);
-                extract_class_methods(node, source, &class_name, symbols, imports, references);
+                extract_class_methods(
+                    node,
+                    source,
+                    Some(&class_name),
+                    symbols,
+                    imports,
+                    references,
+                );
                 new_enclosing = Some(idx);
                 // Still walk the class body for references at class scope
                 // (base class name, decorators). Methods were already walked
@@ -335,7 +342,7 @@ fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
 fn extract_class_methods(
     class_node: Node,
     source: &[u8],
-    class_name: &str,
+    class_name: Option<&str>,
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
@@ -348,10 +355,12 @@ fn extract_class_methods(
     for child in children(body) {
         extract_from_node(child, source, true, None, symbols, imports, references);
     }
-    let owner = Some(class_name.to_string());
-    for sym in &mut symbols[before..] {
-        if matches!(sym.kind, SymbolKind::Method) {
-            sym.owner_type = owner.clone();
+    if let Some(owner) = class_name {
+        let owner = Some(owner.to_string());
+        for sym in &mut symbols[before..] {
+            if matches!(sym.kind, SymbolKind::Method) {
+                sym.owner_type = owner.clone();
+            }
         }
     }
 }
@@ -391,11 +400,18 @@ fn extract_decorated(
                     sym.line_start = node.start_position().row as u32 + 1;
                     let name = sym.name.clone();
                     symbols.push(sym);
-                    name
+                    Some(name)
                 } else {
-                    String::new()
+                    None
                 };
-                extract_class_methods(child, source, &class_name, symbols, imports, references);
+                extract_class_methods(
+                    child,
+                    source,
+                    class_name.as_deref(),
+                    symbols,
+                    imports,
+                    references,
+                );
             }
             "decorated_definition" => {
                 extract_decorated(child, source, inside_class, symbols, imports, references);
