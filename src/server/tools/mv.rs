@@ -84,7 +84,7 @@ impl QartezServer {
         }
 
         let (sym, source_file) = &results[0];
-        let source_abs = self.project_root.join(&source_file.path);
+        let source_abs = self.safe_resolve(&source_file.path)?;
         let target_abs = self.safe_resolve(&params.to_file)?;
 
         if source_file.path != params.to_file
@@ -226,7 +226,10 @@ impl QartezServer {
         let mut import_updates = 0;
         let mut failed_writes: Vec<String> = Vec::new();
         for (importer_path, _) in &importer_files {
-            let importer_abs = self.project_root.join(importer_path);
+            let importer_abs = match self.safe_resolve(importer_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let content = match std::fs::read_to_string(&importer_abs) {
                 Ok(c) => c,
                 Err(_) => continue,

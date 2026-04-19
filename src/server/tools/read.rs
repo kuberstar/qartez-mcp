@@ -190,7 +190,7 @@ impl QartezServer {
 
         for (_idx, filtered) in &per_query {
             for (sym, file) in filtered {
-                let abs_path = self.project_root.join(&file.path);
+                let abs_path = self.safe_resolve(&file.path)?;
                 let source = match std::fs::read_to_string(&abs_path) {
                     Ok(s) => s,
                     Err(e) => return Err(format!("Cannot read {}: {e}", abs_path.display())),

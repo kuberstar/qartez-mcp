@@ -111,7 +111,10 @@ impl QartezServer {
             None
         };
         for importer_path in &importer_paths {
-            let importer_abs = self.project_root.join(importer_path);
+            let importer_abs = match self.safe_resolve(importer_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let content = match std::fs::read_to_string(&importer_abs) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -139,8 +142,8 @@ impl QartezServer {
         let mut mod_rewrite_note = String::new();
         if old_rel_stem != new_rel_stem
             && let Some(parent_rel) = find_parent_mod_file(&self.project_root, &params.from)
+            && let Ok(parent_abs) = self.safe_resolve(&parent_rel.to_string_lossy())
         {
-            let parent_abs = self.project_root.join(&parent_rel);
             if let Ok(content) = std::fs::read_to_string(&parent_abs) {
                 let rewritten = rewrite_mod_decl(&content, &old_rel_stem, &new_rel_stem);
                 if rewritten != content {

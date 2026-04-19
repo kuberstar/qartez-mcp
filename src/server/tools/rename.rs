@@ -183,7 +183,7 @@ impl QartezServer {
             // `files_to_scan` but was skipped during the AST walk above;
             // those files must stay untouched.
             for rel_path in &files_touched {
-                let abs_path = self.project_root.join(rel_path);
+                let abs_path = self.safe_resolve(rel_path)?;
                 let content = std::fs::read_to_string(&abs_path)
                     .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
 
