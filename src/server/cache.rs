@@ -43,7 +43,7 @@ impl super::QartezServer {
     /// Read a file's mtime in nanoseconds, or `None` if the file is missing
     /// or the filesystem does not expose a modification time.
     pub(super) fn file_mtime_ns(&self, rel_path: &str) -> Option<i64> {
-        let abs_path = self.project_root.join(rel_path);
+        let abs_path = self.safe_resolve(rel_path).ok()?;
         std::fs::metadata(&abs_path)
             .ok()?
             .modified()
@@ -69,7 +69,7 @@ impl super::QartezServer {
             return Some(src.clone());
         }
 
-        let abs_path = self.project_root.join(rel_path);
+        let abs_path = self.safe_resolve(rel_path).ok()?;
         let raw = std::fs::read_to_string(&abs_path).ok()?;
         let arc = Arc::new(raw);
 
