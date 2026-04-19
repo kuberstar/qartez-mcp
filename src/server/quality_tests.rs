@@ -1324,6 +1324,73 @@ fn qartez_read_accepts_offset_alias() {
 }
 
 // =========================================================================
+// Section 7b: qartez_read - workspace alias path resolution
+// =========================================================================
+
+#[test]
+fn qartez_read_resolves_symbol_via_workspace_alias() {
+    // Regression: symbol reads used project_root.join(file.path) instead of
+    // safe_resolve, so any DB path prefixed with a workspace alias resolved
+    // against the primary root and returned "No such file or directory".
+    let primary_dir = TempDir::new().unwrap();
+    fs::create_dir(primary_dir.path().join(".git")).unwrap();
+    write_test_files(primary_dir.path());
+
+    let ws_dir = TempDir::new().unwrap();
+    let ws_src = ws_dir.path().join("src");
+    fs::create_dir_all(&ws_src).unwrap();
+    fs::write(
+        ws_src.join("widget.rs"),
+        "pub fn ws_func() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    let conn = setup_db();
+    populate_db(&conn);
+    let ws_file_id = write::upsert_file(&conn, "WS/src/widget.rs", 1000, 50, "rust", 1).unwrap();
+    write::insert_symbols(
+        &conn,
+        ws_file_id,
+        &[SymbolInsert {
+            name: "ws_func".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: Some("pub fn ws_func() -> u32".into()),
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+            owner_type: None,
+        }],
+    )
+    .unwrap();
+
+    let primary = primary_dir.path().to_path_buf();
+    let ws_root = ws_dir.path().to_path_buf();
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert(ws_root.clone(), "WS".to_string());
+    let server = QartezServer::with_roots(
+        conn,
+        primary.clone(),
+        vec![primary, ws_root],
+        aliases,
+        300,
+    );
+
+    let result = server
+        .qartez_read(Parameters(SoulReadParams {
+            symbol_name: Some("ws_func".into()),
+            ..Default::default()
+        }))
+        .expect("ws_func should be readable via workspace alias");
+
+    assert!(result.contains("ws_func"), "result: {result}");
+    assert!(result.contains("42"), "should contain function body, result: {result}");
+}
+
+// =========================================================================
 // Section 8: Tool Handler - qartez_grep
 // =========================================================================
 
