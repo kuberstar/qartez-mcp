@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.4] - 2026-04-21
+
+### Fixed
+
+- **Windows CI tests for `find_server_binary` no longer race the build artifact** - `find_binary` now routes its "sibling of the setup binary" fallback through a new `setup_exe_dir()` helper that consults `QARTEZ_SETUP_EXE_DIR_OVERRIDE` before falling back to `current_exe().parent()`. The two regression tests added in v0.8.3 now set the override to an empty tmp dir, so the `qartez.exe` built into `target/release/deps/` during the same CI job no longer satisfies `find_binary("qartez")` while the test was preparing only `qartez-mcp.exe` under a tmp `HOME`. Production behavior is unchanged - without the override, the fallback still locates siblings of the running `qartez-setup.exe`, which is what the Windows installer relies on.
+- **Env-var-sensitive tests are poisoning-safe** - switched six tests in `bin/setup.rs` (`find_server_binary_*`, `has_claude_vscode_extension_*`) from `ENV_LOCK.lock().unwrap()` to the existing `env_lock()` helper that recovers via `poisoned.into_inner()`. A single failing test no longer cascade-panics every subsequent test that serializes on `$HOME` / `$PATH`.
+
 ## [0.8.3] - 2026-04-21
 
 ### Fixed

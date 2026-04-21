@@ -620,6 +620,26 @@ fn strip_jsonc(text: &str) -> String {
     re.replace_all(&out, "$1").into_owned()
 }
 
+/// Directory used as the "sibling of this binary" fallback in `find_binary`.
+///
+/// Production path is `current_exe().parent()` - the Windows installer ships
+/// `qartez.exe`, `qartez-setup.exe`, and `qartez-guard.exe` into the same
+/// directory, so a setup run must be able to find the server binary next to
+/// itself even when nothing is on `PATH`.
+///
+/// Tests override it via `QARTEZ_SETUP_EXE_DIR_OVERRIDE` because on Windows CI
+/// the test binary lives in `target/release/deps/` alongside `qartez.exe`
+/// built by the same job, which would otherwise satisfy `find_binary("qartez")`
+/// regardless of what the test prepared under `HOME`.
+fn setup_exe_dir() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("QARTEZ_SETUP_EXE_DIR_OVERRIDE") {
+        return Some(PathBuf::from(override_dir));
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
 /// Find a qartez binary by name, checking standard locations.
 fn find_binary(name: &str) -> Option<PathBuf> {
     let home = home_dir();
@@ -627,10 +647,7 @@ fn find_binary(name: &str) -> Option<PathBuf> {
     let candidates = [
         home.join(".local").join("bin").join(name),
         // Also try the cargo target dir relative to this binary
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join(name)))
-            .unwrap_or_default(),
+        setup_exe_dir().map(|d| d.join(name)).unwrap_or_default(),
     ];
     for c in &candidates {
         if c.is_file() {
@@ -3594,12 +3611,19 @@ mod tests {
     /// the legacy `qartez-mcp` name is absent.
     #[test]
     fn find_server_binary_finds_qartez_without_legacy_symlink() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         let empty_path = tmp.path().join("__empty_path_dir");
         fs::create_dir_all(&empty_path).unwrap();
         let _path = EnvGuard::set("PATH", &empty_path);
+        // Prevent the current_exe() sibling fallback in find_binary from
+        // picking up target/release/deps/qartez.exe on Windows CI, which
+        // lives alongside the test binary and would otherwise satisfy
+        // find_binary("qartez") regardless of what we prepared under HOME.
+        let exe_override = tmp.path().join("__empty_exe_dir");
+        fs::create_dir_all(&exe_override).unwrap();
+        let _exe = EnvGuard::set("QARTEZ_SETUP_EXE_DIR_OVERRIDE", &exe_override);
 
         let local_bin = tmp.path().join(".local").join("bin");
         fs::create_dir_all(&local_bin).unwrap();
@@ -3619,12 +3643,15 @@ mod tests {
     /// install), `find_server_binary` must still locate it.
     #[test]
     fn find_server_binary_falls_back_to_legacy_name() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
         let empty_path = tmp.path().join("__empty_path_dir");
         fs::create_dir_all(&empty_path).unwrap();
         let _path = EnvGuard::set("PATH", &empty_path);
+        let exe_override = tmp.path().join("__empty_exe_dir");
+        fs::create_dir_all(&exe_override).unwrap();
+        let _exe = EnvGuard::set("QARTEZ_SETUP_EXE_DIR_OVERRIDE", &exe_override);
 
         let local_bin = tmp.path().join(".local").join("bin");
         fs::create_dir_all(&local_bin).unwrap();
@@ -3678,7 +3705,7 @@ mod tests {
 
     #[test]
     fn has_claude_vscode_extension_detects_versioned_dir() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
 
@@ -3694,7 +3721,7 @@ mod tests {
 
     #[test]
     fn has_claude_vscode_extension_detects_in_cursor() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
 
@@ -3710,7 +3737,7 @@ mod tests {
 
     #[test]
     fn has_claude_vscode_extension_returns_false_when_absent() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
 
@@ -3722,7 +3749,7 @@ mod tests {
     /// from third-party clones (e.g. `someone-else.claude-code-fork-1.0`).
     #[test]
     fn has_claude_vscode_extension_ignores_unrelated_extensions() {
-        let _mu = ENV_LOCK.lock().unwrap();
+        let _mu = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", tmp.path());
 
