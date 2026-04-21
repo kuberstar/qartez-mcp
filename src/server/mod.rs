@@ -306,6 +306,7 @@ impl QartezServer {
                 "qartez_insert_before_symbol" => qartez_insert_before_symbol: SoulInsertSymbolParams,
                 "qartez_insert_after_symbol"  => qartez_insert_after_symbol:  SoulInsertSymbolParams,
                 "qartez_safe_delete"          => qartez_safe_delete:          SoulSafeDeleteParams,
+                "qartez_blame"       => qartez_blame:       SoulBlameParams,
             }
         )
     }
@@ -414,7 +415,14 @@ impl ServerHandler for QartezServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         let result = match request.uri.as_str() {
             "qartez://overview" => {
-                let text = self.build_overview(20, 4000, None, None, false, false);
+                let text = self.build_overview(
+                    20,
+                    helpers::DEFAULT_TOKEN_BUDGET,
+                    None,
+                    None,
+                    false,
+                    false,
+                );
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     text,
                     "qartez://overview",
@@ -530,16 +538,16 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_37() {
+    fn total_tool_count_is_38() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 37, "expected 37 tools, got {}", all.len());
+        assert_eq!(all.len(), 38, "expected 38 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 18, "analysis tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 19, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 7, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 3, "meta tier");
     }

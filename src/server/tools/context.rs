@@ -37,7 +37,7 @@ impl QartezServer {
         Parameters(params): Parameters<SoulContextParams>,
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let budget = params.token_budget.unwrap_or(4000) as usize;
+        let budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         let explain = params.explain.unwrap_or(false);
         let limit = params.limit.unwrap_or(15) as usize;
@@ -171,9 +171,8 @@ impl QartezServer {
                     breakdown.reasons().join(", "),
                 )
             };
-            if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+            if budget_exceeded(&mut out, &line, budget) {
                 dropped_by_budget = ranked.len() - i;
-                out.push_str("  ... (truncated by token budget)\n");
                 break;
             }
             out.push_str(&line);

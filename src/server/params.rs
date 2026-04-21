@@ -916,6 +916,33 @@ pub(super) struct SoulKnowledgeParams {
     pub format: Option<Format>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulBlameParams {
+    #[schemars(description = "Symbol name to blame. Accepts aliases `name` and `symbol_name`.")]
+    #[serde(alias = "name", alias = "symbol_name")]
+    pub symbol: String,
+    #[schemars(
+        description = "Disambiguate when multiple files define the same symbol. Relative file path."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "If true, group results by author with summed line counts instead of per-hunk detail (default: false)."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub aggregate: Option<bool>,
+    #[schemars(description = "Max entries to return (default: 20).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(description = "Approximate token budget for output (default: 4000).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact table, 'detailed' (default) = per-hunk with commit messages"
+    )]
+    pub format: Option<Format>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct ToolsParams {
     #[schemars(

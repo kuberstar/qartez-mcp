@@ -131,6 +131,7 @@ qartez_stats                            # size and language breakdown
 qartez_wiki                             # auto-generated architecture doc
 qartez_hotspots limit=5                 # where the complexity lives
 qartez_knowledge level=module           # who owns what
+qartez_blame symbol=<name>             # per-function git blame
 ```
 
 ### Refactoring

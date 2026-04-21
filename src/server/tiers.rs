@@ -48,6 +48,7 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
     "qartez_semantic",
     "qartez_test_gaps",
     "qartez_knowledge",
+    "qartez_blame",
 ];
 
 /// Destructive refactoring tools unlocked on demand.

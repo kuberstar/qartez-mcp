@@ -39,6 +39,19 @@ pub(super) fn resolve_prefixed_path(
     None
 }
 
+pub(super) const DEFAULT_TOKEN_BUDGET: usize = 4000;
+
+/// Returns `true` (and appends a uniform truncation marker) when appending
+/// `next_chunk` would push `out` past `budget` tokens.
+pub(super) fn budget_exceeded(out: &mut String, next_chunk: &str, budget: usize) -> bool {
+    if estimate_tokens(out) + estimate_tokens(next_chunk) > budget {
+        out.push_str("[truncated by token budget]\n");
+        true
+    } else {
+        false
+    }
+}
+
 pub(super) fn elide_file_source(
     project_root: &std::path::Path,
     project_roots: &[std::path::PathBuf],
@@ -136,6 +149,31 @@ pub(super) fn truncate_path(path: &str, max_len: usize) -> String {
 // the estimate. This is a soft budget hint, not a hard limit.
 pub(super) fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 3
+}
+
+/// Render priority-sorted items under a token budget.
+///
+/// Items are emitted highest-priority-first until the budget is exhausted.
+/// At least one item is always emitted so the caller never gets empty output.
+pub(super) fn budget_render(items: &[(f64, String)], budget_tokens: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&(f64, String)> = items.iter().collect();
+    sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out = String::new();
+    for (emitted, (_, line)) in sorted.iter().enumerate() {
+        if emitted > 0 && estimate_tokens(&out) + estimate_tokens(line) > budget_tokens {
+            let remaining = sorted.len() - emitted;
+            if remaining > 0 {
+                out.push_str(&format!("[truncated: {} more items]\n", remaining));
+            }
+            return out;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 pub(super) fn human_bytes(bytes: i64) -> String {
@@ -439,7 +477,7 @@ pub(super) fn mermaid_label(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_whole_word;
+    use super::*;
 
     #[test]
     fn replace_empty_text_returns_empty() {
@@ -694,6 +732,55 @@ mod tests {
         let input = "foo\nfoox\n_foo\nfoo bar";
         let expected = "X\nfoox\n_foo\nX bar";
         assert_eq!(per_line_rename(input, "foo", "X"), expected);
+    }
+
+    #[test]
+    fn budget_render_all_fit() {
+        let items = vec![
+            (1.0, "line one\n".to_string()),
+            (2.0, "line two\n".to_string()),
+        ];
+        let out = budget_render(&items, 4000);
+        assert!(out.contains("line two"));
+        assert!(out.contains("line one"));
+        assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn budget_render_truncates() {
+        let items: Vec<(f64, String)> = (0..100)
+            .map(|i| {
+                (
+                    i as f64,
+                    format!("item number {i} with some padding text here\n"),
+                )
+            })
+            .collect();
+        let out = budget_render(&items, 100);
+        assert!(out.contains("[truncated:"));
+        assert!(out.contains("more items]"));
+        assert!(out.contains("item number 99"));
+    }
+
+    #[test]
+    fn budget_render_priority_ordering() {
+        let items = vec![
+            (1.0, "low priority\n".to_string()),
+            (3.0, "high priority\n".to_string()),
+            (2.0, "mid priority\n".to_string()),
+        ];
+        let out = budget_render(&items, 4000);
+        let high_pos = out.find("high priority").unwrap();
+        let mid_pos = out.find("mid priority").unwrap();
+        let low_pos = out.find("low priority").unwrap();
+        assert!(high_pos < mid_pos);
+        assert!(mid_pos < low_pos);
+    }
+
+    #[test]
+    fn budget_render_empty() {
+        let out = budget_render(&[], 4000);
+        assert!(out.is_empty());
     }
 }
 

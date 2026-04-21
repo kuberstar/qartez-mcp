@@ -36,7 +36,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRefsParams>,
     ) -> Result<String, String> {
-        let budget = params.token_budget.unwrap_or(4000) as usize;
+        let budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         let transitive = params.transitive.unwrap_or(false);
 
@@ -117,8 +117,7 @@ impl QartezServer {
                         edge.specifier.as_deref().unwrap_or("(unspecified)"),
                         edge.kind,
                     );
-                    if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                        out.push_str("    ... (truncated by token budget)\n");
+                    if budget_exceeded(&mut out, &line, budget) {
                         break;
                     }
                     out.push_str(&line);
@@ -160,8 +159,7 @@ impl QartezServer {
                         last_path = path.clone();
                         format!("    {path} [L{line_no}]\n")
                     };
-                    if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                        out.push_str("    ... (truncated by token budget)\n");
+                    if budget_exceeded(&mut out, &line, budget) {
                         break;
                     }
                     out.push_str(&line);
@@ -207,8 +205,7 @@ impl QartezServer {
                         if let Some(files) = by_depth.get(&depth) {
                             for f in files {
                                 let line = format!("    [depth {depth}] {f}\n");
-                                if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                                    out.push_str("    ... (truncated by token budget)\n");
+                                if budget_exceeded(&mut out, &line, budget) {
                                     truncated = true;
                                     break 'trans;
                                 }

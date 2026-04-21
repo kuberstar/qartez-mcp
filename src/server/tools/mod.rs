@@ -7,6 +7,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 
 use super::QartezServer;
 
+mod blame;
 mod boundaries;
 mod calls;
 mod clones;
@@ -78,6 +79,7 @@ impl QartezServer {
             + Self::qartez_trend_router()
             + Self::qartez_security_router()
             + Self::qartez_knowledge_router()
+            + Self::qartez_blame_router()
             + Self::qartez_tools_router()
             + Self::qartez_semantic_router()
             + Self::qartez_replace_symbol_router()
