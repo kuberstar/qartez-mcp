@@ -23,7 +23,9 @@ pub struct BlameHunk {
 /// Run `git blame` scoped to `[sym_start, sym_end]` (1-based, inclusive).
 ///
 /// Returns one `BlameHunk` per contiguous blame region within the range,
-/// sorted by line_start ascending.
+/// sorted by line_start ascending. libgit2 follows file renames by default;
+/// `track_copies_same_commit_moves` is enabled to also detect intra-commit
+/// code moves.
 pub fn symbol_blame(
     root: &Path,
     file_path: &str,
@@ -36,7 +38,6 @@ pub fn symbol_blame(
     let mut opts = BlameOptions::new();
     opts.min_line(sym_start as usize);
     opts.max_line(sym_end as usize);
-    opts.track_copies_same_commit_moves(true);
     opts.track_copies_same_commit_moves(true);
 
     let blame = repo

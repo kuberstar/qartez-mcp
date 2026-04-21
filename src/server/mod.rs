@@ -415,7 +415,14 @@ impl ServerHandler for QartezServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         let result = match request.uri.as_str() {
             "qartez://overview" => {
-                let text = self.build_overview(20, 4000, None, None, false, false);
+                let text = self.build_overview(
+                    20,
+                    helpers::DEFAULT_TOKEN_BUDGET,
+                    None,
+                    None,
+                    false,
+                    false,
+                );
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     text,
                     "qartez://overview",

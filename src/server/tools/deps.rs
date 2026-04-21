@@ -37,7 +37,7 @@ impl QartezServer {
         Parameters(params): Parameters<SoulDepsParams>,
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let budget = params.token_budget.unwrap_or(4000) as usize;
+        let budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         let file = read::get_file_by_path(&conn, &params.file_path)
             .map_err(|e| format!("DB error: {e}"))?
@@ -144,8 +144,7 @@ impl QartezServer {
                     }
                     _ => format!("  -> {} ({})\n", target_path, edge.kind),
                 };
-                if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                    out.push_str("  ... (truncated)\n");
+                if budget_exceeded(&mut out, &line, budget) {
                     break;
                 }
                 out.push_str(&line);
@@ -169,8 +168,7 @@ impl QartezServer {
                     }
                     _ => format!("  <- {} ({})\n", source_path, edge.kind),
                 };
-                if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                    out.push_str("  ... (truncated)\n");
+                if budget_exceeded(&mut out, &line, budget) {
                     break;
                 }
                 out.push_str(&line);

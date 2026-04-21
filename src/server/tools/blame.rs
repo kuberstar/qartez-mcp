@@ -104,7 +104,7 @@ impl QartezServer {
             let total_lines: u32 = hunks.iter().map(|h| h.lines).sum();
             let mut authors: Vec<(String, u32, String)> = author_lines
                 .into_iter()
-                .map(|(name, (lines, latest))| (name, lines, latest))
+                .map(|(name, (lines, sample))| (name, lines, sample))
                 .collect();
             authors.sort_by(|a, b| b.1.cmp(&a.1));
             authors.truncate(limit);
@@ -112,7 +112,7 @@ impl QartezServer {
             let items: Vec<(f64, String)> = authors
                 .iter()
                 .enumerate()
-                .map(|(i, (name, lines, latest))| {
+                .map(|(i, (name, lines, sample))| {
                     let pct = if total_lines > 0 {
                         *lines as f64 / total_lines as f64 * 100.0
                     } else {
@@ -127,7 +127,7 @@ impl QartezServer {
                             truncate_path(name, 20),
                             lines,
                             pct,
-                            latest,
+                            sample,
                         )
                     };
                     (*lines as f64, line)

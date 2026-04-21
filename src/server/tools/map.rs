@@ -43,7 +43,7 @@ impl QartezServer {
         } else {
             requested_top as i64
         };
-        let token_budget = params.token_budget.unwrap_or(4000) as usize;
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         // `by=symbols` swaps the file ranking out for a symbol-level view.
         // Any other value (including the default) keeps the historical

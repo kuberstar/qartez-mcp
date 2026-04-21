@@ -37,7 +37,7 @@ impl QartezServer {
         Parameters(params): Parameters<SoulOutlineParams>,
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let budget = params.token_budget.unwrap_or(4000) as usize;
+        let budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         let offset = params.offset.unwrap_or(0) as usize;
         let file = read::get_file_by_path(&conn, &params.file_path)
@@ -78,9 +78,8 @@ impl QartezServer {
                 }
                 let marker = if sym.is_exported { "+" } else { "-" };
                 let line = format!("  {marker} {} [L{}]\n", sym.name, sym.line_start);
-                if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+                if budget_exceeded(&mut out, &line, budget) {
                     next_offset = Some(offset + emitted);
-                    out.push_str("  ... (truncated)\n");
                     break;
                 }
                 out.push_str(&line);
@@ -142,9 +141,8 @@ impl QartezServer {
                     "  {} {} [L{}-L{}]{} — {}\n",
                     marker, sym.name, sym.line_start, sym.line_end, cc_tag, sig,
                 );
-                if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+                if budget_exceeded(&mut out, &line, budget) {
                     next_offset = Some(offset + emitted);
-                    out.push_str("  ... (truncated by token budget)\n");
                     break 'outer;
                 }
                 out.push_str(&line);
@@ -159,9 +157,8 @@ impl QartezServer {
                             f.name,
                             f.signature.as_deref().unwrap_or(f.name.as_str()),
                         );
-                        if estimate_tokens(&out) + estimate_tokens(&fline) > budget {
+                        if budget_exceeded(&mut out, &fline, budget) {
                             next_offset = Some(offset + emitted);
-                            out.push_str("  ... (truncated by token budget)\n");
                             break 'outer;
                         }
                         out.push_str(&fline);

@@ -41,6 +41,17 @@ pub(super) fn resolve_prefixed_path(
 
 pub(super) const DEFAULT_TOKEN_BUDGET: usize = 4000;
 
+/// Returns `true` (and appends a uniform truncation marker) when appending
+/// `next_chunk` would push `out` past `budget` tokens.
+pub(super) fn budget_exceeded(out: &mut String, next_chunk: &str, budget: usize) -> bool {
+    if estimate_tokens(out) + estimate_tokens(next_chunk) > budget {
+        out.push_str("[truncated by token budget]\n");
+        true
+    } else {
+        false
+    }
+}
+
 pub(super) fn elide_file_source(
     project_root: &std::path::Path,
     project_roots: &[std::path::PathBuf],

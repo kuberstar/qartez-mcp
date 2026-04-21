@@ -38,7 +38,7 @@ impl QartezServer {
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let limit = params.limit.unwrap_or(20) as i64;
-        let budget = params.token_budget.unwrap_or(4000) as usize;
+        let budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let concise = is_concise(&params.format);
         let use_regex = params.regex.unwrap_or(false);
         let search_bodies = params.search_bodies.unwrap_or(false);
@@ -90,8 +90,7 @@ impl QartezServer {
                     sym.name, sym.kind, file_path, sym.line_start, sym.line_end,
                 )
             };
-            if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                out.push_str("  ... (truncated by token budget)\n");
+            if budget_exceeded(&mut out, &line, budget) {
                 break;
             }
             out.push_str(&line);

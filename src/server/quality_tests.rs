@@ -7212,7 +7212,6 @@ fn qartez_health_buckets_match_intersection_rule() {
 }
 
 #[test]
-#[cfg(feature = "benchmark")]
 fn qartez_blame_dispatch_roundtrip() {
     let dir = TempDir::new().unwrap();
     let conn = setup_db();
