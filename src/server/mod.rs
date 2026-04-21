@@ -108,41 +108,34 @@ impl QartezServer {
         }
     }
 
-    /// Normalize common wrapper syntax around a tool path argument.
+    /// Compatibility shim for clients that pass wrapper syntax around path args.
     ///
     /// Some MCP clients (or copied tool traces) may pass values like:
     /// - `` `src/main.rs` ``
     /// - `"src/main.rs"`
     /// - `'src/main.rs'`
     /// - `[file_path=src/main.rs]`
-    /// - `file_path=src/main.rs`
     ///
-    /// This helper strips one or more wrapper layers before path validation.
+    /// This helper strips quote/backtick wrappers and bracketed assignment
+    /// wrappers before path validation. Bare literals such as `file=notes.md`
+    /// are preserved because the `=` may be part of the filename itself.
     fn normalize_user_path_arg(raw: &str) -> String {
         let mut s = raw.trim().to_string();
 
         loop {
             let before = s.clone();
 
-            // Strip one bracket layer for copied tool-log assignments:
+            // Strip one bracket wrapper for copied tool-log assignments:
             // [file_path=...], [path=...], [file=...]
             if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
                 let inner = s[1..s.len() - 1].trim();
-                if inner.starts_with("file_path=")
-                    || inner.starts_with("path=")
-                    || inner.starts_with("file=")
-                {
-                    s = inner.to_string();
+                if let Some(rest) = inner.strip_prefix("file_path=") {
+                    s = rest.trim().to_string();
+                } else if let Some(rest) = inner.strip_prefix("path=") {
+                    s = rest.trim().to_string();
+                } else if let Some(rest) = inner.strip_prefix("file=") {
+                    s = rest.trim().to_string();
                 }
-            }
-
-            // Strip common key prefixes copied from tool logs.
-            if let Some(rest) = s.strip_prefix("file_path=") {
-                s = rest.trim().to_string();
-            } else if let Some(rest) = s.strip_prefix("path=") {
-                s = rest.trim().to_string();
-            } else if let Some(rest) = s.strip_prefix("file=") {
-                s = rest.trim().to_string();
             }
 
             // Strip one matching quote/backtick layer.
@@ -729,6 +722,14 @@ mod safe_resolve_tests {
     }
 
     #[test]
+    fn rejects_empty_after_normalization() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("[file_path=   ]");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Path must not be empty");
+    }
+
+    #[test]
     fn preserves_literal_bracket_filename() {
         let server = dummy_server(std::path::Path::new("/tmp/project"));
         let result = server.safe_resolve("[notes].md");
@@ -736,6 +737,17 @@ mod safe_resolve_tests {
         assert_eq!(
             result.unwrap(),
             std::path::PathBuf::from("/tmp/project/[notes].md")
+        );
+    }
+
+    #[test]
+    fn preserves_literal_assignment_like_filename() {
+        let server = dummy_server(std::path::Path::new("/tmp/project"));
+        let result = server.safe_resolve("file=notes.md");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/project/file=notes.md")
         );
     }
 }
