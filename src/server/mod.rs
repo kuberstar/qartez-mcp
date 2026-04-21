@@ -293,6 +293,8 @@ impl QartezServer {
                 "qartez_hotspots"    => qartez_hotspots:    SoulHotspotsParams,
                 "qartez_clones"      => qartez_clones:      SoulClonesParams,
                 "qartez_smells"      => qartez_smells:      SoulSmellsParams,
+                "qartez_health"      => qartez_health:      SoulHealthParams,
+                "qartez_refactor_plan" => qartez_refactor_plan: SoulRefactorPlanParams,
                 "qartez_test_gaps"   => qartez_test_gaps:   SoulTestGapsParams,
                 "qartez_boundaries"  => qartez_boundaries:  SoulBoundariesParams,
                 "qartez_hierarchy"   => qartez_hierarchy:   SoulHierarchyParams,
@@ -300,6 +302,10 @@ impl QartezServer {
                 "qartez_security"    => qartez_security:    SoulSecurityParams,
                 "qartez_semantic"    => qartez_semantic:    SemanticParams,
                 "qartez_knowledge"   => qartez_knowledge:   SoulKnowledgeParams,
+                "qartez_replace_symbol"       => qartez_replace_symbol:       SoulReplaceSymbolParams,
+                "qartez_insert_before_symbol" => qartez_insert_before_symbol: SoulInsertSymbolParams,
+                "qartez_insert_after_symbol"  => qartez_insert_after_symbol:  SoulInsertSymbolParams,
+                "qartez_safe_delete"          => qartez_safe_delete:          SoulSafeDeleteParams,
             }
         )
     }
@@ -524,17 +530,17 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_31() {
+    fn total_tool_count_is_37() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 31, "expected 31 tools, got {}", all.len());
+        assert_eq!(all.len(), 37, "expected 37 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 16, "analysis tier");
-        assert_eq!(tiers::TIER_REFACTOR.len(), 3, "refactor tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 18, "analysis tier");
+        assert_eq!(tiers::TIER_REFACTOR.len(), 7, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 3, "meta tier");
     }
 

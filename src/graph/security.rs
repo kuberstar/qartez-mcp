@@ -145,8 +145,16 @@ pub fn builtin_rules() -> Vec<SecurityRule> {
             name: "sql-injection".into(),
             severity: Severity::High,
             category: "injection".into(),
+            // Require both a string-formatter token AND a recognizable SQL
+            // statement opener inside the formatted literal. The earlier
+            // `(SELECT|...|DROP)` tail matched any case-insensitive substring
+            // (`drop-shadow`, `Settings updated`, `selector:...`), drowning real
+            // findings in CSS, log strings, and HashMap key formatting. The
+            // new tail requires SQL syntax that does not appear in plain
+            // English: `SELECT *|DISTINCT|TOP|<col>`, `INSERT INTO`,
+            // `UPDATE x SET`, `DELETE FROM`, `DROP TABLE|INDEX|VIEW|...`.
             pattern: SecurityPattern::BodyRegex(
-                r#"(?i)(format!\(|\.format\(|f\"|%).*(?:SELECT|INSERT|UPDATE|DELETE|DROP)"#.into(),
+                r#"(?i)(?:format!\(|\.format\(|f")[^\n]*?\b(?:SELECT\s+(?:\*|DISTINCT|TOP|[`"\[]?\w)|INSERT\s+INTO\b|UPDATE\s+\w+\s+SET\b|DELETE\s+FROM\b|DROP\s+(?:TABLE|INDEX|VIEW|DATABASE|SCHEMA)\b)"#.into(),
             ),
             description: "SQL query built with string interpolation.".into(),
             languages: None,
@@ -507,6 +515,13 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
         if !opts.include_tests && is_test_path(path) {
             continue;
         }
+        // Skip the file that defines the built-in detection rules: it has to
+        // mention every regex literal (`Command::new`, `format!(`, `MD5`,
+        // `unsafe`, `TODO security`, etc.) and would otherwise self-match
+        // every body-regex rule, drowning the report in noise.
+        if is_security_rule_definition_path(path) {
+            continue;
+        }
         by_file.entry(path.as_str()).or_default().push(sym);
     }
 
@@ -581,6 +596,14 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
                             cr.regex
                                 .find_iter(&body)
                                 .any(|m| !is_sec007_benign(m.as_str(), &body, m.start()))
+                        } else if body_match && cr.rule.id == "SEC001" {
+                            cr.regex
+                                .find_iter(&body)
+                                .any(|m| !is_sec001_env_indirection(m.as_str()))
+                        } else if body_match && cr.rule.id == "SEC004" {
+                            cr.regex
+                                .find_iter(&body)
+                                .any(|m| !is_sec004_static_command(m.as_str(), &body, m.start()))
                         } else {
                             body_match
                         }
@@ -674,6 +697,88 @@ fn is_sec007_benign(url: &str, body: &str, match_start: usize) -> bool {
         return true;
     }
     false
+}
+
+/// Returns `true` for the file that defines this scanner's built-in rules.
+///
+/// Every body-regex pattern is materialized as a string literal in
+/// `builtin_rules()` here, so a body scan of this file would surface a
+/// match for SEC001 (the `password|token` literal), SEC003 (`SELECT...DROP`),
+/// SEC004 (`Command::new`), SEC006 (`md5|sha1`), SEC008 (`unsafe`), and
+/// SEC013 (`TODO.*security`). None of those are real findings, they are
+/// the rule definitions themselves. Skip the whole file rather than per-rule
+/// to keep the exemption obvious from one place.
+fn is_security_rule_definition_path(path: &str) -> bool {
+    path.ends_with("graph/security.rs") || path.ends_with("graph\\security.rs")
+}
+
+/// SEC001 allowlist: returns `true` when the matched `name="value"` snippet
+/// is just an environment-variable indirection rather than a hardcoded
+/// secret. Catches shell `TOKEN="$GITHUB_TOKEN"`, Bash `${VAR}`, JS
+/// `process.env.X`, Python `os.environ['X']`, and YAML `${{ secrets.X }}`.
+fn is_sec001_env_indirection(snippet: &str) -> bool {
+    let value = match snippet.split_once('=') {
+        Some((_, after)) => after.trim().trim_matches(|c| c == '"' || c == '\''),
+        None => return false,
+    };
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.starts_with('$') || v.starts_with("${") {
+        return true;
+    }
+    if v.contains("process.env")
+        || v.contains("os.environ")
+        || v.contains("System.getenv")
+        || v.contains("env::var")
+        || v.contains("std::env::var")
+        || v.contains("ENV[")
+        || v.contains("getenv(")
+        || v.contains("${{") && v.contains("secrets.")
+    {
+        return true;
+    }
+    false
+}
+
+/// SEC004 allowlist: returns `true` when the match is a `Command::new("LIT")`
+/// invocation whose executable is a string literal AND the surrounding
+/// `.args(...)` chain contains no `format!` / `&` interpolation. Static
+/// commands like `Command::new("git").args(["rev-parse", "HEAD"])` cannot
+/// inject arbitrary shells; only interpolated args are dangerous.
+fn is_sec004_static_command(matched: &str, body: &str, match_start: usize) -> bool {
+    if !matched.starts_with("Command::new") {
+        return false;
+    }
+    let after = &body[match_start + matched.len()..];
+    let exec_lit = match after.split_once(')') {
+        Some((inside, _)) => inside.trim_start_matches('('),
+        None => return false,
+    };
+    let exec = exec_lit.trim();
+    let is_string_literal = exec.len() >= 2
+        && (exec.starts_with('"') && exec.ends_with('"'))
+        && !exec[1..exec.len() - 1].contains('{');
+    if !is_string_literal {
+        return false;
+    }
+    // Inspect the next ~512 bytes of method chain (typical builder length).
+    // If the chain interpolates via `format!`, raw `&str` concat, or `+`,
+    // treat it as dynamic. The 512-byte window is large enough to cover
+    // the longest builder call we have in-tree (~300 bytes) but small
+    // enough that a downstream `format!(` in unrelated code does not
+    // poison the verdict.
+    let tail_end = (after.len()).min(512);
+    let tail = &after[..tail_end];
+    if tail.contains("format!(")
+        || tail.contains("&format!")
+        || tail.contains(".to_string()")
+        || tail.contains("String::from(")
+    {
+        return false;
+    }
+    true
 }
 
 /// Resolve a relative index path to an absolute path using the project roots.
@@ -820,6 +925,204 @@ mod tests {
             true,
         );
         check_regex(pat, r#"format!("DELETE FROM temp WHERE id = {}", x)"#, true);
+        check_regex(pat, r#"format!("UPDATE users SET name = {}", n)"#, true);
+        check_regex(pat, r#"format!("INSERT INTO users VALUES ({})", v)"#, true);
+        check_regex(pat, r#"format!("DROP TABLE foo")"#, true);
+    }
+
+    #[test]
+    fn sec003_does_not_flag_log_messages_or_css() {
+        // The old regex matched any case-insensitive `update`/`select`/`drop`
+        // substring, flagging `Settings updated`, `selector:{key}`, and CSS
+        // `drop-shadow`. The new regex requires SQL syntax tokens.
+        let rules = builtin_rules();
+        let pat = pattern_str(rules.iter().find(|r| r.id == "SEC003").unwrap());
+        check_regex(pat, r#"format!("Settings updated: {}", path)"#, false);
+        check_regex(pat, r#"format!("selector:{key}={val}")"#, false);
+        check_regex(
+            pat,
+            r#"format!("Tool list updated. {} tools", count)"#,
+            false,
+        );
+        check_regex(
+            pat,
+            "0%, 100% { filter: drop-shadow(0 0 8px var(--glow)); }",
+            false,
+        );
+        check_regex(
+            pat,
+            r#"format!("Qartez snippet updated in {}", target)"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn sec001_skips_env_indirection() {
+        // The hardcoded-secret rule must not fire on shell/JS/Python
+        // env-variable indirections - those fetch the secret at runtime,
+        // they do not embed it in source.
+        assert!(is_sec001_env_indirection(r#"GH_TOKEN="$GITHUB_TOKEN""#));
+        assert!(is_sec001_env_indirection(r#"token="${env.GITHUB_TOKEN}""#));
+        assert!(is_sec001_env_indirection(
+            r#"api_key="process.env.OPENAI_KEY""#
+        ));
+        assert!(is_sec001_env_indirection(
+            r#"password="os.environ['DB_PASS']""#
+        ));
+        // Real hardcoded secrets are still flagged.
+        assert!(!is_sec001_env_indirection(r#"password="hunter2""#));
+        assert!(!is_sec001_env_indirection(r#"api_key="sk-abc123def""#));
+    }
+
+    #[test]
+    fn sec004_skips_static_command() {
+        // Static `Command::new("git").args([...static literals...])` is safe.
+        let body =
+            r#"std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]).output()"#;
+        let m = "Command::new";
+        let start = body.find(m).unwrap();
+        assert!(is_sec004_static_command(m, body, start));
+
+        // Dynamic command construction via format! must still be flagged.
+        let body = r#"Command::new("sh").arg(format!("echo {}", user_input)).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+
+        // Variable executable (not a literal) is still suspicious.
+        let body = r#"Command::new(&cmd[0]).args(args).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+    }
+
+    #[test]
+    fn rule_definition_file_is_exempt() {
+        // The file containing the rule literals would otherwise self-match
+        // every body-regex rule (it has `Command::new`, `password`, `MD5`,
+        // `unsafe`, `TODO security`, ...). The exemption skips it wholesale.
+        assert!(is_security_rule_definition_path(
+            "qartez-public/src/graph/security.rs"
+        ));
+        assert!(is_security_rule_definition_path(
+            r"qartez-public\src\graph\security.rs"
+        ));
+        assert!(!is_security_rule_definition_path(
+            "qartez-public/src/graph/boundaries.rs"
+        ));
+    }
+
+    #[test]
+    fn rule_exemption_does_not_match_other_security_files() {
+        // A `*security*.rs` file in another module must still be scanned.
+        // Only the canonical path `graph/security.rs` is exempt.
+        assert!(!is_security_rule_definition_path(
+            "src/server/tools/security.rs"
+        ));
+        assert!(!is_security_rule_definition_path("src/security.rs"));
+        assert!(!is_security_rule_definition_path("graph/security_test.rs"));
+        assert!(!is_security_rule_definition_path("user/code.rs"));
+    }
+
+    #[test]
+    fn sec001_env_indirection_covers_more_languages() {
+        // System.getenv (Java)
+        assert!(is_sec001_env_indirection(
+            r#"token="System.getenv(\"GH_TOKEN\")""#
+        ));
+        // env::var (Rust)
+        assert!(is_sec001_env_indirection(
+            r#"secret="env::var(\"SECRET\").unwrap()""#
+        ));
+        // std::env::var (Rust full path)
+        assert!(is_sec001_env_indirection(
+            r#"api_key="std::env::var(\"API_KEY\").ok()""#
+        ));
+        // Ruby ENV[]
+        assert!(is_sec001_env_indirection(r#"token="ENV[\"GH_TOKEN\"]""#));
+        // C getenv()
+        assert!(is_sec001_env_indirection(r#"token="getenv(\"TOKEN\")""#));
+        // GitHub Actions secrets context
+        assert!(is_sec001_env_indirection(
+            r#"token="${{ secrets.GH_TOKEN }}""#
+        ));
+    }
+
+    #[test]
+    fn sec001_does_not_skip_secrets_with_dollar_signs() {
+        // A real password that happens to contain `$` mid-string must
+        // still be flagged. Only LEADING `$`/`${` indicates an env ref.
+        assert!(!is_sec001_env_indirection(r#"password="hunter$2""#));
+        assert!(!is_sec001_env_indirection(r#"api_key="sk-$abc-123""#));
+    }
+
+    #[test]
+    fn sec001_handles_single_quoted_values() {
+        // Bash/JS single-quoted string: `token='$GITHUB_TOKEN'` must
+        // still register as env indirection (the helper trims both
+        // quote styles).
+        assert!(is_sec001_env_indirection(r#"token='$GITHUB_TOKEN'"#));
+        assert!(is_sec001_env_indirection(
+            r#"api_key='process.env.OPENAI_KEY'"#
+        ));
+    }
+
+    #[test]
+    fn sec001_handles_no_equals_sign() {
+        // The hardcoded-secret regex always captures `name = "value"`,
+        // but a defensive helper should not panic if fed something
+        // unusual. No `=` → cannot parse → not env indirection.
+        assert!(!is_sec001_env_indirection("just some text"));
+        assert!(!is_sec001_env_indirection(""));
+    }
+
+    #[test]
+    fn sec004_static_command_handles_string_from() {
+        // `String::from(format!(...))` and `arg.to_string()` are also
+        // dynamic and must NOT be skipped.
+        let m = "Command::new";
+        let body = r#"Command::new("sh").arg(String::from(user_input)).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+
+        let body = r#"Command::new("sh").arg(user_input.to_string()).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+
+        let body = r#"Command::new("git").arg(&format!("--{flag}", flag = f)).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+    }
+
+    #[test]
+    fn sec004_static_command_handles_curly_brace_in_literal() {
+        // `Command::new("script-{version}")` interpolation in the exec
+        // name itself is dynamic; must NOT be skipped.
+        let m = "Command::new";
+        let body = r#"Command::new("script-{version}").output()"#;
+        let start = body.find(m).unwrap();
+        assert!(!is_sec004_static_command(m, body, start));
+    }
+
+    #[test]
+    fn sec004_static_command_long_chain_within_window() {
+        // Builder chain inside the 512-byte inspection window: even a
+        // long chain stays static if no interpolation is present.
+        let m = "Command::new";
+        let body = r#"Command::new("cargo").args(["build", "--release", "--all-features", "--target=x86_64-apple-darwin", "--manifest-path", "Cargo.toml"]).output()"#;
+        let start = body.find(m).unwrap();
+        assert!(is_sec004_static_command(m, body, start));
+    }
+
+    #[test]
+    fn sec004_static_command_unrelated_format_outside_window_is_safe() {
+        // A `format!(` further than 512 bytes after the Command::new
+        // belongs to unrelated code and must not poison the verdict.
+        let m = "Command::new";
+        let padding = " ".repeat(600);
+        let body = format!(
+            r#"Command::new("git").arg("status").output();{padding}let s = format!("unrelated {{}}", x);"#
+        );
+        let start = body.find(m).unwrap();
+        assert!(is_sec004_static_command(m, &body, start));
     }
 
     #[test]

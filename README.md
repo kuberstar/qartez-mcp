@@ -10,7 +10,7 @@
   </p>
   <p align="center">
     <a href="#quickstart">Quickstart</a> ·
-    <a href="#the-31-tools">31 Tools</a> ·
+    <a href="#the-37-tools">37 Tools</a> ·
     <a href="#modification-guard">Guard</a> ·
     <a href="#benchmarks">Benchmarks</a> ·
     <a href="#comparison-with-alternatives">Comparison</a> ·
@@ -24,7 +24,7 @@
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg"></a>
     <img alt="MSRV 1.88" src="https://img.shields.io/badge/MSRV-1.88-orange.svg">
     <img alt="37 languages" src="https://img.shields.io/badge/languages-37-green.svg">
-    <img alt="31 MCP tools" src="https://img.shields.io/badge/MCP_tools-31-purple.svg">
+    <img alt="37 MCP tools" src="https://img.shields.io/badge/MCP_tools-37-purple.svg">
   </p>
 </p>
 
@@ -197,7 +197,7 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ---
 
-## The 31 tools
+## The 37 tools
 
 Think of these as the **standard library for AI code understanding**. Each one replaces a multi-step human workflow with a single, token-efficient call the agent can reason about.
 
@@ -233,6 +233,8 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 | `qartez_trend` | Complexity trend over git history: tracks how a function's cyclomatic complexity evolved commit by commit. Flags functions that are GROWING, STABLE, or SHRINKING. |
 | `qartez_security` | Security scanner with 13 built-in rules. Regex-based pattern matching scored by PageRank to prioritize high-impact files. Custom rules via `.qartez/security.toml`. Filters by severity (low/medium/high/critical) and category. |
 | `qartez_smells` | Code smell detector: finds **god functions** (high complexity + long body), **long parameter lists**, and **feature envy** (methods that use another type more than their own). Tuneable thresholds. |
+| `qartez_health` | **Prioritized fix list.** Cross-references `qartez_hotspots` with `qartez_smells` and buckets files as Critical (hotspot + smell), High (hotspot only), or Medium (smell only). Each entry carries a concrete suggested refactor technique. |
+| `qartez_refactor_plan` | Ordered, safety-annotated refactor plan for one file. Each step names a technique (Extract Method, Introduce Parameter Object), an estimated CC impact category (High/Medium/Low) with a range, and safety signals from impact, test coverage, and caller count. |
 | `qartez_test_gaps` | Test coverage gap analysis via the import graph. Three modes: `gaps` ranks untested source files by risk, `map` shows test-to-source mappings, `suggest` recommends tests to run for a git diff range. |
 | `qartez_knowledge` | **Bus-factor analysis.** Git-blame-based authorship at file and module level. Surfaces single-author files and modules where knowledge is concentrated in one contributor. |
 | `qartez_semantic` | Semantic search using a local embedding model. Natural-language queries ranked by hybrid FTS5 + vector similarity (RRF). Requires the `semantic` cargo feature and a one-time model download (~270 MB). |
@@ -244,6 +246,10 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 | `qartez_rename` | Rename a symbol across the entire codebase. Definition, imports, all usages. Preview by default, `apply=true` to execute. |
 | `qartez_move` | Move a symbol to another file and rewrite all import paths. One MCP call. |
 | `qartez_rename_file` | Rename a file and update every import pointing to it. |
+| `qartez_replace_symbol` | Replace a symbol's whole line range with new source. Caller provides the full replacement including the signature; preview by default, `apply=true` executes atomically. |
+| `qartez_insert_before_symbol` | Splice new code immediately before an anchor symbol. Anchor lookup goes through the indexed symbol table - no need for the exact surrounding context. |
+| `qartez_insert_after_symbol` | Splice new code immediately after an anchor symbol. Same anchor-based addressing as `qartez_insert_before_symbol`. |
+| `qartez_safe_delete` | Delete a symbol after reporting every file that still imports it. Refuses to apply when importers exist unless `force=true`. |
 
 ### Meta (unlock via `qartez_tools`)
 

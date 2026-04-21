@@ -3,6 +3,45 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::Result;
 use crate::storage::models::{self, CoChangeRow, EdgeRow, FileRow, SymbolRow};
 
+/// Languages whose "exported" symbols are top-level keys, blocks, or rules
+/// rather than imports - they have no inbound import-edge concept by design,
+/// so every extracted symbol always reads as "unused" and pollutes
+/// `qartez_unused`. Keep in lock-step with the language-name strings
+/// returned by each `LanguageSupport::language_name` impl.
+///
+/// Excluded: config (yaml, toml, hcl, ini, json), build (makefile,
+/// dockerfile), templating (helm), web styling (css, nginx, caddyfile),
+/// shell (bash), service definitions (systemd). Real export-bearing
+/// languages (rust, typescript, python, go, java, c, cpp, ruby, php,
+/// kotlin, swift, scala, haskell, ocaml, lua, dart, elixir, jsonnet, sql,
+/// protobuf, etc.) stay in scope.
+pub const LANGUAGES_WITHOUT_EXPORT_SEMANTICS: &[&str] = &[
+    "yaml",
+    "toml",
+    "hcl",
+    "json",
+    "ini",
+    "makefile",
+    "dockerfile",
+    "helm",
+    "css",
+    "nginx",
+    "caddyfile",
+    "bash",
+    "systemd",
+];
+
+/// SQL `IN (...)` payload for [`LANGUAGES_WITHOUT_EXPORT_SEMANTICS`].
+/// All entries are static identifiers from this crate, so a comma-joined
+/// inline list is safe; no rusqlite parameter binding is needed.
+pub fn languages_without_export_semantics_sql_list() -> String {
+    LANGUAGES_WITHOUT_EXPORT_SEMANTICS
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Sanitize user input for FTS5 MATCH queries. Plain alphanumeric tokens
 /// (with `_`, plus an optional trailing `*` for prefix matching) pass
 /// through; anything else is wrapped in a double-quoted phrase so FTS5
@@ -420,15 +459,17 @@ pub fn count_unused_exports(conn: &Connection) -> Result<i64> {
     if materialized > 0 {
         return Ok(materialized);
     }
-    let fallback: i64 = conn.query_row(
+    let fallback_sql = format!(
         "SELECT COUNT(*) FROM symbols s
+         JOIN files f ON f.id = s.file_id
          WHERE s.is_exported = 1
            AND COALESCE(s.unused_excluded, 0) = 0
+           AND f.language NOT IN ({})
            AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_file = s.file_id)
            AND NOT EXISTS (SELECT 1 FROM symbol_refs sr WHERE sr.to_symbol_id = s.id)",
-        [],
-        |r| r.get(0),
-    )?;
+        languages_without_export_semantics_sql_list()
+    );
+    let fallback: i64 = conn.query_row(&fallback_sql, [], |r| r.get(0))?;
     Ok(fallback)
 }
 
@@ -462,12 +503,14 @@ pub fn get_unused_exports_page(
     // follow-up `populate_unused_exports`). Compute on the fly using the
     // `unused_excluded` column so callers still get correct results.
     if results.is_empty() && offset == 0 {
+        let lang_filter = languages_without_export_semantics_sql_list();
         let sql = format!(
             "SELECT {SYMBOL_FILE_JOIN_COLS}
              FROM symbols s
              JOIN files f ON s.file_id = f.id
              WHERE s.is_exported = 1
                AND COALESCE(s.unused_excluded, 0) = 0
+               AND f.language NOT IN ({lang_filter})
                AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_file = s.file_id)
                AND NOT EXISTS (SELECT 1 FROM symbol_refs sr WHERE sr.to_symbol_id = s.id)
              ORDER BY f.path, s.line_start

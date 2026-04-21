@@ -1682,6 +1682,168 @@ fn test_populate_unused_exports_idempotent() {
 }
 
 // ===========================================================================
+// 47b. populate_unused_exports excludes config languages (yaml, toml, etc.)
+//
+// Regression: a `extract_top_level_keys` call in the YAML language module
+// marks every top-level key (`name:`, `on:`, `jobs:` ...) as `is_exported`.
+// Combined with `Cargo.toml` and `dependabot.yml` having no inbound edges,
+// this drowned the qartez_unused output in 947 false positives. The fix
+// adds a `f.language NOT IN (...)` filter to both the materialized
+// populate query and the count/page fallbacks.
+// ===========================================================================
+
+#[test]
+fn test_populate_unused_exports_skips_config_languages() {
+    let conn = setup();
+    let yaml = write::upsert_file(&conn, ".github/workflows/ci.yml", 1000, 100, "yaml", 50)
+        .expect("upsert yaml");
+    let toml = write::upsert_file(&conn, "Cargo.toml", 1000, 100, "toml", 50).expect("upsert toml");
+    let rust = write::upsert_file(&conn, "src/lib.rs", 1000, 100, "rust", 50).expect("upsert rust");
+
+    write::insert_symbols(
+        &conn,
+        yaml,
+        &[sym("on:workflow_dispatch", "variable", 1, 1, true)],
+    )
+    .unwrap();
+    write::insert_symbols(&conn, toml, &[sym("dependencies", "const", 1, 1, true)]).unwrap();
+    write::insert_symbols(&conn, rust, &[sym("Orphan", "function", 1, 5, true)]).unwrap();
+
+    write::populate_unused_exports(&conn).unwrap();
+    let page = read::get_unused_exports_page(&conn, i64::MAX, 0).unwrap();
+
+    let names: Vec<&str> = page.iter().map(|(s, _)| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"Orphan"),
+        "rust unused export must surface, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"on:workflow_dispatch"),
+        "yaml top-level keys must NOT be reported as unused, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"dependencies"),
+        "toml top-level keys must NOT be reported as unused, got {names:?}"
+    );
+}
+
+// ===========================================================================
+// 47c. count_unused_exports fallback also respects the language filter
+//
+// Regression: count_unused_exports has a separate fallback SQL path that
+// runs when the materialized `unused_exports` table is empty. The filter
+// must be applied there too, otherwise the count and the page disagree
+// on freshly-migrated DBs.
+// ===========================================================================
+
+#[test]
+fn test_count_unused_exports_fallback_respects_language_filter() {
+    let conn = setup();
+    let yaml = write::upsert_file(&conn, ".github/dependabot.yml", 1000, 100, "yaml", 50)
+        .expect("upsert yaml");
+    let rust = write::upsert_file(&conn, "src/lib.rs", 1000, 100, "rust", 50).expect("upsert rust");
+
+    write::insert_symbols(&conn, yaml, &[sym("version", "variable", 1, 1, true)]).unwrap();
+    write::insert_symbols(&conn, rust, &[sym("Orphan", "function", 1, 5, true)]).unwrap();
+
+    // Skip populate_unused_exports → forces fallback in count_unused_exports.
+    let fallback_count = read::count_unused_exports(&conn).unwrap();
+    assert_eq!(
+        fallback_count, 1,
+        "fallback count must exclude yaml (only Orphan from rust survives)"
+    );
+
+    // Once materialized, both paths should agree.
+    write::populate_unused_exports(&conn).unwrap();
+    let mat_count = read::count_unused_exports(&conn).unwrap();
+    assert_eq!(mat_count, 1, "materialized count must agree with fallback");
+}
+
+// ===========================================================================
+// 47d. get_unused_exports_page fallback respects the language filter
+//
+// Same regression as 47c, but for the page query. The fallback in
+// get_unused_exports_page also has its own SQL string and was patched
+// in the same change.
+// ===========================================================================
+
+#[test]
+fn test_get_unused_exports_page_fallback_respects_language_filter() {
+    let conn = setup();
+    let toml = write::upsert_file(&conn, "Cargo.toml", 1000, 100, "toml", 50).expect("upsert toml");
+    let css = write::upsert_file(&conn, "site.css", 1000, 100, "css", 50).expect("upsert css");
+    let rust = write::upsert_file(&conn, "src/lib.rs", 1000, 100, "rust", 50).expect("upsert rust");
+
+    write::insert_symbols(&conn, toml, &[sym("dependencies", "const", 1, 1, true)]).unwrap();
+    write::insert_symbols(&conn, css, &[sym(".header", "selector", 1, 1, true)]).unwrap();
+    write::insert_symbols(&conn, rust, &[sym("RustOrphan", "function", 1, 5, true)]).unwrap();
+
+    // Skip populate_unused_exports → fallback path runs.
+    let page = read::get_unused_exports_page(&conn, i64::MAX, 0).unwrap();
+    let names: Vec<&str> = page.iter().map(|(s, _)| s.name.as_str()).collect();
+
+    assert_eq!(
+        names,
+        vec!["RustOrphan"],
+        "fallback page must exclude toml/css and only return RustOrphan, got {names:?}"
+    );
+}
+
+// ===========================================================================
+// 47e. LANGUAGES_WITHOUT_EXPORT_SEMANTICS list is consistent
+//
+// Sanity: every language string in the constant must round-trip through
+// the SQL list helper without quoting issues, and rust must NOT be in
+// the list (else we'd silently ship a broken qartez_unused that
+// excluded the primary language of this repo).
+// ===========================================================================
+
+#[test]
+fn test_languages_without_export_semantics_consistency() {
+    let langs = read::LANGUAGES_WITHOUT_EXPORT_SEMANTICS;
+    assert!(
+        !langs.contains(&"rust"),
+        "rust must never appear in the exclusion list"
+    );
+    assert!(
+        !langs.contains(&"typescript"),
+        "typescript must never appear in the exclusion list"
+    );
+    assert!(
+        !langs.contains(&"python"),
+        "python must never appear in the exclusion list"
+    );
+    assert!(
+        !langs.contains(&"go"),
+        "go must never appear in the exclusion list"
+    );
+    assert!(
+        !langs.contains(&"java"),
+        "java must never appear in the exclusion list"
+    );
+    assert!(langs.contains(&"yaml"));
+    assert!(langs.contains(&"toml"));
+    assert!(langs.contains(&"hcl"));
+
+    // The SQL list payload must quote each entry exactly once and not
+    // contain SQL meta-chars that could break the IN clause.
+    let sql_list = read::languages_without_export_semantics_sql_list();
+    for lang in langs {
+        let needle = format!("'{lang}'");
+        assert!(
+            sql_list.contains(&needle),
+            "lang {lang} missing from SQL list: {sql_list}"
+        );
+        // No bare double-quote, semicolon, comment marker (would indicate
+        // injection if the constant ever picked up bad input).
+        assert!(
+            !lang.contains('\'') && !lang.contains(';') && !lang.contains("--"),
+            "lang {lang} has unsafe chars"
+        );
+    }
+}
+
+// ===========================================================================
 // 48. compute_blast_radius (whole-graph) vs blast_radius_for_file consistency
 // ===========================================================================
 

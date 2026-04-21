@@ -2,10 +2,10 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.4.x   | Yes                |
-| < 0.4   | No                 |
+| Version  | Supported |
+|----------|-----------|
+| 0.8.x    | ✓         |
+| < 0.8    | ✗         |
 
 Only the latest minor release receives security updates. If you are using an older version, please upgrade before reporting.
 

@@ -324,64 +324,49 @@ pub(super) fn compute_cochange_pairs(
 /// excluded from blast radius and aggregate counts by default). Covers common
 /// conventions across Rust, Go, TypeScript/JavaScript, Python, Java, and Ruby.
 pub(super) fn is_test_path(path: &str) -> bool {
-    if path.starts_with("tests/")
-        || path.starts_with("test/")
-        || path.starts_with("benches/")
-        || path.starts_with("__tests__/")
-        || path.starts_with("spec/")
-    {
+    const TEST_DIR_PREFIXES: &[&str] = &["tests/", "test/", "benches/", "__tests__/", "spec/"];
+    const TEST_DIR_SUBSTRINGS: &[&str] =
+        &["/tests/", "/test/", "/benches/", "/__tests__/", "/spec/"];
+    const TEST_FILE_EXACT: &[&str] = &["test.rs", "tests.rs"];
+    const TEST_FILE_SUFFIXES: &[&str] = &[
+        "_test.rs",
+        "_tests.rs",
+        "_test.go",
+        "_test.dart",
+        ".test.ts",
+        ".spec.ts",
+        ".test.tsx",
+        ".spec.tsx",
+        ".test.js",
+        ".spec.js",
+        ".test.jsx",
+        ".spec.jsx",
+        "_test.py",
+        "Test.java",
+        "Tests.java",
+        "Test.kt",
+        "Tests.kt",
+        "_spec.rb",
+        "Test.cs",
+        "Tests.cs",
+    ];
+
+    if TEST_DIR_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
     }
-    if path.contains("/tests/")
-        || path.contains("/test/")
-        || path.contains("/benches/")
-        || path.contains("/__tests__/")
-        || path.contains("/spec/")
-    {
+    if TEST_DIR_SUBSTRINGS.iter().any(|p| path.contains(p)) {
         return true;
     }
-    if let Some(name) = path.rsplit('/').next() {
-        if matches!(name, "test.rs" | "tests.rs") {
-            return true;
-        }
-        if name.ends_with("_test.rs") || name.ends_with("_tests.rs") {
-            return true;
-        }
-        if name.ends_with("_test.go") {
-            return true;
-        }
-        if name.ends_with("_test.dart") {
-            return true;
-        }
-        if name.ends_with(".test.ts")
-            || name.ends_with(".spec.ts")
-            || name.ends_with(".test.tsx")
-            || name.ends_with(".spec.tsx")
-            || name.ends_with(".test.js")
-            || name.ends_with(".spec.js")
-            || name.ends_with(".test.jsx")
-            || name.ends_with(".spec.jsx")
-        {
-            return true;
-        }
-        if (name.starts_with("test_") && name.ends_with(".py")) || name.ends_with("_test.py") {
-            return true;
-        }
-        if name.ends_with("Test.java")
-            || name.ends_with("Tests.java")
-            || name.ends_with("Test.kt")
-            || name.ends_with("Tests.kt")
-        {
-            return true;
-        }
-        if name.ends_with("_spec.rb") {
-            return true;
-        }
-        if name.ends_with("Test.cs") || name.ends_with("Tests.cs") {
-            return true;
-        }
+    let Some(name) = path.rsplit('/').next() else {
+        return false;
+    };
+    if TEST_FILE_EXACT.contains(&name) {
+        return true;
     }
-    false
+    if TEST_FILE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+    name.starts_with("test_") && name.ends_with(".py")
 }
 
 /// Returns true if the Rust source at `path` contains inline test markers

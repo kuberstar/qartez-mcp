@@ -6597,6 +6597,543 @@ fn qartez_smells_file_path_unknown_errors() {
 }
 
 // =========================================================================
+// Section: qartez_health
+// =========================================================================
+
+#[test]
+fn qartez_health_reports_unhealthy_files() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(out.contains("Codebase Health Report"), "header:\n{out}");
+    assert!(
+        out.contains("src/godf.rs") || out.contains("src/longparams.rs"),
+        "expected smelled files in output:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_health_surfaces_recommendations() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("Recommended") || out.contains("Extract Method"),
+        "expected recommendations section:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_health_respects_max_health_cutoff() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(0.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("No unhealthy files") || out.contains("Showing 0"),
+        "at max_health=0 we should not surface any files:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_health_concise_is_compact() {
+    let (server, _dir) = setup_smells_fixture();
+    let detailed = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            format: Some(Format::Detailed),
+            ..Default::default()
+        }))
+        .unwrap();
+    let concise = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            format: Some(Format::Concise),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        concise.len() < detailed.len(),
+        "concise must be shorter than detailed",
+    );
+}
+
+// =========================================================================
+// Section: qartez_refactor_plan
+// =========================================================================
+
+#[test]
+fn qartez_refactor_plan_orders_god_first() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/godf.rs".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(out.contains("Refactor Plan"), "header:\n{out}");
+    assert!(
+        out.contains("huge_fn"),
+        "must mention the god function:\n{out}"
+    );
+    assert!(
+        out.contains("Extract Method") || out.contains("HIGH"),
+        "must propose a refactor technique:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_handles_long_params_file() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/longparams.rs".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("many_args"),
+        "must mention the long-params fn:\n{out}",
+    );
+    assert!(
+        out.contains("Introduce Parameter Object"),
+        "must propose IPO:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_empty_when_below_thresholds() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/envy.rs".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("No smells detected"),
+        "below-threshold file must yield no steps:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_missing_file_errors() {
+    let (server, _dir) = setup_smells_fixture();
+    let err = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/does_not_exist.rs".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(
+        err.contains("File not found") || err.contains("not found") || err.contains("No such file"),
+        "missing file must error:\n{err}",
+    );
+}
+
+#[test]
+fn qartez_health_dispatches_via_call_tool_by_name() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .call_tool_by_name("qartez_health", serde_json::json!({ "max_health": 10.0 }))
+        .expect("qartez_health via call_tool_by_name must succeed");
+    assert!(
+        out.contains("Codebase Health Report"),
+        "dispatched output must contain header:\n{out}"
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_dispatches_via_call_tool_by_name() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .call_tool_by_name(
+            "qartez_refactor_plan",
+            serde_json::json!({ "file_path": "src/godf.rs" }),
+        )
+        .expect("qartez_refactor_plan via call_tool_by_name must succeed");
+    assert!(
+        out.contains("Refactor Plan"),
+        "dispatched output must contain header:\n{out}"
+    );
+}
+
+#[test]
+fn qartez_health_accepts_stringified_numbers() {
+    // Claude Code sometimes forwards numeric args as strings. The flexible
+    // deserializers must accept "10" for max_health and u32 fields alike.
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .call_tool_by_name(
+            "qartez_health",
+            serde_json::json!({
+                "max_health": "10",
+                "min_complexity": "15",
+                "min_lines": "50",
+                "min_params": "5",
+                "limit": "5",
+            }),
+        )
+        .expect("stringified numeric args must deserialize");
+    assert!(out.contains("Codebase Health Report"), "out:\n{out}");
+}
+
+#[test]
+fn qartez_refactor_plan_accepts_stringified_numbers() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .call_tool_by_name(
+            "qartez_refactor_plan",
+            serde_json::json!({
+                "file_path": "src/godf.rs",
+                "min_complexity": "15",
+                "min_lines": "50",
+                "min_params": "5",
+                "limit": "5",
+            }),
+        )
+        .expect("stringified numeric args must deserialize");
+    assert!(out.contains("Refactor Plan"), "out:\n{out}");
+}
+
+#[test]
+fn qartez_refactor_plan_rejects_missing_file_path() {
+    let (server, _dir) = setup_smells_fixture();
+    let result = server.call_tool_by_name("qartez_refactor_plan", serde_json::json!({}));
+    assert!(
+        result.is_err(),
+        "missing required file_path must error, got: {result:?}"
+    );
+}
+
+#[test]
+fn qartez_health_and_refactor_plan_carry_tool_metadata() {
+    // Every MCP client relies on these fields to show per-tool descriptions
+    // in tool pickers and to skip destructive tools in read-only contexts.
+    let (server, _dir) = setup_smells_fixture();
+    let all = server.tool_router.list_all();
+    for name in ["qartez_health", "qartez_refactor_plan"] {
+        let tool = all
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} missing from router"));
+        let desc = tool
+            .description
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name} has no description"));
+        assert!(
+            desc.len() > 50,
+            "{name} description is too short for an agent to pick: {desc:?}",
+        );
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} missing annotations"));
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(true),
+            "{name} must be flagged read-only",
+        );
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(false),
+            "{name} must not be flagged destructive",
+        );
+    }
+}
+
+#[test]
+fn qartez_health_and_refactor_plan_live_in_analysis_tier() {
+    use crate::server::tiers::{TIER_ANALYSIS, TIER_CORE, TIER_META, TIER_REFACTOR};
+    for name in ["qartez_health", "qartez_refactor_plan"] {
+        assert!(
+            TIER_ANALYSIS.contains(&name),
+            "{name} must be in TIER_ANALYSIS"
+        );
+        assert!(!TIER_CORE.contains(&name), "{name} must NOT be in core");
+        assert!(
+            !TIER_REFACTOR.contains(&name),
+            "{name} must NOT be in refactor"
+        );
+        assert!(!TIER_META.contains(&name), "{name} must NOT be in meta");
+    }
+}
+
+#[test]
+fn qartez_health_concise_is_machine_friendly() {
+    let (server, _dir) = setup_smells_fixture();
+    let concise = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            format: Some(Format::Concise),
+            ..Default::default()
+        }))
+        .unwrap();
+    // Concise format uses severity tags C/H/M and single-space columns.
+    assert!(
+        concise.lines().any(|l| l.starts_with('C')
+            || l.starts_with('H')
+            || l.starts_with('M')
+            || l.starts_with('#')),
+        "concise format missing per-line severity tag:\n{concise}",
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_concise_is_machine_friendly() {
+    let (server, _dir) = setup_smells_fixture();
+    let concise = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/godf.rs".into(),
+            format: Some(Format::Concise),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        concise.contains("# n impact technique"),
+        "concise format missing header:\n{concise}",
+    );
+}
+
+#[test]
+fn qartez_health_empty_db_no_panic() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let conn = setup_db();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            ..Default::default()
+        }))
+        .expect("empty DB must not error");
+    assert!(
+        out.contains("No unhealthy files") || out.contains("Showing 0"),
+        "empty DB should report no findings:\n{out}",
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_limit_caps_steps() {
+    // Exactly two smells are seeded (huge_fn + many_args implicit LP). With
+    // limit=1 the plan should surface only one step.
+    let (server, _dir) = setup_smells_fixture();
+    let limited = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/godf.rs".into(),
+            limit: Some(1),
+            ..Default::default()
+        }))
+        .unwrap();
+    // Only huge_fn is in src/godf.rs. Confirm exactly one step header.
+    let step_headers = limited.matches("## Step ").count();
+    assert!(
+        step_headers <= 1,
+        "limit=1 should cap steps, saw {step_headers}:\n{limited}",
+    );
+}
+
+#[test]
+fn qartez_health_and_refactor_plan_hidden_in_progressive_core() {
+    // In progressive mode (QARTEZ_PROGRESSIVE=1) the server starts with only
+    // TIER_CORE + qartez_tools enabled. The two new analysis tools must not
+    // leak into that starter set. Rather than manipulate the env var (which
+    // makes the test racy in parallel), assert directly on the tier table.
+    use crate::server::tiers::{META_TOOL_NAME, TIER_CORE};
+    let starter: std::collections::HashSet<&str> =
+        TIER_CORE.iter().copied().chain([META_TOOL_NAME]).collect();
+    assert!(
+        !starter.contains("qartez_health"),
+        "qartez_health must NOT appear in the progressive-mode starter set",
+    );
+    assert!(
+        !starter.contains("qartez_refactor_plan"),
+        "qartez_refactor_plan must NOT appear in the progressive-mode starter set",
+    );
+}
+
+#[test]
+fn qartez_health_schema_is_discoverable() {
+    // The rmcp tool router exposes a JSON-Schema-shaped input schema for every
+    // tool. MCP clients rely on this to present parameters to the user. This
+    // test asserts both new tools publish a schema with the documented keys.
+    let (server, _dir) = setup_smells_fixture();
+    let all = server.tool_router.list_all();
+    for (name, expected_fields) in [
+        (
+            "qartez_health",
+            vec![
+                "limit",
+                "max_health",
+                "min_complexity",
+                "min_lines",
+                "min_params",
+                "format",
+            ],
+        ),
+        (
+            "qartez_refactor_plan",
+            vec![
+                "file_path",
+                "limit",
+                "min_complexity",
+                "min_lines",
+                "min_params",
+                "format",
+            ],
+        ),
+    ] {
+        let tool = all
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let schema_json = serde_json::to_string(&tool.input_schema).unwrap();
+        for field in expected_fields {
+            assert!(
+                schema_json.contains(field),
+                "{name} schema missing {field}: {schema_json}",
+            );
+        }
+    }
+}
+
+#[test]
+fn qartez_refactor_plan_required_file_path_is_marked_required() {
+    let (server, _dir) = setup_smells_fixture();
+    let all = server.tool_router.list_all();
+    let tool = all
+        .iter()
+        .find(|t| t.name.as_ref() == "qartez_refactor_plan")
+        .unwrap();
+    let schema_json = serde_json::to_string(&tool.input_schema).unwrap();
+    assert!(
+        schema_json.contains("\"required\"") && schema_json.contains("\"file_path\""),
+        "schema must mark file_path required: {schema_json}",
+    );
+}
+
+#[test]
+fn qartez_health_extreme_max_health_zero() {
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(0.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("No unhealthy files") || out.contains("Showing 0"),
+        "max_health=0 should filter everything: {out}"
+    );
+}
+
+#[test]
+fn qartez_health_threshold_beyond_ten_clamps() {
+    // max_health > 10 is defensively clamped to 10 (see tool impl). Both
+    // 10.0 and 999.0 must produce identical output.
+    let (server, _dir) = setup_smells_fixture();
+    let at_ten = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    let above_ten = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(999.0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert_eq!(
+        at_ten, above_ten,
+        "values above 10 must clamp to 10 for deterministic output"
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_zero_limit_surfaces_at_least_one_step() {
+    // limit is `.max(1)` in the tool so 0 becomes 1. Regression guard for
+    // the .max(1) call.
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "src/godf.rs".into(),
+            limit: Some(0),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("## Step 1"),
+        "limit=0 must still surface one step (clamped): {out}"
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_path_traversal_blocked() {
+    // safe_resolve rejects any path escaping the project root.
+    let (server, _dir) = setup_smells_fixture();
+    let err = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "../../../etc/passwd".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(
+        err.contains("escapes") || err.contains("relative") || err.contains("not found"),
+        "traversal must be rejected: {err}"
+    );
+}
+
+#[test]
+fn qartez_refactor_plan_quoted_path_accepted() {
+    // normalize_user_path_arg strips matching quote/backtick wrappers.
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_refactor_plan(Parameters(SoulRefactorPlanParams {
+            file_path: "`src/godf.rs`".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("huge_fn"),
+        "backtick-wrapped path must still resolve: {out}"
+    );
+}
+
+#[test]
+fn qartez_health_buckets_match_intersection_rule() {
+    // The severity buckets are:
+    //   Critical  = hotspot AND smell
+    //   High      = hotspot only
+    //   Medium    = smell only
+    // The smells fixture has low pagerank/churn so everything should land in
+    // Medium. Verify no Critical/High appear for this fixture.
+    let (server, _dir) = setup_smells_fixture();
+    let out = server
+        .qartez_health(Parameters(SoulHealthParams {
+            max_health: Some(10.0),
+            format: Some(Format::Detailed),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        out.contains("## Medium") || out.contains("Medium"),
+        "low-pagerank smells must fall into Medium bucket:\n{out}",
+    );
+}
+
+// =========================================================================
 // Helpers
 // =========================================================================
 

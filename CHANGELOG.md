@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.0] - 2026-04-21
+
+### Added
+
+- **`qartez_health`** - prioritized, actionable health report for the whole repo. Cross-references `qartez_hotspots` with `qartez_smells`: files that score badly in both surface as **Critical** with concrete refactor techniques (Extract Method, Introduce Parameter Object), hotspot-only as **High**, smell-only as **Medium**. Pure aggregator - reuses the same 0-10 health formula as `qartez_hotspots`. Added to `TIER_ANALYSIS`.
+- **`qartez_refactor_plan`** - ordered, safety-annotated refactor plan for a single file. Each step names a concrete technique, categorizes the expected CC impact (High/Medium/Low) with a **range** (e.g. "-5 to -12 CC"), and folds in safety signals from existing tools: whether tests cover the file, caller count from `symbol_refs`, and `is_exported`. CC impact is conservative by design - ranges, not fake precision. Added to `TIER_ANALYSIS`.
+- **`qartez_replace_symbol`** - replace a symbol's whole line range (`line_start..line_end`) with new source. Caller supplies the full replacement including the signature; the tool performs an atomic line-range rewrite via tmp-file + rename. Preview by default; `apply=true` executes. `kind` / `file_path` disambiguate when the name is shared. Added to `TIER_REFACTOR`.
+- **`qartez_insert_before_symbol` / `qartez_insert_after_symbol`** - splice new code immediately before or after an anchor symbol. Avoids the "find the exact surrounding context" step that Edit requires; anchor lookup goes through the indexed symbol table. Preview by default; `apply=true` executes. Added to `TIER_REFACTOR`.
+- **`qartez_safe_delete`** - delete a symbol after reporting every file that still imports it. Refuses to apply when importers exist unless `force=true`, so the caller sees the breakage before the file is modified. Preview always lists the importers. Added to `TIER_REFACTOR`.
+- **Shared helper module `server/tools/refactor_common.rs`** - hosts `resolve_unique_symbol` (symbol + file + kind disambiguation shared with `qartez_move`), `validate_range` (stale-index detection), `write_atomic` (tmp-file + rename), and `join_lines_with_trailing` (POSIX trailing-newline preservation). Cuts duplication across the four new tools and `qartez_move`-style refactors.
+
+### Fixed
+
+- **`qartez_security` no longer fires on CSS and log strings** - SEC003 (SQL injection) now requires actual SQL syntax (`SELECT *|DISTINCT|TOP|<col>`, `INSERT INTO`, `UPDATE x SET`, `DELETE FROM`, `DROP TABLE|...`) inside `format!` literals, so patterns like `drop-shadow(...)`, `"Settings updated"` log lines, and `"selector:{key}={val}"` map keys stop matching. SEC001 (hardcoded secret) skips env-variable indirections (`$VAR`, `${VAR}`, `process.env.X`, `os.environ['X']`). SEC004 (command injection) skips `Command::new("LIT")` when the argument is a string literal and the builder chain has no `format!` / `String::from` / `to_string()` interpolation. The rule-definition file (`graph/security.rs`) is excluded from scanning so its own regex bodies no longer self-match. Findings on this repo drop 68 → 33 (51% noise reduction).
+- **`qartez_unused` no longer fires on config-only languages** - `populate_unused_exports`, `count_unused_exports`, and `get_unused_exports_page` now filter out yaml, toml, hcl, json, ini, makefile, dockerfile, helm, css, nginx, caddyfile, bash, and systemd - languages without import semantics. Findings on this repo drop 947 → 82 (91% noise reduction). Regression test `test_populate_unused_exports_skips_config_languages`.
+- **`write_atomic` tmp path is unique per call** - the tmp path used by the refactor tools (`qartez_replace_symbol`, `qartez_insert_before/after_symbol`, `qartez_safe_delete`) was deterministic (`file.qartez_edit_tmp`). Two concurrent tool calls on the same file both wrote to the same tmp, so the first `rename()` consumed the second call's bytes and the second `rename()` failed with ENOENT. The tmp path now carries a pid + thread-id + atomic-counter nonce so concurrent writes to different files never collide on the tmp name. Same-file concurrent writes still have last-writer-wins semantics (matches `qartez_move` / `qartez_rename`; MCP clients serialize tool calls anyway). Covered by a new concurrency regression test that spins 8 threads against `qartez_replace_symbol` on distinct files.
+- **`qartez_replace_symbol` refuses empty `new_code`** - previously an empty string turned into "replace the symbol with one blank line" via the `"".split('\n') → [""]` quirk. Callers wanting to remove a symbol should use `qartez_safe_delete`.
+- **`initialize` response tool count and refactor-tier listing were stale** - `mcp_instructions.md` (the text served in `initialize` responses) still claimed "27 tools" and listed only the three legacy refactor tools. Updated to reflect the current tool count and the full refactor tier.
+
+### Changed
+
+- **`qartez_read` and `qartez_move` god functions split into composable helpers** - `qartez_read` (233 lines, CC=40) is now split into `read_file_slice`, `read_symbol_batch`, `render_symbol_section`, and `parse_symbol_queries`; the largest remaining helper is CC=16. `qartez_move` (273 lines, CC=47) is now split into `validate_source`, `extract_lines`, `gather_importers`, `format_move_preview`, `write_atomic`, and `rewrite_importers`; the largest remaining helper is CC=19. Pure refactor, no behavior change.
+- **`qartez_move` uses the unified `refactor_common::write_atomic`** - the per-tool atomic-write implementation is gone; both `qartez_move` and the new refactor tools now share one tmp-file + rename path. `is_test_path` in `helpers.rs` was also simplified (fewer allocations, same semantics).
+
 ## [0.8.5] - 2026-04-21
 
 ### Fixed

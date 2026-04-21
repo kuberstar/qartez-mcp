@@ -1363,6 +1363,146 @@ fn test_qartez_read_file_path_alone_reads_whole_file() {
     );
 }
 
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_qartez_read_split_preserves_all_modes() {
+    // Behavioral parity test for the qartez_read refactor: every mode the
+    // monolithic version supported must still produce equivalent output
+    // through the new dispatcher + helpers.
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("a.rs"),
+        "// header\npub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("b.rs"),
+        "pub fn gamma() -> i32 { 3 }\npub fn delta() -> i32 { 4 }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("dup.rs"),
+        "pub fn alpha() -> i32 { 99 }\n", // shadows alpha from a.rs
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    // 1. Single-symbol read by symbol_name.
+    let single = server
+        .call_tool_by_name("qartez_read", json!({ "symbol_name": "beta" }))
+        .expect("single-symbol read should succeed");
+    assert!(single.contains("beta"), "single read missing symbol header");
+    assert!(single.contains("pub fn beta"), "single read missing body");
+
+    // 2. Batch read via `symbols=[...]`.
+    let batch = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "symbols": ["alpha", "gamma", "delta"] }),
+        )
+        .expect("batch read should succeed");
+    assert!(batch.contains("alpha"), "batch missing alpha");
+    assert!(batch.contains("gamma"), "batch missing gamma");
+    assert!(batch.contains("delta"), "batch missing delta");
+
+    // 3. Batch with one missing - partial-hit returns output + footer.
+    let partial = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "symbols": ["alpha", "no_such_symbol"] }),
+        )
+        .expect("partial batch should not error");
+    assert!(partial.contains("alpha"), "partial missing the hit");
+    assert!(
+        partial.contains("not found") && partial.contains("no_such_symbol"),
+        "partial batch must surface the missing name in footer"
+    );
+
+    // 4. file_path filter disambiguates between two `alpha` definitions.
+    let filtered = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "symbol_name": "alpha", "file_path": "dup.rs" }),
+        )
+        .expect("filtered single-symbol read should succeed");
+    assert!(
+        filtered.contains("dup.rs") && filtered.contains("99"),
+        "file_path filter must pick the dup.rs definition (= 99), got: {filtered}"
+    );
+    assert!(
+        !filtered.contains("a.rs"),
+        "filter must exclude a.rs alpha, got: {filtered}"
+    );
+
+    // 5. All-missing batch returns Err (no partial hits to fall back on).
+    let err = server
+        .call_tool_by_name("qartez_read", json!({ "symbols": ["nope1", "nope2"] }))
+        .unwrap_err();
+    assert!(
+        err.contains("No symbol found") || err.contains("not found"),
+        "all-missing batch should error, got: {err}"
+    );
+
+    // 6. Missing both symbols and file_path is a clear error.
+    let err = server
+        .call_tool_by_name("qartez_read", json!({}))
+        .unwrap_err();
+    assert!(
+        err.contains("required") || err.contains("Either"),
+        "empty params must error, got: {err}"
+    );
+
+    // 7. Empty symbols list is treated as missing.
+    let err = server
+        .call_tool_by_name("qartez_read", json!({ "symbols": [] }))
+        .unwrap_err();
+    assert!(
+        err.contains("required") || err.contains("Either"),
+        "empty symbols list must error, got: {err}"
+    );
+
+    // 8. Symbols list with only empty strings is also missing.
+    let err = server
+        .call_tool_by_name("qartez_read", json!({ "symbols": ["", ""] }))
+        .unwrap_err();
+    assert!(
+        err.contains("required") || err.contains("non-empty"),
+        "all-empty symbols list must error, got: {err}"
+    );
+
+    // 9. context_lines expands the slice on the start side.
+    let with_ctx = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "symbol_name": "alpha", "file_path": "a.rs", "context_lines": 1 }),
+        )
+        .expect("context_lines read should succeed");
+    assert!(
+        with_ctx.contains("// header"),
+        "context_lines=1 must include the line above alpha (// header), got: {with_ctx}"
+    );
+
+    // 10. Tiny max_bytes triggers a truncation marker for batch mode.
+    let trunc = server
+        .call_tool_by_name(
+            "qartez_read",
+            json!({ "symbols": ["alpha", "beta", "gamma", "delta"], "max_bytes": 100 }),
+        )
+        .expect("truncated batch should not error");
+    assert!(
+        trunc.contains("truncated") || trunc.contains("skipped"),
+        "tiny max_bytes must trigger truncation marker for batch, got: {trunc}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // qartez-guard PreToolUse hook - end-to-end
 // ---------------------------------------------------------------------------
@@ -2044,6 +2184,160 @@ fn test_security_scan_sec007_allowlist_end_to_end() {
     assert!(
         !result.contains("http://backend"),
         "single-label host must not appear in findings: {result}"
+    );
+}
+
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_security_scan_noise_reduction_end_to_end() {
+    // End-to-end coverage for the four noise-reduction changes shipped in
+    // the noise-reduction patch: SEC003 SQL syntax tightening, SEC001
+    // env-indirection skip, SEC004 static-literal Command skip, and the
+    // graph/security.rs self-scan exemption. Build a fixture project with
+    // ALL the historical false positives next to a curated set of true
+    // positives, scan it, and assert FPs are gone while TPs survive.
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    let graph = src.join("graph");
+    fs::create_dir_all(&graph).unwrap();
+
+    // ---- TRUE POSITIVES (must surface) ----
+
+    // Real SQL injection via format!.
+    fs::write(
+        src.join("real_sql.rs"),
+        "pub fn user_lookup(id: i64) {\n    \
+         let q = format!(\"SELECT * FROM users WHERE id = {}\", id);\n    \
+         let _ = q;\n\
+         }\n",
+    )
+    .unwrap();
+
+    // Real hardcoded secret (literal value, not env indirection).
+    fs::write(
+        src.join("real_secret.rs"),
+        "pub fn load() {\n    \
+         let password = \"hunter2-real-prod-secret\";\n    \
+         let _ = password;\n\
+         }\n",
+    )
+    .unwrap();
+
+    // Real dynamic Command (interpolated arg via format!).
+    fs::write(
+        src.join("real_cmd.rs"),
+        "pub fn unsafe_exec(user: &str) {\n    \
+         let _ = std::process::Command::new(\"sh\")\n        \
+                 .arg(format!(\"echo {}\", user))\n        \
+                 .output();\n\
+         }\n",
+    )
+    .unwrap();
+
+    // ---- FALSE POSITIVES (must NOT surface) ----
+
+    // SEC003: format! with substring "updated" (matched 'UPDATE' under old regex).
+    fs::write(
+        src.join("fp_log_update.rs"),
+        "pub fn log_settings_update(path: &str) {\n    \
+         let msg = format!(\"Settings updated: {}\", path);\n    \
+         let _ = msg;\n\
+         }\n",
+    )
+    .unwrap();
+
+    // SEC003: format! with "selector:" (matched 'SELECT' under old regex).
+    fs::write(
+        src.join("fp_selector_key.rs"),
+        "pub fn build_selector(key: &str, val: &str) {\n    \
+         let s = format!(\"selector:{}={}\", key, val);\n    \
+         let _ = s;\n\
+         }\n",
+    )
+    .unwrap();
+
+    // SEC001: env-variable indirections (no hardcoded value).
+    fs::write(
+        src.join("fp_env_token.rs"),
+        "pub fn env_indirection() {\n    \
+         let token = \"${env.GITHUB_TOKEN}\";\n    \
+         let api_key = \"process.env.OPENAI_KEY\";\n    \
+         let _ = (token, api_key);\n\
+         }\n",
+    )
+    .unwrap();
+
+    // SEC004: static Command::new with all-literal args.
+    fs::write(
+        src.join("fp_static_git.rs"),
+        "pub fn git_sha() {\n    \
+         let _ = std::process::Command::new(\"git\")\n        \
+                 .args([\"rev-parse\", \"--short\", \"HEAD\"])\n        \
+                 .output();\n\
+         }\n",
+    )
+    .unwrap();
+
+    // graph/security.rs exemption: drop the same regex literal here that
+    // would self-match every body-regex rule. The scanner must skip this
+    // file entirely.
+    fs::write(
+        graph.join("security.rs"),
+        "pub fn fake_rule_table() {\n    \
+         let _sec001 = r#\"(?i)(password|token|secret|api_key)\\s*=\\s*\"[^\"]{4,}\"\"#;\n    \
+         let _sec003 = r#\"(?i)(format!\\(|\\.format\\(|f\")[^\"\\n]*?\\b(?:SELECT|INSERT|UPDATE|DELETE|DROP)\"#;\n    \
+         let _sec004 = r#\"(?i)(Command::new|subprocess|os\\.system|exec\\()\"#;\n    \
+         let _ = (_sec001, _sec003, _sec004);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let result = server
+        .call_tool_by_name(
+            "qartez_security",
+            json!({ "min_severity": "low", "limit": 200 }),
+        )
+        .expect("qartez_security dispatch");
+
+    // ---- TRUE POSITIVES must surface ----
+    assert!(
+        result.contains("real_sql.rs"),
+        "real SQL injection must still be flagged, got:\n{result}"
+    );
+    assert!(
+        result.contains("real_secret.rs"),
+        "real hardcoded secret must still be flagged, got:\n{result}"
+    );
+    assert!(
+        result.contains("real_cmd.rs"),
+        "dynamic Command::new with format! must still be flagged, got:\n{result}"
+    );
+
+    // ---- FALSE POSITIVES must NOT surface ----
+    for fp in [
+        "fp_log_update.rs",
+        "fp_selector_key.rs",
+        "fp_env_token.rs",
+        "fp_static_git.rs",
+    ] {
+        assert!(
+            !result.contains(fp),
+            "false positive resurfaced in {fp}, got:\n{result}"
+        );
+    }
+
+    // graph/security.rs exemption: even though the file contains every
+    // body-regex literal, the scanner must skip it wholesale.
+    assert!(
+        !result.contains("graph/security.rs"),
+        "graph/security.rs self-scan exemption broken, got:\n{result}"
     );
 }
 
@@ -3966,6 +4260,179 @@ fn test_qartez_move_preserves_blank_line_separators() {
     );
 }
 
+#[cfg(feature = "benchmark")]
+#[test]
+fn test_qartez_move_split_preserves_all_modes() {
+    // Behavioral parity test for the qartez_move refactor: every code
+    // path the monolithic version supported must still produce the same
+    // result through the new validate_source + extract_lines +
+    // gather_importers + format_move_preview + write_atomic +
+    // rewrite_importers helpers.
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // 1. Multi-match disambiguation: two `dup` symbols in different files.
+    fs::write(src.join("a.rs"), "pub fn dup() -> i32 { 1 }\n").unwrap();
+    fs::write(src.join("b.rs"), "pub fn dup() -> i32 { 2 }\n").unwrap();
+    fs::write(src.join("target.rs"), "pub fn anchor() {}\n").unwrap();
+    // 2. Kind disambiguation: same name as fn AND const.
+    fs::write(
+        src.join("kinds.rs"),
+        "pub fn shared() {}\npub const shared: i32 = 0;\n",
+    )
+    .unwrap();
+    // 3. Conflict: target file already has same-name same-kind symbol.
+    fs::write(src.join("conflict.rs"), "pub fn already_here() {}\n").unwrap();
+    fs::write(
+        src.join("conflict_target.rs"),
+        "pub fn already_here() {}\n", // would collide
+    )
+    .unwrap();
+    // 4. Apply path with importer rewrite.
+    fs::write(src.join("util.rs"), "pub fn helper() -> i32 { 42 }\n").unwrap();
+    fs::write(
+        src.join("consumer.rs"),
+        "use crate::util::helper;\npub fn use_it() -> i32 { helper() }\n",
+    )
+    .unwrap();
+    fs::write(src.join("util_dest.rs"), "pub fn anchor2() {}\n").unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\npub mod target;\npub mod kinds;\n\
+         pub mod conflict;\npub mod conflict_target;\npub mod util;\n\
+         pub mod consumer;\npub mod util_dest;\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    // 1. Multi-match must error with disambiguation hint.
+    let err = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({ "symbol": "dup", "to_file": "src/target.rs" }),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("Multiple definitions") && err.contains("a.rs") && err.contains("b.rs"),
+        "multi-match must list both locations, got: {err}"
+    );
+
+    // 2. Kind disambiguation: pass kind=function to pick exactly one.
+    let preview_fn = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({
+                "symbol": "shared",
+                "kind": "function",
+                "to_file": "src/target.rs",
+            }),
+        )
+        .expect("kind-narrowed preview must succeed");
+    assert!(
+        preview_fn.contains("Preview") && preview_fn.contains("kinds.rs"),
+        "kind=function must produce a preview from kinds.rs, got: {preview_fn}"
+    );
+
+    // 2b. Bad kind = clear error listing available kinds.
+    let err = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({
+                "symbol": "shared",
+                "kind": "trait",
+                "to_file": "src/target.rs",
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("Available kinds"),
+        "bad kind must report available kinds, got: {err}"
+    );
+
+    // 3. Same-name in source AND target is also caught - the multi-match
+    //    error (which fires from find_symbol_by_name returning >1 row)
+    //    is the primary protection. The conflict check inside
+    //    validate_source is a defensive second line for cases where the
+    //    target's symbols are present but the multi-match path is bypassed
+    //    (e.g., kind filter narrows source to 1 while target retains its
+    //    own match in get_symbols_for_file).
+    let err = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({
+                "symbol": "already_here",
+                "to_file": "src/conflict_target.rs",
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("Multiple definitions")
+            || err.contains("already defines")
+            || err.contains("Refusing to overwrite"),
+        "name collision must be caught (multi-match OR conflict), got: {err}"
+    );
+
+    // 4. Apply path rewrites importer + creates target body + truncates source.
+    let result = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({
+                "symbol": "helper",
+                "to_file": "src/util_dest.rs",
+                "apply": true,
+            }),
+        )
+        .expect("apply must succeed");
+    assert!(
+        result.contains("Moved") && result.contains("importer(s) rewritten"),
+        "apply must report move + importer count, got: {result}"
+    );
+
+    // Source file must no longer contain `helper`.
+    let src_content = fs::read_to_string(src.join("util.rs")).unwrap();
+    assert!(
+        !src_content.contains("pub fn helper"),
+        "source must be drained, got: {src_content:?}"
+    );
+    // Target file must contain `helper` body.
+    let tgt_content = fs::read_to_string(src.join("util_dest.rs")).unwrap();
+    assert!(
+        tgt_content.contains("pub fn helper"),
+        "target must include the helper body, got: {tgt_content:?}"
+    );
+    // Importer must be rewritten from `crate::util::helper` to
+    // `crate::util_dest::helper`.
+    let consumer = fs::read_to_string(src.join("consumer.rs")).unwrap();
+    assert!(
+        consumer.contains("util_dest::helper"),
+        "consumer import must be rewritten, got: {consumer:?}"
+    );
+    assert!(
+        !consumer.contains("util::helper"),
+        "old import path must be gone, got: {consumer:?}"
+    );
+
+    // 5. Symbol that does not exist returns a clean error.
+    let err = server
+        .call_tool_by_name(
+            "qartez_move",
+            json!({ "symbol": "no_such_symbol_anywhere", "to_file": "src/target.rs" }),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("No symbol found"),
+        "missing symbol must error, got: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Regression: qartez_rename_file rewrites `use crate::<old>` importers
 // ---------------------------------------------------------------------------
@@ -4025,5 +4492,1071 @@ fn test_qartez_rename_file_updates_crate_imports() {
     assert!(
         lib.contains("pub mod baz;"),
         "parent `mod foo;` declaration must be rewritten, got: {lib:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// qartez_replace_symbol / qartez_insert_before_symbol / qartez_insert_after_symbol / qartez_safe_delete
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_qartez_replace_symbol_rewrites_definition() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn a() {\n    let _ = 1;\n}\n\npub fn b() {\n    let _ = 2;\n}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let new_body = "pub fn b() {\n    let _ = 42;\n    let _ = 43;\n}";
+    let result = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "b",
+                "new_code": new_body,
+                "apply": true,
+            }),
+        )
+        .expect("qartez_replace_symbol must succeed");
+    assert!(
+        result.starts_with("Replaced 'b'"),
+        "expected replace confirmation, got: {result}"
+    );
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        updated.contains("let _ = 42;"),
+        "new body must be present: {updated}"
+    );
+    assert!(
+        updated.contains("let _ = 43;"),
+        "new body second line must be present: {updated}"
+    );
+    assert!(
+        !updated.contains("let _ = 2;"),
+        "old body must be gone: {updated}"
+    );
+    assert!(
+        updated.contains("pub fn a()"),
+        "unrelated symbol must stay: {updated}"
+    );
+    assert!(
+        updated.ends_with('\n'),
+        "trailing newline must be preserved: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_replace_symbol_preview_does_not_modify() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn a() {\n    let _ = 1;\n}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "a",
+                "new_code": "pub fn a() { let _ = 99; }",
+            }),
+        )
+        .expect("qartez_replace_symbol preview must succeed");
+    assert!(
+        result.contains("Preview"),
+        "preview header must be present: {result}"
+    );
+
+    let untouched = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert_eq!(
+        untouched, original,
+        "preview must not write to disk: {untouched:?}"
+    );
+}
+
+#[test]
+fn test_qartez_insert_before_symbol_splices_at_anchor() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn a() {\n    let _ = 1;\n}\n\npub fn b() {\n    let _ = 2;\n}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let _ = server
+        .call_tool_by_name(
+            "qartez_insert_before_symbol",
+            json!({
+                "symbol": "b",
+                "new_code": "pub fn helper() {}\n",
+                "apply": true,
+            }),
+        )
+        .expect("qartez_insert_before_symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    let helper_idx = updated
+        .find("pub fn helper()")
+        .expect("helper must be inserted");
+    let b_idx = updated.find("pub fn b()").expect("b must still exist");
+    assert!(
+        helper_idx < b_idx,
+        "helper must appear before anchor `b`, got: {updated}"
+    );
+    assert!(
+        updated.contains("pub fn a()"),
+        "unrelated symbol must stay: {updated}"
+    );
+}
+
+#[test]
+fn test_qartez_insert_after_symbol_splices_at_anchor() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn a() {\n    let _ = 1;\n}\n\npub fn b() {\n    let _ = 2;\n}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let _ = server
+        .call_tool_by_name(
+            "qartez_insert_after_symbol",
+            json!({
+                "symbol": "a",
+                "new_code": "pub fn helper() {}",
+                "apply": true,
+            }),
+        )
+        .expect("qartez_insert_after_symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    let a_idx = updated.find("pub fn a()").expect("a must still exist");
+    let helper_idx = updated
+        .find("pub fn helper()")
+        .expect("helper must be inserted");
+    let b_idx = updated.find("pub fn b()").expect("b must still exist");
+    assert!(
+        a_idx < helper_idx && helper_idx < b_idx,
+        "helper must appear between a and b, got: {updated}"
+    );
+    assert!(
+        updated.ends_with('\n'),
+        "trailing newline must be preserved: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_safe_delete_refuses_when_importer_exists() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub mod helper;\npub mod caller;\n").unwrap();
+    fs::write(src.join("helper.rs"), "pub fn helper() {}\n").unwrap();
+    fs::write(
+        src.join("caller.rs"),
+        "use crate::helper::helper;\npub fn entry() { helper(); }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_safe_delete",
+            json!({
+                "symbol": "helper",
+                "apply": true,
+            }),
+        )
+        .expect_err("delete must refuse without force");
+    assert!(
+        err.contains("Refusing to delete"),
+        "expected refusal message, got: {err}"
+    );
+    // File must be untouched.
+    let untouched = fs::read_to_string(src.join("helper.rs")).unwrap();
+    assert!(
+        untouched.contains("pub fn helper()"),
+        "symbol must still be present after refused delete: {untouched}"
+    );
+}
+
+#[test]
+fn test_qartez_safe_delete_removes_symbol_with_force() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn keep() {}\n\npub fn drop_me() { let _ = 1; }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_safe_delete",
+            json!({
+                "symbol": "drop_me",
+                "apply": true,
+            }),
+        )
+        .expect("qartez_safe_delete must succeed when no importers");
+    assert!(
+        result.starts_with("Deleted 'drop_me'"),
+        "expected delete confirmation: {result}"
+    );
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        !updated.contains("drop_me"),
+        "symbol must be removed: {updated:?}"
+    );
+    assert!(
+        updated.contains("pub fn keep()"),
+        "unrelated symbol must stay: {updated:?}"
+    );
+    assert!(
+        updated.ends_with('\n'),
+        "trailing newline must be preserved: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_safe_delete_preview_lists_importers() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub mod h;\npub mod c;\n").unwrap();
+    fs::write(src.join("h.rs"), "pub fn target() {}\n").unwrap();
+    fs::write(
+        src.join("c.rs"),
+        "use crate::h::target;\npub fn entry() { target(); }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let preview = server
+        .call_tool_by_name(
+            "qartez_safe_delete",
+            json!({
+                "symbol": "target",
+            }),
+        )
+        .expect("preview must succeed");
+    assert!(
+        preview.contains("Preview: delete 'target'"),
+        "expected preview header: {preview}"
+    );
+    assert!(
+        preview.contains("src/c.rs"),
+        "importer must be listed in preview: {preview}"
+    );
+
+    // File must be untouched.
+    let untouched = fs::read_to_string(src.join("h.rs")).unwrap();
+    assert!(
+        untouched.contains("pub fn target()"),
+        "preview must not write to disk: {untouched}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases for the new refactor tools
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_qartez_replace_symbol_first_symbol_in_file() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn first() {}\n\npub fn second() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "first",
+                "new_code": "pub fn first() { let _ = 99; }",
+                "apply": true,
+            }),
+        )
+        .expect("replace first symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        updated.starts_with("pub fn first() { let _ = 99; }"),
+        "replacement must start the file: {updated:?}"
+    );
+    assert!(
+        updated.contains("pub fn second()"),
+        "later symbols preserved: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_replace_symbol_last_symbol_no_trailing_newline() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // No trailing newline - regression case for naive `lines().join("\n")`.
+    let original = "pub fn first() {}\n\npub fn last() { 1 }";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "last",
+                "new_code": "pub fn last() { 2 }",
+                "apply": true,
+            }),
+        )
+        .expect("replace last symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        !updated.ends_with('\n'),
+        "missing trailing newline must not be invented: {updated:?}"
+    );
+    assert!(
+        updated.contains("pub fn last() { 2 }"),
+        "new code must be in file: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_replace_symbol_empty_new_code_refused() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn a() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "a",
+                "new_code": "",
+                "apply": true,
+            }),
+        )
+        .expect_err("empty new_code must error");
+    assert!(
+        err.contains("Empty `new_code`"),
+        "expected empty-code error: {err}"
+    );
+    // File must be untouched.
+    let untouched = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert_eq!(untouched, original, "file must be unchanged: {untouched:?}");
+}
+
+#[test]
+fn test_qartez_replace_symbol_ambiguous_errors_cleanly() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    fs::write(src.join("a.rs"), "pub fn dup() {}\n").unwrap();
+    fs::write(src.join("b.rs"), "pub fn dup() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "dup",
+                "new_code": "pub fn dup() { 1 }",
+                "apply": true,
+            }),
+        )
+        .expect_err("ambiguous symbol must error");
+    assert!(
+        err.contains("Multiple definitions"),
+        "expected ambiguity error: {err}"
+    );
+
+    // Now disambiguate via file_path.
+    let ok = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "dup",
+                "new_code": "pub fn dup() { 2 }",
+                "file_path": "src/a.rs",
+                "apply": true,
+            }),
+        )
+        .expect("file_path disambiguation must succeed");
+    assert!(ok.contains("Replaced"), "expected apply confirmation: {ok}");
+
+    let a_src = fs::read_to_string(src.join("a.rs")).unwrap();
+    let b_src = fs::read_to_string(src.join("b.rs")).unwrap();
+    assert!(
+        a_src.contains("pub fn dup() { 2 }"),
+        "a.rs updated: {a_src}"
+    );
+    assert!(
+        !b_src.contains("pub fn dup() { 2 }"),
+        "b.rs untouched: {b_src}"
+    );
+}
+
+#[test]
+fn test_qartez_replace_symbol_nonexistent_symbol_errors() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "does_not_exist",
+                "new_code": "fn whatever() {}",
+                "apply": true,
+            }),
+        )
+        .expect_err("nonexistent symbol must error");
+    assert!(err.contains("No symbol found"), "expected not-found: {err}");
+}
+
+#[test]
+fn test_qartez_replace_symbol_path_traversal_blocked() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    // Invalid `file_path` - traversal attempt. Should not resolve to any
+    // indexed file (index only holds paths relative to root).
+    let err = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "a",
+                "new_code": "pub fn a() { 1 }",
+                "file_path": "../../../etc/passwd",
+                "apply": true,
+            }),
+        )
+        .expect_err("traversal path must not match any indexed symbol");
+    assert!(
+        err.contains("No symbol 'a' in file") || err.contains("No symbol found"),
+        "expected filter-miss error for traversal path, got: {err}"
+    );
+}
+
+#[test]
+fn test_qartez_insert_preview_does_not_modify() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn anchor() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let preview = server
+        .call_tool_by_name(
+            "qartez_insert_after_symbol",
+            json!({
+                "symbol": "anchor",
+                "new_code": "pub fn new_helper() {}",
+            }),
+        )
+        .expect("preview must succeed");
+    assert!(
+        preview.contains("Preview"),
+        "expected preview header: {preview}"
+    );
+
+    let untouched = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert_eq!(untouched, original, "preview must not write to disk");
+}
+
+#[test]
+fn test_qartez_insert_empty_new_code_is_noop() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn anchor() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_insert_after_symbol",
+            json!({
+                "symbol": "anchor",
+                "new_code": "",
+                "apply": true,
+            }),
+        )
+        .expect("empty insert must noop, not crash");
+    assert!(
+        result.contains("No changes"),
+        "empty insert must be a visible noop: {result}"
+    );
+
+    let untouched = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert_eq!(untouched, original, "empty insert must not change file");
+}
+
+#[test]
+fn test_qartez_insert_after_at_end_of_file() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn only() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    server
+        .call_tool_by_name(
+            "qartez_insert_after_symbol",
+            json!({
+                "symbol": "only",
+                "new_code": "pub fn appended() {}",
+                "apply": true,
+            }),
+        )
+        .expect("insert after last symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        updated.contains("pub fn only()") && updated.contains("pub fn appended()"),
+        "both symbols must be present: {updated}"
+    );
+    assert!(
+        updated.find("pub fn only()").unwrap() < updated.find("pub fn appended()").unwrap(),
+        "new symbol must follow anchor: {updated}"
+    );
+    assert!(updated.ends_with('\n'), "trailing newline preserved");
+}
+
+#[test]
+fn test_qartez_insert_before_at_start_of_file() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let original = "pub fn first() {}\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    server
+        .call_tool_by_name(
+            "qartez_insert_before_symbol",
+            json!({
+                "symbol": "first",
+                "new_code": "// prelude comment",
+                "apply": true,
+            }),
+        )
+        .expect("insert before first symbol must succeed");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        updated.starts_with("// prelude comment"),
+        "insert-before must land at file start: {updated:?}"
+    );
+}
+
+#[test]
+fn test_qartez_insert_preserves_unicode_content() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Rust allows non-ASCII string literals; tree-sitter tolerates them.
+    let original = "pub fn greet() -> &'static str { \"Привет мир\" }\n";
+    fs::write(src.join("lib.rs"), original).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    server
+        .call_tool_by_name(
+            "qartez_insert_after_symbol",
+            json!({
+                "symbol": "greet",
+                "new_code": "pub fn hello() -> &'static str { \"日本語\" }",
+                "apply": true,
+            }),
+        )
+        .expect("unicode content must not break insert");
+
+    let updated = fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        updated.contains("Привет мир") && updated.contains("日本語"),
+        "both unicode strings must survive: {updated}"
+    );
+}
+
+#[test]
+fn test_qartez_safe_delete_nonexistent_symbol_errors() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_safe_delete",
+            json!({
+                "symbol": "missing",
+                "apply": true,
+            }),
+        )
+        .expect_err("nonexistent symbol must error");
+    assert!(err.contains("No symbol found"), "expected not-found: {err}");
+}
+
+#[test]
+fn test_qartez_safe_delete_force_drops_symbol_with_importers() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub mod helper;\npub mod caller;\n").unwrap();
+    fs::write(src.join("helper.rs"), "pub fn helper() {}\n").unwrap();
+    fs::write(
+        src.join("caller.rs"),
+        "use crate::helper::helper;\npub fn entry() { helper(); }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let result = server
+        .call_tool_by_name(
+            "qartez_safe_delete",
+            json!({
+                "symbol": "helper",
+                "apply": true,
+                "force": true,
+            }),
+        )
+        .expect("force=true must succeed");
+    assert!(result.contains("Deleted"), "expected delete: {result}");
+    assert!(
+        result.contains("WARNING"),
+        "must warn about dangling imports: {result}"
+    );
+
+    let helper_src = fs::read_to_string(src.join("helper.rs")).unwrap();
+    assert!(
+        !helper_src.contains("pub fn helper()"),
+        "symbol must be removed: {helper_src:?}"
+    );
+    // Caller is left dangling per the tool's contract.
+    let caller_src = fs::read_to_string(src.join("caller.rs")).unwrap();
+    assert!(
+        caller_src.contains("use crate::helper::helper;"),
+        "tool must NOT auto-fix importers (that is the caller's job): {caller_src}"
+    );
+}
+
+#[test]
+fn test_qartez_replace_symbol_preview_kind_disambiguates() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Free function `pub fn foo()` and impl method `Foo::foo()` share a name
+    // but have different kinds (`function` vs `method`).
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Foo;\npub fn foo() {}\nimpl Foo {\n    pub fn foo() {}\n}\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 300);
+
+    let preview = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "foo",
+                "kind": "function",
+                "new_code": "pub fn foo() { let _ = 1; }",
+            }),
+        )
+        .expect("kind filter must resolve to free function");
+    assert!(
+        preview.contains("Preview: replace 'foo'"),
+        "preview must identify target: {preview}"
+    );
+}
+
+#[test]
+fn test_write_atomic_tmp_path_unique_across_concurrent_writes() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    for i in 0..8 {
+        fs::write(
+            src.join(format!("f{i}.rs")),
+            format!("pub fn g{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let mut lib = String::from("pub mod f0;\npub mod f1;\npub mod f2;\npub mod f3;\n");
+    lib.push_str("pub mod f4;\npub mod f5;\npub mod f6;\npub mod f7;\n");
+    fs::write(src.join("lib.rs"), &lib).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = Arc::new(QartezServer::new(conn, root.to_path_buf(), 300));
+
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let server = Arc::clone(&server);
+        handles.push(thread::spawn(move || {
+            server.call_tool_by_name(
+                "qartez_replace_symbol",
+                json!({
+                    "symbol": format!("g{i}"),
+                    "new_code": format!("pub fn g{i}() {{ let _ = {i}; }}"),
+                    "apply": true,
+                }),
+            )
+        }));
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let r = h.join().unwrap();
+        assert!(r.is_ok(), "worker {i} must succeed, got: {:?}", r.err());
+    }
+
+    for i in 0..8 {
+        let content = fs::read_to_string(src.join(format!("f{i}.rs"))).unwrap();
+        assert!(
+            content.contains(&format!("let _ = {i};")),
+            "file f{i}.rs must contain its replacement, got: {content:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: qartez_health + qartez_refactor_plan on a real indexed crate.
+//
+// Exercises the full path: tree-sitter parse -> complexity + signature -> DB
+// -> MCP dispatch -> tool impl -> output. The fixture-only tests in
+// quality_tests.rs hand-craft CC numbers; this test lets the real indexer
+// compute them, which is what catches any drift between what the tool expects
+// to see in the DB and what the indexer actually writes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_qartez_health_end_to_end_on_real_index() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // A genuinely complex function: many independent branches, real body >= 50 lines.
+    let mut god_body = String::from("pub fn classify(n: i32) -> &'static str {\n");
+    for i in 0..25 {
+        god_body.push_str(&format!(
+            "    if n == {i} {{ return \"v{i}\"; }}\n    else if n < -{i} {{ return \"nv{i}\"; }}\n"
+        ));
+    }
+    god_body.push_str("    \"unknown\"\n}\n");
+    fs::write(src.join("classify.rs"), &god_body).unwrap();
+
+    // Benign file so the "no findings" branch is exercised against a realistic repo.
+    fs::write(
+        src.join("simple.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    // Health report: classify must surface as a smell (real CC, real body).
+    let health = server
+        .call_tool_by_name(
+            "qartez_health",
+            json!({
+                "max_health": 10.0,
+                "min_complexity": 10,
+                "min_lines": 20,
+            }),
+        )
+        .expect("qartez_health must run against a real index");
+    assert!(
+        health.contains("classify"),
+        "real-index health must surface classify(): {health}"
+    );
+    assert!(
+        health.contains("src/classify.rs"),
+        "path must be rendered: {health}"
+    );
+    // Must be in a severity bucket (Medium is expected given low churn).
+    assert!(
+        health.contains("Medium") || health.contains("Critical") || health.contains("High"),
+        "health must emit a severity bucket, got: {health}"
+    );
+}
+
+#[test]
+fn test_qartez_refactor_plan_end_to_end_on_real_index() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // One god function (high real CC + long body)
+    let mut god_body = String::from("pub fn dispatch(kind: u32, payload: &str) -> u32 {\n");
+    for i in 0..20 {
+        god_body.push_str(&format!(
+            "    if kind == {i} {{\n        if payload.starts_with(\"a{i}\") {{ return {i} + 1; }}\n        else if payload.starts_with(\"b{i}\") {{ return {i} + 2; }}\n        return {i};\n    }}\n"
+        ));
+    }
+    god_body.push_str("    0\n}\n");
+
+    // One long-params function in the same file
+    god_body.push_str(
+        "pub fn build(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32) -> i32 { a + b + c + d + e + f + g }\n",
+    );
+    fs::write(src.join("dispatch.rs"), &god_body).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    let plan = server
+        .call_tool_by_name(
+            "qartez_refactor_plan",
+            json!({
+                "file_path": "src/dispatch.rs",
+                "min_complexity": 10,
+                "min_lines": 20,
+                "min_params": 5,
+            }),
+        )
+        .expect("qartez_refactor_plan must run against a real index");
+
+    assert!(plan.contains("Refactor Plan"), "header missing: {plan}");
+    assert!(
+        plan.contains("dispatch"),
+        "god function must appear as a step: {plan}"
+    );
+    assert!(
+        plan.contains("build"),
+        "long-params fn must appear as a step: {plan}"
+    );
+    assert!(
+        plan.contains("Extract Method"),
+        "god step must propose Extract Method: {plan}"
+    );
+    assert!(
+        plan.contains("Introduce Parameter Object"),
+        "long-params step must propose IPO: {plan}"
+    );
+    // The CC impact range must render for the god step.
+    assert!(
+        plan.contains("-") && plan.contains("CC"),
+        "CC impact range missing: {plan}"
+    );
+}
+
+#[test]
+fn test_qartez_health_no_findings_against_clean_repo() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // Two tiny functions, no smells possible.
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn one() -> i32 { 1 }\npub fn two() -> i32 { 2 }\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, dir.path(), false).unwrap();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+
+    let out = server
+        .call_tool_by_name("qartez_health", json!({ "max_health": 5.0 }))
+        .expect("must not error on a clean repo");
+    assert!(
+        out.contains("No unhealthy files") || out.contains("Showing 0"),
+        "clean repo must report no findings, got: {out}"
     );
 }

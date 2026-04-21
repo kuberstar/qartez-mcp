@@ -77,7 +77,7 @@ qartez_test_gaps mode=suggest base=main # which tests should you run?
 
 ## Unlocking tools
 
-By default, all 31 tools are available. With progressive disclosure
+By default, all 37 tools are available. With progressive disclosure
 (`QARTEZ_PROGRESSIVE=1`), start with core tools and unlock more as needed:
 
 ```
@@ -94,6 +94,8 @@ qartez_tools enable=["all"]             # unlock everything
 | Find all usages of a symbol | analysis (`qartez_refs`) |
 | Check for dead code | analysis (`qartez_unused`) |
 | Review architecture health | analysis (`qartez_hotspots`, `qartez_boundaries`) |
+| Get a prioritized fix list for the repo | analysis (`qartez_health`) |
+| Plan a refactor on a specific file | analysis (`qartez_refactor_plan`) |
 | Find duplicate code | analysis (`qartez_clones`) |
 | Rename a symbol across the codebase | refactor (`qartez_rename`) |
 | Move a function to another file | refactor (`qartez_move`) |
@@ -134,6 +136,8 @@ qartez_knowledge level=module           # who owns what
 ### Refactoring
 
 ```
+qartez_health                           # whole-repo prioritized fix list
+qartez_refactor_plan file_path=<target> # ordered, safety-annotated step-by-step plan
 qartez_impact file_path=<target>        # assess blast radius first
 qartez_refs symbol=<old_name>           # find all usages
 qartez_rename old_name=<old> new_name=<new>           # preview rename

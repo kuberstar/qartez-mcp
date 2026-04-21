@@ -50,87 +50,16 @@ impl QartezServer {
         let no_symbols_requested = params.symbol_name.as_deref().is_none_or(|s| s.is_empty())
             && params.symbols.as_ref().is_none_or(|v| v.is_empty());
         if no_symbols_requested && let Some(ref fp) = params.file_path {
-            let abs_path = self.safe_resolve(fp)?;
-            let source = std::fs::read_to_string(&abs_path)
-                .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
-            let lines: Vec<&str> = source.lines().collect();
-            let total_lines = lines.len();
-            if total_lines == 0 {
-                return Ok(format!("{fp} (empty file)\n"));
-            }
-
-            // Resolve the requested range. `limit` mirrors the built-in Read
-            // tool: read `limit` lines starting at `start_line` (defaults to
-            // 1). When none of start_line/end_line/limit are set, the whole
-            // file is returned — max_bytes still bounds the output so huge
-            // files don't blow the response budget.
-            let mut start = params.start_line.unwrap_or(0);
-            let mut end = params.end_line.unwrap_or(0);
-            if let Some(lim) = params.limit
-                && lim > 0
-            {
-                if start == 0 {
-                    start = 1;
-                }
-                if end == 0 {
-                    end = start.saturating_add(lim - 1);
-                }
-            }
-            if start == 0 {
-                start = 1;
-            }
-            if end == 0 {
-                end = total_lines as u32;
-            }
-            let start_idx = (start as usize).saturating_sub(1);
-            if start_idx >= total_lines {
-                return Err(format!(
-                    "start_line ({start}) exceeds file length ({total_lines})"
-                ));
-            }
-            if start > end {
-                return Err(format!("start_line ({start}) > end_line ({end})"));
-            }
-            let end_idx = (end as usize).min(total_lines);
-
-            let mut out = format!("{fp} L{start}-{end_idx}\n");
-            let mut truncated_at: Option<usize> = None;
-            for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
-                let formatted = format!("{:>4} | {}\n", start_idx + i + 1, line);
-                if out.len() + formatted.len() > max_bytes {
-                    truncated_at = Some(start_idx + i);
-                    break;
-                }
-                out.push_str(&formatted);
-            }
-            if let Some(cut) = truncated_at {
-                out.push_str(&format!(
-                    "// ... (truncated at line {}, response reached {max_bytes}-byte cap; raise `max_bytes` or page with `start_line`/`limit`)\n",
-                    cut + 1,
-                ));
-            }
-            return Ok(out);
+            return self.read_file_slice(
+                fp,
+                params.start_line,
+                params.end_line,
+                params.limit,
+                max_bytes,
+            );
         }
 
-        // Build the caller-requested query list. Batch mode takes priority when
-        // both fields are set, so a caller migrating from single → batch does
-        // not have to clear `symbol_name` explicitly. Unknown-but-present empty
-        // strings in the list are dropped as no-ops rather than erroring, so
-        // callers can freely splat variable-length arrays.
-        let queries: Vec<String> = match (params.symbols, params.symbol_name) {
-            (Some(list), _) if !list.is_empty() => {
-                list.into_iter().filter(|s| !s.is_empty()).collect()
-            }
-            (_, Some(name)) if !name.is_empty() => vec![name],
-            _ => {
-                return Err(
-                    "Either `symbol_name` or a non-empty `symbols` list is required".to_string(),
-                );
-            }
-        };
-        if queries.is_empty() {
-            return Err("No non-empty symbol names provided".to_string());
-        }
+        let queries = parse_symbol_queries(params.symbols, params.symbol_name)?;
 
         // Normalize the file_path filter so Windows callers can pass either
         // separator style and still substring-match forward-slash DB keys.
@@ -139,6 +68,96 @@ impl QartezServer {
             .as_deref()
             .map(|s| crate::index::to_forward_slash(s.to_string()));
 
+        self.read_symbol_batch(&queries, file_filter.as_deref(), max_bytes, context_lines)
+    }
+
+    /// Raw file-range read used when no symbol name is supplied. Returns
+    /// the whole file or a `start_line..=end_line` slice (with optional
+    /// `limit` lines from `start_line`). Honors the same `max_bytes` cap
+    /// as symbol mode and emits an inline truncation marker when the cap
+    /// is hit so callers know they need to page.
+    fn read_file_slice(
+        &self,
+        fp: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+        limit: Option<u32>,
+        max_bytes: usize,
+    ) -> Result<String, String> {
+        let abs_path = self.safe_resolve(fp)?;
+        let source = std::fs::read_to_string(&abs_path)
+            .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
+        let lines: Vec<&str> = source.lines().collect();
+        let total_lines = lines.len();
+        if total_lines == 0 {
+            return Ok(format!("{fp} (empty file)\n"));
+        }
+
+        // Resolve the requested range. `limit` mirrors the built-in Read
+        // tool: read `limit` lines starting at `start_line` (defaults to
+        // 1). When none of start_line/end_line/limit are set, the whole
+        // file is returned — max_bytes still bounds the output so huge
+        // files don't blow the response budget.
+        let mut start = start_line.unwrap_or(0);
+        let mut end = end_line.unwrap_or(0);
+        if let Some(lim) = limit
+            && lim > 0
+        {
+            if start == 0 {
+                start = 1;
+            }
+            if end == 0 {
+                end = start.saturating_add(lim - 1);
+            }
+        }
+        if start == 0 {
+            start = 1;
+        }
+        if end == 0 {
+            end = total_lines as u32;
+        }
+        let start_idx = (start as usize).saturating_sub(1);
+        if start_idx >= total_lines {
+            return Err(format!(
+                "start_line ({start}) exceeds file length ({total_lines})"
+            ));
+        }
+        if start > end {
+            return Err(format!("start_line ({start}) > end_line ({end})"));
+        }
+        let end_idx = (end as usize).min(total_lines);
+
+        let mut out = format!("{fp} L{start}-{end_idx}\n");
+        let mut truncated_at: Option<usize> = None;
+        for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
+            let formatted = format!("{:>4} | {}\n", start_idx + i + 1, line);
+            if out.len() + formatted.len() > max_bytes {
+                truncated_at = Some(start_idx + i);
+                break;
+            }
+            out.push_str(&formatted);
+        }
+        if let Some(cut) = truncated_at {
+            out.push_str(&format!(
+                "// ... (truncated at line {}, response reached {max_bytes}-byte cap; raise `max_bytes` or page with `start_line`/`limit`)\n",
+                cut + 1,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Symbol-mode read for one or many names. Resolves each query to its
+    /// matching `(symbol, file)` rows in a single pass, batches the
+    /// blast-radius lookup, then renders sections honoring the byte cap.
+    /// Missing names are reported as a trailing comment instead of erroring
+    /// out, so partial-hit batches still return useful output.
+    fn read_symbol_batch(
+        &self,
+        queries: &[String],
+        file_filter: Option<&str>,
+        max_bytes: usize,
+        context_lines: usize,
+    ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
         // Two-pass: first resolve each query to its matching (symbol, file)
@@ -158,10 +177,10 @@ impl QartezServer {
                 Ok(r) => r,
                 Err(e) => return Err(format!("DB error: {e}")),
             };
-            let filtered: Vec<_> = if let Some(ref fp) = file_filter {
+            let filtered: Vec<_> = if let Some(fp) = file_filter {
                 results
                     .into_iter()
-                    .filter(|(_, file)| file.path.contains(fp.as_str()))
+                    .filter(|(_, file)| file.path.contains(fp))
                     .collect()
             } else {
                 results
@@ -188,37 +207,9 @@ impl QartezServer {
         let mut rendered_count: usize = 0;
         let mut truncated = false;
 
-        for (_idx, filtered) in &per_query {
+        'outer: for (_idx, filtered) in &per_query {
             for (sym, file) in filtered {
-                let abs_path = self.safe_resolve(&file.path)?;
-                let source = match std::fs::read_to_string(&abs_path) {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("Cannot read {}: {e}", abs_path.display())),
-                };
-
-                let lines: Vec<&str> = source.lines().collect();
-                // Expand the window by `context_lines` on the start side;
-                // the end side is the symbol's real terminator (symbols
-                // are closed units, rarely useful to trail beyond them).
-                let sym_start = (sym.line_start as usize).saturating_sub(1);
-                let start = sym_start.saturating_sub(context_lines);
-                let end = (sym.line_end as usize).min(lines.len());
-
-                let visibility = if sym.is_exported { "+" } else { "-" };
-                let blast_r = blast_radii.get(&file.id).copied().unwrap_or(0);
-
-                // Compact single-line header: marker name kind @ path:Lstart-end →blast
-                // Replaces the old two-line `// name — kind (visibility) →X\n// path [Lx-Ly]`
-                // format. Saves ~12 tokens per symbol; still carries every
-                // field a caller needs.
-                let mut section = format!(
-                    "// {visibility} {} {} @ {}:L{}-{} →{}\n",
-                    sym.name, sym.kind, file.path, sym.line_start, sym.line_end, blast_r,
-                );
-                for (i, line) in lines[start..end].iter().enumerate() {
-                    section.push_str(&format!("{:>4} | {}\n", start + i + 1, line));
-                }
-                section.push('\n');
+                let section = self.render_symbol_section(sym, file, context_lines, &blast_radii)?;
 
                 // Stop before writing if this section would push us past the
                 // cap. We still include at least one full section even if it
@@ -226,21 +217,17 @@ impl QartezServer {
                 // worse than returning a single over-budget response.
                 if !out.is_empty() && out.len() + section.len() > max_bytes {
                     truncated = true;
-                    break;
+                    break 'outer;
                 }
                 out.push_str(&section);
                 rendered_any = true;
                 rendered_count += 1;
             }
-
-            if truncated {
-                break;
-            }
         }
 
         if !rendered_any {
             let joined = queries.join(", ");
-            if let Some(ref fp) = file_filter {
+            if let Some(fp) = file_filter {
                 return Err(format!(
                     "No symbols [{joined}] found in file matching '{fp}'"
                 ));
@@ -265,4 +252,69 @@ impl QartezServer {
 
         Ok(out)
     }
+
+    /// Render one `(symbol, file)` pair as the "// + name kind @ path:..."
+    /// header followed by its source lines (with `context_lines` of leading
+    /// context). Reads the file from disk; the caller owns the byte-budget
+    /// decision of whether to keep this section.
+    fn render_symbol_section(
+        &self,
+        sym: &crate::storage::models::SymbolRow,
+        file: &crate::storage::models::FileRow,
+        context_lines: usize,
+        blast_radii: &HashMap<i64, i64>,
+    ) -> Result<String, String> {
+        let abs_path = self.safe_resolve(&file.path)?;
+        let source = std::fs::read_to_string(&abs_path)
+            .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
+
+        let lines: Vec<&str> = source.lines().collect();
+        // Expand the window by `context_lines` on the start side;
+        // the end side is the symbol's real terminator (symbols
+        // are closed units, rarely useful to trail beyond them).
+        let sym_start = (sym.line_start as usize).saturating_sub(1);
+        let start = sym_start.saturating_sub(context_lines);
+        let end = (sym.line_end as usize).min(lines.len());
+
+        let visibility = if sym.is_exported { "+" } else { "-" };
+        let blast_r = blast_radii.get(&file.id).copied().unwrap_or(0);
+
+        // Compact single-line header: marker name kind @ path:Lstart-end →blast
+        // Replaces the old two-line `// name — kind (visibility) →X\n// path [Lx-Ly]`
+        // format. Saves ~12 tokens per symbol; still carries every
+        // field a caller needs.
+        let mut section = format!(
+            "// {visibility} {} {} @ {}:L{}-{} →{}\n",
+            sym.name, sym.kind, file.path, sym.line_start, sym.line_end, blast_r,
+        );
+        for (i, line) in lines[start..end].iter().enumerate() {
+            section.push_str(&format!("{:>4} | {}\n", start + i + 1, line));
+        }
+        section.push('\n');
+        Ok(section)
+    }
+}
+
+/// Pick the caller-requested query list. Batch mode takes priority when
+/// both fields are set, so a caller migrating from single → batch does
+/// not have to clear `symbol_name` explicitly. Empty strings in the list
+/// are dropped as no-ops rather than erroring, so callers can freely
+/// splat variable-length arrays.
+fn parse_symbol_queries(
+    symbols: Option<Vec<String>>,
+    symbol_name: Option<String>,
+) -> Result<Vec<String>, String> {
+    let queries: Vec<String> = match (symbols, symbol_name) {
+        (Some(list), _) if !list.is_empty() => list.into_iter().filter(|s| !s.is_empty()).collect(),
+        (_, Some(name)) if !name.is_empty() => vec![name],
+        _ => {
+            return Err(
+                "Either `symbol_name` or a non-empty `symbols` list is required".to_string(),
+            );
+        }
+    };
+    if queries.is_empty() {
+        return Err("No non-empty symbol names provided".to_string());
+    }
+    Ok(queries)
 }

@@ -413,17 +413,28 @@ pub fn rebuild_symbol_bodies_for_file(
 /// pipeline - after `full_index` has written every file's imports and the
 /// edge graph is settled. Query-time `qartez_unused` then becomes a single
 /// JOIN-plus-LIMIT instead of re-walking tree-sitter ASTs for every call.
+///
+/// Files in `LANGUAGES_WITHOUT_EXPORT_SEMANTICS` are excluded: their
+/// "exported" symbols are top-level keys (YAML, TOML), targets (Makefile),
+/// blocks (HCL, Nginx, Caddyfile), or rules (CSS, Dockerfile) that have no
+/// inbound import edges by language design - they were drowning real Rust
+/// dead-code findings under hundreds of false positives from CI workflows,
+/// `Cargo.toml`, `dependabot.yml`, and friends.
 pub fn populate_unused_exports(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    let sql = format!(
         "DELETE FROM unused_exports;
          INSERT INTO unused_exports (symbol_id, file_id)
          SELECT s.id, s.file_id
          FROM symbols s
+         JOIN files f ON f.id = s.file_id
          WHERE s.is_exported = 1
            AND COALESCE(s.unused_excluded, 0) = 0
+           AND f.language NOT IN ({})
            AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_file = s.file_id)
            AND NOT EXISTS (SELECT 1 FROM symbol_refs sr WHERE sr.to_symbol_id = s.id)",
-    )?;
+        crate::storage::read::languages_without_export_semantics_sql_list()
+    );
+    conn.execute_batch(&sql)?;
     Ok(())
 }
 

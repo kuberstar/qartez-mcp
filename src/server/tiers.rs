@@ -39,6 +39,8 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
     "qartez_hotspots",
     "qartez_clones",
     "qartez_smells",
+    "qartez_health",
+    "qartez_refactor_plan",
     "qartez_boundaries",
     "qartez_hierarchy",
     "qartez_trend",
@@ -49,7 +51,15 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
 ];
 
 /// Destructive refactoring tools unlocked on demand.
-pub(super) const TIER_REFACTOR: &[&str] = &["qartez_rename", "qartez_move", "qartez_rename_file"];
+pub(super) const TIER_REFACTOR: &[&str] = &[
+    "qartez_rename",
+    "qartez_move",
+    "qartez_rename_file",
+    "qartez_replace_symbol",
+    "qartez_insert_before_symbol",
+    "qartez_insert_after_symbol",
+    "qartez_safe_delete",
+];
 
 /// Build, documentation, and project-admin meta-tools.
 ///

@@ -422,7 +422,7 @@ fn format_feature_envy(
 /// receiver params (`self`, `&self`, `&mut self` in Rust, `self`/`cls` in
 /// Python). Handles nested generics (`HashMap<K, V>`) and nested parens so
 /// commas inside type parameters are not miscounted.
-fn count_signature_params(sig: &str) -> usize {
+pub(super) fn count_signature_params(sig: &str) -> usize {
     // Find the first '(' and its matching ')'
     let start = match sig.find('(') {
         Some(i) => i + 1,

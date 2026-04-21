@@ -16,18 +16,24 @@ mod deps;
 mod diff_impact;
 mod find;
 mod grep;
+mod health;
 mod hierarchy;
 mod hotspots;
 mod impact;
+mod insert;
 mod knowledge;
 mod map;
 mod mv;
 mod outline;
 mod project;
 mod read;
+mod refactor_common;
+mod refactor_plan;
 mod refs;
 mod rename;
 mod rename_file;
+mod replace;
+mod safe_delete;
 mod security;
 mod semantic;
 mod smells;
@@ -63,6 +69,8 @@ impl QartezServer {
             + Self::qartez_hotspots_router()
             + Self::qartez_clones_router()
             + Self::qartez_smells_router()
+            + Self::qartez_health_router()
+            + Self::qartez_refactor_plan_router()
             + Self::qartez_test_gaps_router()
             + Self::qartez_wiki_router()
             + Self::qartez_boundaries_router()
@@ -72,5 +80,9 @@ impl QartezServer {
             + Self::qartez_knowledge_router()
             + Self::qartez_tools_router()
             + Self::qartez_semantic_router()
+            + Self::qartez_replace_symbol_router()
+            + Self::qartez_insert_before_symbol_router()
+            + Self::qartez_insert_after_symbol_router()
+            + Self::qartez_safe_delete_router()
     }
 }

@@ -1,6 +1,6 @@
 # Tool reference
 
-Qartez exposes 31 tools via MCP, organized into four tiers. By default all
+Qartez exposes 37 tools via MCP, organized into four tiers. By default all
 tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 `qartez_tools` are visible at startup; unlock others on demand.
 
@@ -9,8 +9,8 @@ tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 | Tier | Tools | Purpose |
 |------|-------|---------|
 | **core** | 8 | Navigate, read, assess - the daily-driver set |
-| **analysis** | 16 | Deep investigation, debugging, review, architecture |
-| **refactor** | 3 | Codebase-wide rename and move operations |
+| **analysis** | 18 | Deep investigation, debugging, review, architecture |
+| **refactor** | 7 | Codebase-wide rename, move, replace, insert, and safe-delete operations |
 | **meta** | 3 | Build toolchain, documentation, workspace admin |
 | **discovery** | 1 | `qartez_tools` - always visible, manages tier visibility |
 
@@ -236,6 +236,43 @@ and feature envy (functions that reference more external symbols than internal).
 | `limit` | u32 | 20 | Max results |
 | `format` | enum | detailed | `detailed` or `concise` |
 
+### `qartez_health`
+
+Prioritized fix list that cross-references `qartez_hotspots` with
+`qartez_smells`. Files that score badly in both signals are bucketed as
+**Critical**; hotspot-only as **High**; smell-only as **Medium**. Every
+surfaced file carries a concrete suggested refactor technique so the agent can
+move from "here is a bad file" to "here is what to do about it" in one call.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `limit` | u32 | 15 | Max files to surface across all buckets |
+| `max_health` | f64 | 5.0 | Only show files with health at or below this value (0-10) |
+| `min_complexity` | u32 | 15 | God-function CC threshold |
+| `min_lines` | u32 | 50 | God-function body-lines threshold |
+| `min_params` | u32 | 5 | Long-params threshold (self/&self excluded) |
+| `format` | enum | detailed | `detailed` or `concise` |
+
+### `qartez_refactor_plan`
+
+Ordered, safety-annotated refactor plan for a single file. Each step names a
+concrete technique (Extract Method for god functions, Introduce Parameter
+Object for long param lists), categorizes the expected CC impact (High /
+Medium / Low) with a **range**, and folds in safety signals derived from
+existing tools: caller count, `is_exported`, and whether tests cover the file.
+
+CC impact is emitted as a conservative range, not a single number. Re-index
+after each step to see the real delta.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `file_path` | string | **required** | Target file |
+| `limit` | u32 | 8 | Max steps to surface |
+| `min_complexity` | u32 | 15 | God-function CC threshold |
+| `min_lines` | u32 | 50 | God-function body-lines threshold |
+| `min_params` | u32 | 5 | Long-params threshold (self/&self excluded) |
+| `format` | enum | detailed | `detailed` or `concise` |
+
 ### `qartez_boundaries`
 
 Architecture boundary rule checking. Validates import rules between
@@ -375,6 +412,63 @@ Preview mode by default.
 |-------|------|---------|-------------|
 | `from` | string | **required** | Current file path |
 | `to` | string | **required** | New file path |
+| `apply` | bool | false | Actually write changes |
+
+### `qartez_replace_symbol`
+
+Replace a symbol's whole line range (`line_start..line_end`) with a new
+definition. Caller supplies the full replacement including the signature;
+the tool performs an atomic line-range rewrite. Preview mode by default.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol` | string | **required** | Symbol to replace. Aliases: `name`, `symbol_name`. |
+| `new_code` | string | **required** | Full replacement source (must include the signature). |
+| `kind` | string | — | Disambiguate by symbol kind |
+| `file_path` | string | — | Disambiguate by file when the name exists in multiple files |
+| `apply` | bool | false | Actually write changes |
+
+### `qartez_insert_before_symbol`
+
+Splice new code immediately before an anchor symbol's first line. Lets the
+caller add helpers, tests, or related items next to existing code without
+needing the exact surrounding context. Preview mode by default.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol` | string | **required** | Anchor symbol. Aliases: `name`, `symbol_name`. |
+| `new_code` | string | **required** | Source text to insert |
+| `kind` | string | — | Disambiguate by symbol kind |
+| `file_path` | string | — | Disambiguate by file |
+| `apply` | bool | false | Actually write changes |
+
+### `qartez_insert_after_symbol`
+
+Splice new code immediately after an anchor symbol's last line. Same
+anchor-based addressing as `qartez_insert_before_symbol`. Preview mode
+by default.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol` | string | **required** | Anchor symbol. Aliases: `name`, `symbol_name`. |
+| `new_code` | string | **required** | Source text to insert |
+| `kind` | string | — | Disambiguate by symbol kind |
+| `file_path` | string | — | Disambiguate by file |
+| `apply` | bool | false | Actually write changes |
+
+### `qartez_safe_delete`
+
+Delete a symbol after reporting every file that still imports its defining
+file. Refuses to apply when importers exist unless `force=true`; the caller
+is then responsible for fixing the dangling uses. Preview always lists the
+importers.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol` | string | **required** | Symbol to delete. Aliases: `name`, `symbol_name`. |
+| `kind` | string | — | Disambiguate by symbol kind |
+| `file_path` | string | — | Disambiguate by file |
+| `force` | bool | false | Delete even when importers exist (leaves dangling imports) |
 | `apply` | bool | false | Actually write changes |
 
 ---

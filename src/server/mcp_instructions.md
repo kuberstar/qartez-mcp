@@ -11,7 +11,7 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 
 ## Tool tiers
 
-Qartez organizes its 27 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
+Qartez organizes its 37 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
 
 ### Core (always available)
 
@@ -36,6 +36,8 @@ Deep investigation for debugging, review, and architecture:
 - `qartez_diff_impact` - blast radius of a git diff
 - `qartez_hotspots` - complexity x coupling x churn ranking
 - `qartez_clones` - duplicate code via AST hashing
+- `qartez_health` - prioritized fix list cross-referencing hotspots + smells
+- `qartez_refactor_plan` - ordered refactor steps for one file with safety + CC-impact annotations
 - `qartez_boundaries` - architecture boundary rule violations
 - `qartez_hierarchy` - type/trait inheritance hierarchy
 - `qartez_trend` - symbol complexity trend over git history
@@ -44,10 +46,14 @@ Deep investigation for debugging, review, and architecture:
 
 ### Refactor (unlock via `qartez_tools enable: ["refactor"]`)
 
-Codebase-wide rename and move operations:
+Codebase-wide rename, move, replace, insert, and safe-delete operations:
 - `qartez_rename` - rename a symbol across all files
 - `qartez_move` - move a symbol between files
 - `qartez_rename_file` - rename a file and update all imports
+- `qartez_replace_symbol` - replace a symbol's whole line range with new source
+- `qartez_insert_before_symbol` - splice new code immediately before an anchor symbol
+- `qartez_insert_after_symbol` - splice new code immediately after an anchor symbol
+- `qartez_safe_delete` - delete a symbol after reporting every file that still imports it
 
 ### Meta (unlock via `qartez_tools enable: ["meta"]`)
 

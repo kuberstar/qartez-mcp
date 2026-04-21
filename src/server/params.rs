@@ -439,6 +439,78 @@ pub(super) struct SoulRenameFileParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulReplaceSymbolParams {
+    #[schemars(description = "Symbol name to replace. Accepts aliases `name` and `symbol_name`.")]
+    #[serde(alias = "name", alias = "symbol_name")]
+    pub symbol: String,
+    #[schemars(
+        description = "Full new source for the symbol (replaces lines L[line_start..line_end] inclusive). Must include the signature - this is a whole-symbol replace, not a body-only splice."
+    )]
+    pub new_code: String,
+    #[schemars(
+        description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method')."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name exists in multiple files. Relative path."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(description = "If true, apply the replace. If false (default), show a preview.")]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub apply: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulInsertSymbolParams {
+    #[schemars(
+        description = "Anchor symbol name. New code is inserted before (or after) its line range. Accepts aliases `name` and `symbol_name`."
+    )]
+    #[serde(alias = "name", alias = "symbol_name")]
+    pub symbol: String,
+    #[schemars(
+        description = "Source text to insert. A trailing newline is added if missing so the anchor symbol stays on its own line."
+    )]
+    pub new_code: String,
+    #[schemars(
+        description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method')."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name exists in multiple files. Relative path."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(description = "If true, apply the insert. If false (default), show a preview.")]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub apply: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulSafeDeleteParams {
+    #[schemars(description = "Symbol name to delete. Accepts aliases `name` and `symbol_name`.")]
+    #[serde(alias = "name", alias = "symbol_name")]
+    pub symbol: String,
+    #[schemars(
+        description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method')."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name exists in multiple files. Relative path."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "If true, delete even when the symbol still has importers (they will be left dangling for the caller to fix). Default false refuses to apply when importers exist."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub force: Option<bool>,
+    #[schemars(description = "If true, apply the delete. If false (default), show a preview.")]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub apply: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulOutlineParams {
     #[schemars(description = "Relative file path to get outline for. Aliases: `file`, `path`.")]
     #[serde(alias = "file", alias = "path")]
@@ -873,4 +945,59 @@ pub(super) struct SoulWorkspaceParams {
         description = "The path to the project directory (required for 'add', optional for 'remove')"
     )]
     pub path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulHealthParams {
+    #[schemars(
+        description = "Max number of files to surface across all severity buckets (default: 15)."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Health-score cutoff (0-10). Files with health above this value are not surfaced (default: 5.0, i.e. only unhealthy files)."
+    )]
+    #[serde(default, deserialize_with = "flexible::f64_opt")]
+    pub max_health: Option<f64>,
+    #[schemars(
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_complexity: Option<u32>,
+    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_lines: Option<u32>,
+    #[schemars(description = "Long Parameter List: minimum parameter count (default: 5).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_params: Option<u32>,
+    #[schemars(
+        description = "'concise' = compact table, 'detailed' (default) = grouped output with per-file recommendations"
+    )]
+    pub format: Option<Format>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulRefactorPlanParams {
+    #[schemars(description = "Target file path (relative to project root). Required.")]
+    pub file_path: String,
+    #[schemars(
+        description = "Max number of steps to surface (default: 8). Steps are ordered by estimated impact descending, then by safety."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_complexity: Option<u32>,
+    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_lines: Option<u32>,
+    #[schemars(description = "Long Parameter List: minimum parameter count (default: 5).")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub min_params: Option<u32>,
+    #[schemars(
+        description = "'concise' = one-line-per-step, 'detailed' (default) = full step cards with technique + safety + CC impact estimate"
+    )]
+    pub format: Option<Format>,
 }
