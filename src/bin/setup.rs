@@ -923,6 +923,12 @@ fn install_claude_one(
         settings["hooks"] = serde_json::json!({});
     }
 
+    // Pragmatic cleanup: remove all qartez hook entries before adding new ones.
+    // This fixes duplication issues from previous versions or matcher changes.
+    remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
+    remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-setup");
+    remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+
     // Use qartez-guard binary directly (no bash dependency).
     // Hook commands are executed by a shell (Git Bash on Windows), so
     // paths must survive shell escape-processing - see
@@ -1226,6 +1232,12 @@ fn install_gemini_one(
         settings["hooks"] = serde_json::json!({});
     }
 
+    // Pragmatic cleanup: remove all qartez hook entries before adding new ones.
+    // This fixes duplication issues from previous versions or matcher changes.
+    remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
+    remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-setup");
+    remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+
     // Use qartez-guard binary directly (no bash dependency). Hook
     // commands run through a shell, so paths must survive shell
     // escape-processing - see format_hook_command_path.
@@ -1336,6 +1348,7 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
         let mut settings = read_json(&settings_path)?;
 
         remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
+        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-setup");
         remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
 
         if let Some(hooks) = settings.get("hooks")
@@ -1705,6 +1718,7 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         // Remove qartez hook entries from PreToolUse
         remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
         // Remove qartez session start hook
+        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-setup");
         remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
 
         // Clean up empty hooks object
