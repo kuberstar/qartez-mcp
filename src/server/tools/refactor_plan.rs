@@ -36,9 +36,15 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRefactorPlanParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_refactor_plan")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
-        let limit = params.limit.unwrap_or(8).max(1) as usize;
+        // Default 8 matches the tool description; an upper cap of 50 keeps
+        // the rendered plan inside the MCP transport budget even when a
+        // caller passes a very large `limit`. The floor of 1 guarantees
+        // we still show at least the highest-impact step.
+        const MAX_REFACTOR_STEPS: u32 = 50;
+        let limit = params.limit.unwrap_or(8).clamp(1, MAX_REFACTOR_STEPS) as usize;
         let min_cc = params.min_complexity.unwrap_or(15);
         let min_lines = params.min_lines.unwrap_or(50);
         let min_params = params.min_params.unwrap_or(5) as usize;
@@ -84,7 +90,27 @@ impl QartezServer {
             ));
         }
 
-        let has_tests = file_has_tests(&conn, &rel).unwrap_or(false);
+        // Two coverage signals: cross-file (`tests/foo.rs -> src/foo.rs`
+        // import edge) and inline (`#[cfg(test)] fn test_*` colocated
+        // with production). The old report used only the import-edge
+        // signal, so files like `src/index/mod.rs` with ~80 inline
+        // `test_*` functions AND an external `tests/business_logic.rs`
+        // importer were flagged "Tests covering file: none detected".
+        // Report both to give callers an accurate safety picture.
+        let (cross_file_count, has_cross_file_tests) =
+            cross_file_test_stats(&conn, &rel).unwrap_or((0, false));
+        let has_inline = helpers::has_inline_rust_tests(&self.project_root, &rel);
+        let inline_test_count = if has_inline {
+            symbols
+                .iter()
+                .filter(|s| {
+                    matches!(s.kind.as_str(), "function" | "method") && s.name.starts_with("test_")
+                })
+                .count()
+        } else {
+            0
+        };
+        let has_tests = has_cross_file_tests || has_inline;
 
         let symbol_caller_counts =
             caller_counts(&conn, symbols.iter().map(|s| s.id)).unwrap_or_default();
@@ -119,13 +145,19 @@ impl QartezServer {
             "Moderate"
         };
 
+        let tests_summary = match (inline_test_count, cross_file_count, has_tests) {
+            (0, 0, _) => "none detected".to_string(),
+            (n, 0, _) if n > 0 => format!("{n} inline"),
+            (0, m, _) if m > 0 => format!("{m} cross-file file(s)"),
+            (n, m, _) => format!("{n} inline + {m} cross-file file(s)"),
+        };
+
         let mut out = String::new();
         out.push_str(&format!("# Refactor Plan: `{rel}`\n\n"));
         out.push_str(&format!(
-            "- Current health: **{current_health:.1}/10 ({health_tag})**\n- MaxCC={max_cc}  PageRank={:.4}  Churn={}\n- Tests covering file: {}\n- Steps surfaced: {}/{}\n\n",
+            "- Current health: **{current_health:.1}/10 ({health_tag})**\n- MaxCC={max_cc}  PageRank={:.4}  Churn={}\n- Tests covering file: {tests_summary}\n- Steps surfaced: {}/{}\n\n",
             file.pagerank,
             file.change_count,
-            if has_tests { "yes" } else { "none detected" },
             steps.len(),
             total,
         ));
@@ -318,7 +350,14 @@ fn health_score(max_cc: f64, coupling: f64, churn: i64) -> f64 {
 }
 
 /// True when any indexed file importing the target looks like a test file.
-fn file_has_tests(conn: &rusqlite::Connection, rel: &str) -> rusqlite::Result<bool> {
+/// Count test files that import `rel` and whether at least one exists.
+/// The boolean is a slim compatibility shim for callers that only care
+/// about yes/no; the count drives the refactor-plan report so the user
+/// sees "M cross-file test file(s)" instead of a bare "yes".
+fn cross_file_test_stats(
+    conn: &rusqlite::Connection,
+    rel: &str,
+) -> rusqlite::Result<(usize, bool)> {
     let mut stmt = conn.prepare_cached(
         "SELECT f.path FROM edges e
          JOIN files f ON f.id = e.from_file
@@ -326,12 +365,14 @@ fn file_has_tests(conn: &rusqlite::Connection, rel: &str) -> rusqlite::Result<bo
          WHERE t.path = ?1",
     )?;
     let rows = stmt.query_map([rel], |row| row.get::<_, String>(0))?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for path in rows.flatten() {
         if helpers::is_test_path(&path) {
-            return Ok(true);
+            seen.insert(path);
         }
     }
-    Ok(false)
+    let has = !seen.is_empty();
+    Ok((seen.len(), has))
 }
 
 /// For each of the given symbol ids, how many other symbols reference them.

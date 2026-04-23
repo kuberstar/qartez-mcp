@@ -355,6 +355,7 @@ fn extract_refs_from_text(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }
@@ -373,6 +374,7 @@ fn extract_refs_from_text(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }
@@ -391,6 +393,7 @@ fn extract_refs_from_text(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }
@@ -406,6 +409,7 @@ fn extract_refs_from_text(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }
@@ -433,6 +437,7 @@ fn extract_refs_from_text(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }

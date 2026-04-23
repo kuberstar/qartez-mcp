@@ -181,10 +181,30 @@ pub(super) fn is_mermaid(format: &Option<Format>) -> bool {
     matches!(format, Some(Format::Mermaid))
 }
 
+/// Reject `format=mermaid` for tools that do not have a graph renderer.
+///
+/// The `Format` enum is shared across every tool for schema economy, so
+/// every tool's JSON Schema advertises `"mermaid"` as a valid value. Only
+/// `qartez_deps`, `qartez_calls`, and `qartez_hierarchy` actually emit
+/// Mermaid output; the rest historically fell through to plain text
+/// without any signal, which looked like a bug on the caller's end. Call
+/// this at the top of any tool that does NOT implement a Mermaid
+/// renderer so the caller gets a clear validation error instead of a
+/// silent format downgrade.
+pub(super) fn reject_mermaid(format: &Option<Format>, tool: &str) -> Result<(), String> {
+    if is_mermaid(format) {
+        Err(format!(
+            "format=mermaid is not supported for {tool}. Use qartez_deps, qartez_calls, or qartez_hierarchy for graph visualisations, or omit `format` for the default text output."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct QartezParams {
     #[schemars(
-        description = "Number of top files to show (default: 20). Pass 0 or set all_files=true to return every file PageRank-sorted."
+        description = "Number of top-ranked files to include. Default: 20. Use 0 or all_files=true for the full list (every file PageRank-sorted). Watch for token-budget truncation on large repos."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub top_n: Option<u32>,
@@ -312,6 +332,11 @@ pub(super) struct SoulDiffImpactParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub risk: Option<bool>,
+    #[schemars(
+        description = "Write guard-ACK entries under `.qartez/acks/` for each indexed changed file (default: false). The tool is read-only by default; set `ack=true` only when running the pre-edit checkpoint flow that needs ACK side-effects."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub ack: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -342,7 +367,9 @@ pub(super) struct SoulGrepParams {
     )]
     #[serde(alias = "pattern")]
     pub query: String,
-    #[schemars(description = "Max number of results (default: 20)")]
+    #[schemars(
+        description = "Max number of results (default: 200). The active governor is `token_budget`; raise `limit` only if you need more than 200 rows."
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,
     #[schemars(
@@ -390,6 +417,20 @@ pub(super) struct SoulRenameParams {
     #[schemars(description = "New name for the symbol")]
     pub new_name: String,
     #[schemars(
+        description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method'). Required when the old_name matches multiple symbol kinds unless `file_path` is set."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name is defined in multiple files. Relative path. Required when the old_name is defined in multiple files unless the matches collapse to a single symbol via `kind`."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "If true, allow the rename even when `new_name` already exists as a defined symbol in one of the files that will be rewritten. Default false refuses to apply when a collision is detected."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub allow_collision: Option<bool>,
+    #[schemars(
         description = "If true, apply the rename. If false (default), show a preview of changes."
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
@@ -425,6 +466,11 @@ pub(super) struct SoulMoveParams {
         description = "Disambiguate by symbol kind when the name is shared (e.g. 'function' vs 'method'). Accepts the kinds returned by qartez_find."
     )]
     pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name is defined in multiple files. Relative path."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -578,7 +624,7 @@ pub(super) struct SoulCallsParams {
     )]
     pub direction: Option<CallDirection>,
     #[schemars(
-        description = "Max depth for call chain traversal (default: 1). Pass 2 to also see transitive chains - this can emit many lines on hub functions."
+        description = "Max depth for call chain traversal (default: 1, max: 10). Values above 10 are clamped. Each extra level can emit many lines on hub functions."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub depth: Option<u32>,
@@ -586,6 +632,19 @@ pub(super) struct SoulCallsParams {
         description = "'concise' = names only, 'detailed' (default) = with file paths and lines, 'mermaid' = call graph as a Mermaid diagram (use only when the user asks for a visual)"
     )]
     pub format: Option<Format>,
+    #[schemars(
+        description = "Max rows per caller/callee section (default: 50). Rows beyond the cap are truncated with a `... +N more, raise limit=` footer."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
+    #[schemars(
+        description = "Include test-file callers in the listing (default: false). Tests are excluded by default so hub-function output stays focused on production callers."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_tests: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -728,7 +787,7 @@ pub(super) struct SoulTestGapsParams {
     #[serde(default, deserialize_with = "flexible::f64_opt")]
     pub min_pagerank: Option<f64>,
     #[schemars(
-        description = "In 'map' mode, include which symbols from source files are referenced by test files (default: false)."
+        description = "In 'map' mode with a source `file_path`, also list the intersection of symbols defined in the source file AND referenced by its mapped test files. Empty when no indexed symbol edges resolve into the file (e.g. tests reach the source via crate-rooted FTS fallback). Default: false."
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_symbols: Option<bool>,
@@ -737,15 +796,15 @@ pub(super) struct SoulTestGapsParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulWikiParams {
     #[schemars(
-        description = "File path to write the wiki to (relative to project root). If omitted, returns the markdown inline."
+        description = "File path to write the wiki to. Accepts a path relative to the project root or an absolute path whose parent directory already exists. If omitted, returns the markdown inline capped by `token_budget`."
     )]
     pub write_to: Option<String>,
     #[schemars(
-        description = "Leiden resolution parameter (default: 1.0). Larger values produce more, smaller clusters; smaller values merge clusters."
+        description = "Leiden resolution parameter (default: 1.0). Larger values produce more, smaller clusters; smaller values merge clusters. Passing an explicit value forces a cluster recompute so the new resolution takes effect even when the clustering table is already populated."
     )]
     pub resolution: Option<f64>,
     #[schemars(
-        description = "Minimum cluster size (default: 3). Clusters smaller than this are folded into the `misc` bucket."
+        description = "Minimum cluster size (default: 3). Clusters smaller than this are folded into the `misc` bucket. Passing an explicit value forces a cluster recompute."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_cluster_size: Option<u32>,
@@ -759,6 +818,11 @@ pub(super) struct SoulWikiParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub recompute: Option<bool>,
+    #[schemars(
+        description = "Approximate token budget for inline output (default: 8000). Ignored when `write_to` is set. Output exceeding the budget is truncated with a footer pointing at `write_to`."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -773,13 +837,18 @@ pub(super) struct SoulBoundariesParams {
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub suggest: Option<bool>,
     #[schemars(
-        description = "When `suggest` is true and `write_to` is set, write the generated TOML to this path (relative to the project root) instead of returning it inline."
+        description = "When `suggest` is true and `write_to` is set, write the generated TOML to this path. Accepts a path relative to the project root or an absolute path whose parent directory already exists. Ignored unless `suggest=true`: passing `write_to` with `suggest=false` is a validation error."
     )]
     pub write_to: Option<String>,
     #[schemars(
         description = "'concise' = one-line-per-violation summary, 'detailed' (default) = grouped output with rule text."
     )]
     pub format: Option<Format>,
+    #[schemars(
+        description = "When `suggest=true` and no cluster assignment is present, run the Leiden clustering on demand (default: true). Set to false to fail loudly with remediation instead."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub auto_cluster: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -790,15 +859,20 @@ pub(super) struct SoulTrendParams {
     #[serde(alias = "file", alias = "path")]
     pub file_path: String,
     #[schemars(
-        description = "Optional symbol name to filter (e.g. a function name). When omitted, shows trends for all symbols in the file. Aliases: `name`, `symbol`."
+        description = "Optional symbol name to filter (e.g. a function name). When supplied, the filter is applied PRE-scan so `limit` caps the filtered commit set. Empty strings are treated as 'no filter'. When omitted, shows trends for all symbols in the file. Aliases: `name`, `symbol`."
     )]
     #[serde(alias = "name", alias = "symbol")]
     pub symbol_name: Option<String>,
     #[schemars(
-        description = "Max number of commits to analyze (default: 10, max: 50). Only commits that actually changed the file are counted."
+        description = "Max number of commits to analyze (default: 10, max: 50, strictly clamped server-side). Only commits that actually changed the file are counted."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,
+    #[schemars(
+        description = "Approximate token budget for the rendered report (default: 4000, floor: 512). Output exceeding the budget is truncated at a UTF-8 boundary with a footer pointing at `symbol_name` / `limit`."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
     #[schemars(
         description = "'concise' = compact table, 'detailed' (default) = full breakdown with delta percentages"
     )]
@@ -822,7 +896,7 @@ pub(super) struct SoulHierarchyParams {
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub transitive: Option<bool>,
     #[schemars(
-        description = "Max depth for transitive traversal (default: 20). Only applies when transitive=true."
+        description = "Max depth for hierarchy traversal (default: 20). `max_depth=0` returns only the seed symbol itself with no children or parents, regardless of `transitive`. Positive values bound the transitive traversal."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub max_depth: Option<u32>,
@@ -986,7 +1060,7 @@ pub(super) struct SoulRefactorPlanParams {
     #[schemars(description = "Target file path (relative to project root). Required.")]
     pub file_path: String,
     #[schemars(
-        description = "Max number of steps to surface (default: 8). Steps are ordered by estimated impact descending, then by safety."
+        description = "Max number of steps to surface (default: 8, min: 1, max: 50). Steps are ordered by estimated impact descending, then by safety. Values outside [1, 50] are clamped server-side."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,

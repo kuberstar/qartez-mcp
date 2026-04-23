@@ -82,7 +82,8 @@ struct Cli {
     /// Internal flag: session-start hook entry point.
     /// Implements the auto-indexing behavior from qartez-session-start.sh in Rust.
     /// Detects project, checks for .qartez marker, validates repo markers,
-    /// locates qartez-mcp binary, and spawns a detached background reindex.
+    /// locates the server binary (`qartez.exe` on Windows), and spawns a
+    /// detached background reindex.
     #[arg(long, hide = true)]
     session_start: bool,
 }
@@ -923,6 +924,13 @@ fn install_claude_one(
         settings["hooks"] = serde_json::json!({});
     }
 
+    // Pragmatic cleanup: remove all qartez hook entries before adding new ones.
+    // This fixes duplication issues from previous versions or matcher changes.
+    remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
+    for term in SESSION_START_SEARCH_TERMS {
+        remove_hook_entries_containing(&mut settings, "SessionStart", term);
+    }
+
     // Use qartez-guard binary directly (no bash dependency).
     // Hook commands are executed by a shell (Git Bash on Windows), so
     // paths must survive shell escape-processing - see
@@ -977,7 +985,7 @@ fn install_claude_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "qartez-setup",
+        SESSION_START_SEARCH_TERMS,
         &session_cmd,
         5000,
     );
@@ -1024,6 +1032,19 @@ struct HookEntry<'a> {
     timeout: u64,
 }
 
+/// Session-start hook command matchers.
+///
+/// Each term is a case-insensitive `contains` check against an existing
+/// hook's `command` string. The terms cover every known variant of the
+/// session-start hook so `ensure_hook_entry_no_matcher` can refresh or
+/// deduplicate instead of appending a duplicate:
+/// - `qartez-setup` matches current hook commands shaped like
+///   `<path>/qartez-setup --session-start`
+/// - `--session-start` matches the stable CLI flag regardless of binary name
+/// - `qartez-session-start` matches the legacy shell-script variant
+const SESSION_START_SEARCH_TERMS: &[&str] =
+    &["qartez-setup", "--session-start", "qartez-session-start"];
+
 /// Format a binary path for use as an IDE hook `command` string.
 ///
 /// Claude Code and Gemini execute hook commands through a shell. On
@@ -1061,6 +1082,8 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
         timeout,
     } = entry;
 
+    let search_term_lc = search_term.to_ascii_lowercase();
+
     let hooks_arr = settings["hooks"][hook_type]
         .as_array()
         .cloned()
@@ -1075,7 +1098,7 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
                     arr.iter().any(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains(search_term))
+                            .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                     })
                 })
     });
@@ -1090,7 +1113,7 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
                 for h in arr.iter_mut() {
                     if h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                     {
                         h["command"] = serde_json::Value::String(command.to_string());
                     }
@@ -1116,10 +1139,22 @@ fn ensure_hook_entry(settings: &mut serde_json::Value, hook_type: &str, entry: H
 fn ensure_hook_entry_no_matcher(
     settings: &mut serde_json::Value,
     hook_type: &str,
-    search_term: &str,
+    search_terms: &[&str],
     command: &str,
     timeout: u64,
 ) {
+    let search_terms_lc: Vec<String> = search_terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+
+    let command_matches = |candidate: &str| {
+        let candidate_lc = candidate.to_ascii_lowercase();
+        search_terms_lc
+            .iter()
+            .any(|term| candidate_lc.contains(term))
+    };
+
     let hooks_arr = settings["hooks"][hook_type]
         .as_array()
         .cloned()
@@ -1133,7 +1168,7 @@ fn ensure_hook_entry_no_matcher(
                 arr.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(command_matches)
                 })
             })
     });
@@ -1146,7 +1181,7 @@ fn ensure_hook_entry_no_matcher(
                 for h in arr.iter_mut() {
                     if h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(search_term))
+                        .is_some_and(command_matches)
                     {
                         h["command"] = serde_json::Value::String(command.to_string());
                     }
@@ -1226,6 +1261,13 @@ fn install_gemini_one(
         settings["hooks"] = serde_json::json!({});
     }
 
+    // Pragmatic cleanup: remove all qartez hook entries before adding new ones.
+    // This fixes duplication issues from previous versions or matcher changes.
+    remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
+    for term in SESSION_START_SEARCH_TERMS {
+        remove_hook_entries_containing(&mut settings, "SessionStart", term);
+    }
+
     // Use qartez-guard binary directly (no bash dependency). Hook
     // commands run through a shell, so paths must survive shell
     // escape-processing - see format_hook_command_path.
@@ -1275,7 +1317,7 @@ fn install_gemini_one(
     ensure_hook_entry_no_matcher(
         &mut settings,
         "SessionStart",
-        "qartez-setup",
+        SESSION_START_SEARCH_TERMS,
         &session_cmd,
         5000,
     );
@@ -1336,7 +1378,9 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
         let mut settings = read_json(&settings_path)?;
 
         remove_hook_entries_containing(&mut settings, "BeforeTool", "qartez-guard");
-        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+        for term in SESSION_START_SEARCH_TERMS {
+            remove_hook_entries_containing(&mut settings, "SessionStart", term);
+        }
 
         if let Some(hooks) = settings.get("hooks")
             && hooks.as_object().is_some_and(|o| o.is_empty())
@@ -1705,7 +1749,9 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         // Remove qartez hook entries from PreToolUse
         remove_hook_entries_containing(&mut settings, "PreToolUse", "qartez-guard");
         // Remove qartez session start hook
-        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+        for term in SESSION_START_SEARCH_TERMS {
+            remove_hook_entries_containing(&mut settings, "SessionStart", term);
+        }
 
         // Clean up empty hooks object
         if let Some(hooks) = settings.get("hooks")
@@ -1750,6 +1796,8 @@ fn remove_hook_entries_containing(
     hook_type: &str,
     search_term: &str,
 ) {
+    let search_term_lc = search_term.to_ascii_lowercase();
+
     if let Some(arr) = settings["hooks"][hook_type].as_array() {
         let filtered: Vec<_> = arr
             .iter()
@@ -1761,7 +1809,7 @@ fn remove_hook_entries_containing(
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.contains(search_term))
+                                .is_some_and(|c| c.to_ascii_lowercase().contains(&search_term_lc))
                         })
                     })
             })
@@ -2095,11 +2143,52 @@ fn uninstall_continue() -> anyhow::Result<()> {
 
 // -- OpenCode (JSON with mcp key, command is array) --------------------------
 
-fn install_opencode(bin: &str) -> anyhow::Result<()> {
-    let config_path = Ide::OpenCode.config_path();
-    ensure_parent(&config_path)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeUpdate {
+    NoChange,
+    Added,
+    Updated,
+}
 
-    let mut data = read_json(&config_path)?;
+fn opencode_config_paths() -> (PathBuf, PathBuf) {
+    let json = Ide::OpenCode.config_path();
+    let jsonc = json.with_extension("jsonc");
+    (json, jsonc)
+}
+
+fn read_json_or_jsonc(path: &Path) -> anyhow::Result<serde_json::Value> {
+    if !path.is_file() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let text = fs::read_to_string(path)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let is_jsonc = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonc"));
+
+    if is_jsonc {
+        let cleaned = strip_jsonc(trimmed);
+        let json_str = if cleaned.trim().is_empty() {
+            "{}"
+        } else {
+            cleaned.as_str()
+        };
+        Ok(serde_json::from_str(json_str)?)
+    } else {
+        Ok(serde_json::from_str(trimmed)?)
+    }
+}
+
+fn install_opencode_at(path: &Path, bin: &str) -> anyhow::Result<OpenCodeUpdate> {
+    ensure_parent(path)?;
+
+    let mut data = read_json_or_jsonc(path)?;
     if data.get("$schema").is_none() {
         data["$schema"] = serde_json::json!("https://opencode.ai/config.json");
     }
@@ -2114,54 +2203,127 @@ fn install_opencode(bin: &str) -> anyhow::Result<()> {
     });
 
     if data["mcp"]["qartez"] == desired {
-        info(&format!(
-            "OpenCode already has qartez pointing at {bin} (no changes)."
-        ));
-        return Ok(());
+        return Ok(OpenCodeUpdate::NoChange);
     }
 
     let existed = data["mcp"].get("qartez").is_some();
-    backup_file(&config_path)?;
+    backup_file(path)?;
     data["mcp"]["qartez"] = desired;
-    write_json(&config_path, &data)?;
+    write_json(path, &data)?;
 
     if existed {
-        info(&format!(
-            "Updated qartez in OpenCode config: {}",
-            config_path.display()
-        ));
+        Ok(OpenCodeUpdate::Updated)
     } else {
-        info(&format!(
-            "Added qartez to OpenCode config: {}",
-            config_path.display()
+        Ok(OpenCodeUpdate::Added)
+    }
+}
+
+fn uninstall_opencode_at(path: &Path) -> anyhow::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let mut data = read_json_or_jsonc(path)?;
+    let present = data.get("mcp").and_then(|m| m.get("qartez")).is_some();
+    if !present {
+        return Ok(false);
+    }
+
+    backup_file(path)?;
+    if let Some(mcp) = data.get_mut("mcp").and_then(|m| m.as_object_mut()) {
+        mcp.remove("qartez");
+    }
+    write_json(path, &data)?;
+    Ok(true)
+}
+
+fn install_opencode(bin: &str) -> anyhow::Result<()> {
+    let (json_path, jsonc_path) = opencode_config_paths();
+    let json_exists = json_path.is_file();
+    let jsonc_exists = jsonc_path.is_file();
+
+    if json_exists && jsonc_exists {
+        warn(&format!(
+            "Both OpenCode config files exist. Updating both: {}, {}",
+            json_path.display(),
+            jsonc_path.display()
         ));
+    }
+
+    let targets: Vec<PathBuf> = if json_exists && jsonc_exists {
+        vec![json_path.clone(), jsonc_path.clone()]
+    } else if json_exists {
+        vec![json_path.clone()]
+    } else if jsonc_exists {
+        vec![jsonc_path.clone()]
+    } else {
+        vec![json_path.clone()]
+    };
+
+    for config_path in targets {
+        match install_opencode_at(&config_path, bin)? {
+            OpenCodeUpdate::NoChange => info(&format!(
+                "OpenCode already has qartez pointing at {bin}: {} (no changes).",
+                config_path.display()
+            )),
+            OpenCodeUpdate::Updated => info(&format!(
+                "Updated qartez in OpenCode config: {}",
+                config_path.display()
+            )),
+            OpenCodeUpdate::Added => info(&format!(
+                "Added qartez to OpenCode config: {}",
+                config_path.display()
+            )),
+        }
     }
     Ok(())
 }
 
 fn uninstall_opencode() -> anyhow::Result<()> {
-    let config_path = Ide::OpenCode.config_path();
-    if !config_path.is_file() {
+    let (json_path, jsonc_path) = opencode_config_paths();
+    let json_exists = json_path.is_file();
+    let jsonc_exists = jsonc_path.is_file();
+
+    if !json_exists && !jsonc_exists {
         info(&format!(
             "No OpenCode config found at {}. Nothing to uninstall.",
-            config_path.display()
+            json_path.display()
         ));
         return Ok(());
     }
 
-    let mut data = read_json(&config_path)?;
-    let present = data.get("mcp").and_then(|m| m.get("qartez")).is_some();
-    if !present {
-        info("qartez not present in OpenCode config. Nothing to uninstall.");
-        return Ok(());
+    if json_exists && jsonc_exists {
+        warn(&format!(
+            "Both OpenCode config files exist. Attempting uninstall from both: {}, {}",
+            json_path.display(),
+            jsonc_path.display()
+        ));
     }
 
-    backup_file(&config_path)?;
-    if let Some(mcp) = data.get_mut("mcp").and_then(|m| m.as_object_mut()) {
-        mcp.remove("qartez");
+    let targets: Vec<PathBuf> = if json_exists && jsonc_exists {
+        vec![json_path.clone(), jsonc_path.clone()]
+    } else if json_exists {
+        vec![json_path.clone()]
+    } else {
+        vec![jsonc_path.clone()]
+    };
+
+    let mut removed_any = false;
+    for config_path in targets {
+        if uninstall_opencode_at(&config_path)? {
+            removed_any = true;
+            info(&format!("Removed qartez from {}", config_path.display()));
+        } else {
+            info(&format!(
+                "qartez not present in {}. Nothing to uninstall.",
+                config_path.display()
+            ));
+        }
     }
-    write_json(&config_path, &data)?;
-    info(&format!("Removed qartez from {}", config_path.display()));
+
+    if !removed_any {
+        info("qartez not present in OpenCode config. Nothing to uninstall.");
+    }
     Ok(())
 }
 
@@ -2852,7 +3014,7 @@ fn run_session_start() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Locate qartez server binary
+    // Locate qartez server binary (`qartez.exe` on Windows).
     let binary = find_server_binary().or_else(|| {
         // Fallback: check QARTEZ_BINARY env var
         std::env::var("QARTEZ_BINARY")
@@ -3550,6 +3712,68 @@ mod tests {
         assert!(!session_cmd.contains(".sh"));
     }
 
+    #[test]
+    fn ensure_hook_entry_no_matcher_refreshes_legacy_session_start_command() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "hooks/qartez-session-start.sh",
+                        "timeout": 5000
+                    }]
+                }]
+            }
+        });
+
+        ensure_hook_entry_no_matcher(
+            &mut settings,
+            "SessionStart",
+            SESSION_START_SEARCH_TERMS,
+            "qartez-setup --session-start",
+            5000,
+        );
+
+        let hooks = settings["hooks"]["SessionStart"]
+            .as_array()
+            .expect("SessionStart hooks must exist");
+        assert_eq!(
+            hooks.len(),
+            1,
+            "legacy entry should be refreshed, not duplicated"
+        );
+
+        let cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(cmd, "qartez-setup --session-start");
+    }
+
+    #[test]
+    fn remove_hook_entries_containing_removes_legacy_session_start_command() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "hooks/qartez-session-start.sh",
+                        "timeout": 5000
+                    }]
+                }]
+            }
+        });
+
+        remove_hook_entries_containing(&mut settings, "SessionStart", "qartez-session-start");
+
+        assert!(
+            settings
+                .get("hooks")
+                .and_then(|h| h.get("SessionStart"))
+                .is_none(),
+            "legacy SessionStart hook entry should be removed"
+        );
+    }
+
     // -- Mock curl for fetch_latest_release_tag ----------------------------
 
     #[cfg(unix)]
@@ -3803,6 +4027,74 @@ mod tests {
         fs::create_dir_all(&ext_dir).unwrap();
 
         assert!(!has_claude_vscode_extension());
+    }
+
+    #[test]
+    fn install_opencode_prefers_existing_jsonc_without_creating_json() {
+        let _mu = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+
+        let opencode_dir = tmp.path().join(".config").join("opencode");
+        fs::create_dir_all(&opencode_dir).unwrap();
+
+        let jsonc_path = opencode_dir.join("opencode.jsonc");
+        fs::write(
+            &jsonc_path,
+            r#"{
+  // comment should be accepted
+  "mcp": {}
+}
+"#,
+        )
+        .unwrap();
+
+        install_opencode("qartez").unwrap();
+
+        let json_path = opencode_dir.join("opencode.json");
+        assert!(
+            !json_path.exists(),
+            "should not create opencode.json when only .jsonc exists"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&jsonc_path).unwrap()).unwrap();
+        assert_eq!(parsed["mcp"]["qartez"]["enabled"], serde_json::json!(true));
+        assert_eq!(
+            parsed["mcp"]["qartez"]["command"],
+            serde_json::json!(["qartez"])
+        );
+    }
+
+    #[test]
+    fn install_opencode_updates_both_when_json_and_jsonc_exist() {
+        let _mu = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path());
+
+        let opencode_dir = tmp.path().join(".config").join("opencode");
+        fs::create_dir_all(&opencode_dir).unwrap();
+
+        let json_path = opencode_dir.join("opencode.json");
+        let jsonc_path = opencode_dir.join("opencode.jsonc");
+        fs::write(&json_path, r#"{"mcp":{}}"#).unwrap();
+        fs::write(&jsonc_path, "// comment\n{\n  \"mcp\": {}\n}\n").unwrap();
+
+        install_opencode("qartez").unwrap();
+
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let parsed_jsonc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&jsonc_path).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed_json["mcp"]["qartez"]["command"],
+            serde_json::json!(["qartez"])
+        );
+        assert_eq!(
+            parsed_jsonc["mcp"]["qartez"]["command"],
+            serde_json::json!(["qartez"])
+        );
     }
 
     #[test]

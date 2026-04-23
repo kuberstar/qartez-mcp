@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-04-22
+
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -36,6 +38,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRefsParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_refs")?;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
         let transitive = params.transitive.unwrap_or(false);
@@ -43,24 +46,13 @@ impl QartezServer {
         // All DB queries under one lock acquisition; the lock is dropped
         // before the tree-sitter / FS phase (cached_calls) so the watcher
         // and other handlers are not blocked during parsing.
-        let (refs, fts_fallback_paths, reverse_graph, file_path_lookup) = {
+        let (refs, reverse_graph, file_path_lookup) = {
             let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
             let refs = read::get_symbol_references(&conn, &params.symbol)
                 .map_err(|e| format!("DB error: {e}"))?;
             if refs.is_empty() {
                 return Ok(format!("No symbol found with name '{}'", params.symbol));
             }
-
-            // FTS fallback: files whose symbol bodies mention the target
-            // identifier. Supplements the edge graph because not every caller
-            // shows up as a direct importer — external-crate `use` lines are
-            // dropped at index time, `use crate::a::sub;` resolves to `a/mod.rs`
-            // not `a/sub.rs`, and child modules pulled in via `use super::*;`
-            // carry a wildcard specifier that the old importer filter dropped.
-            // Failures are non-fatal: if FTS is missing we still have the
-            // edge-based scan set below.
-            let fts_fallback_paths: Vec<String> =
-                read::find_file_paths_by_body_text(&conn, &params.symbol).unwrap_or_default();
 
             let (reverse_graph, file_path_lookup) = if transitive {
                 let all_edges = read::get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
@@ -78,16 +70,36 @@ impl QartezServer {
                 (HashMap::new(), HashMap::new())
             };
 
-            (refs, fts_fallback_paths, reverse_graph, file_path_lookup)
+            (refs, reverse_graph, file_path_lookup)
         };
 
         let mut out = String::new();
 
         for (sym, file, importers) in &refs {
+            // Drop self-references only (a symbol whose `from_symbol_id`
+            // equals the defining `sym.id`, i.e. `fn f() { f() }`) so the
+            // `Direct references` list is not padded with the symbol
+            // listing itself. Intra-file references from a DIFFERENT
+            // symbol in the same file (e.g. a `pub(super)` helper called
+            // through `.map(helper)`) are kept - they are legitimate
+            // usages and previously disappeared behind a blanket
+            // `importer.file == def.file` filter.
+            let external_importers: Vec<&(
+                crate::storage::models::EdgeRow,
+                crate::storage::models::FileRow,
+                i64,
+            )> = importers
+                .iter()
+                .filter(|(_, _, from_sym)| *from_sym != sym.id)
+                .collect();
+
             if concise {
-                let paths: Vec<&str> = importers.iter().map(|(_, f)| f.path.as_str()).collect();
+                let paths: Vec<&str> = external_importers
+                    .iter()
+                    .map(|(_, f, _)| f.path.as_str())
+                    .collect();
                 out.push_str(&format!(
-                    "{} ({}) in {} — {} ref(s): {}\n",
+                    "{} ({}) in {} - {} ref(s): {}\n",
                     sym.name,
                     sym.kind,
                     file.path,
@@ -106,17 +118,28 @@ impl QartezServer {
                 sym.name, sym.kind, file.path, sym.line_start, sym.line_end,
             ));
 
-            if importers.is_empty() {
+            if external_importers.is_empty() {
                 out.push_str("  No direct references found.\n\n");
             } else {
-                out.push_str(&format!("  Direct references ({}):\n", importers.len()));
-                for (edge, importer_file) in importers {
-                    let line = format!(
-                        "    {} — imports via '{}' ({})\n",
-                        importer_file.path,
-                        edge.specifier.as_deref().unwrap_or("(unspecified)"),
-                        edge.kind,
-                    );
+                out.push_str(&format!(
+                    "  Direct references ({}):\n",
+                    external_importers.len()
+                ));
+                for (edge, importer_file, _from_sym) in &external_importers {
+                    // Suppress the `imports via '...'` clause when the
+                    // edge has no specifier: for symbol-level refs the
+                    // specifier is routinely absent and the placeholder
+                    // `(unspecified)` added one noise line per importer
+                    // that carried no real information. When a real
+                    // specifier is present (e.g. `use foo::Bar as Baz;`)
+                    // it is kept so callers can still see the rename.
+                    let line = match edge.specifier.as_deref() {
+                        Some(spec) if !spec.is_empty() => format!(
+                            "    {} - imports via '{}' ({})\n",
+                            importer_file.path, spec, edge.kind,
+                        ),
+                        _ => format!("    {} ({})\n", importer_file.path, edge.kind),
+                    };
                     if estimate_tokens(&out) + estimate_tokens(&line) > budget {
                         out.push_str("    ... (truncated by token budget)\n");
                         break;
@@ -126,16 +149,19 @@ impl QartezServer {
                 out.push('\n');
             }
 
-            // Union the def file, every importer, and every FTS-body-match
-            // into the scan set. BTreeSet gives us dedup plus stable order
-            // for reproducible output.
+            // Per-symbol scan set: the defining file plus every file whose
+            // `symbol_refs` edge was resolved to THIS specific `sym.id`.
+            // This is the only correctness-safe scope when the repo has
+            // multiple same-named definitions (e.g. several `run` fns
+            // across modules): including a blanket FTS-body-match union
+            // would attribute every textual call to every same-named
+            // symbol. Files that textually mention the name but have no
+            // resolved edge to this sym are assumed to target a different
+            // same-named sym and are left to that sym's iteration.
             let mut scan_paths: BTreeSet<String> = BTreeSet::new();
             scan_paths.insert(file.path.clone());
-            for (_, importer_file) in importers {
+            for (_, importer_file, _from_sym) in importers {
                 scan_paths.insert(importer_file.path.clone());
-            }
-            for path in &fts_fallback_paths {
-                scan_paths.insert(path.clone());
             }
             let mut call_sites: Vec<(String, usize)> = Vec::new();
             for scan_path in &scan_paths {
@@ -149,7 +175,7 @@ impl QartezServer {
             call_sites.sort();
             if !call_sites.is_empty() {
                 out.push_str(&format!(
-                    "  Direct call sites ({} — AST-resolved):\n",
+                    "  Direct call sites ({} - AST-resolved):\n",
                     call_sites.len()
                 ));
                 let mut last_path = String::new();
@@ -170,15 +196,27 @@ impl QartezServer {
             }
 
             if transitive {
+                // Walk per-symbol: seed the BFS from every direct
+                // importer file (the files that actually use THIS sym),
+                // not from the defining file's dependents. The pre-fix
+                // behavior started at `file.id` so every symbol defined
+                // in a hub module (e.g. `languages/mod.rs`) inherited
+                // the module's full fan-out regardless of which specific
+                // symbol was queried. Starting at per-symbol importers
+                // keeps the transitive set bounded to files that
+                // actually reach the symbol through the edge graph.
                 let mut visited: HashSet<i64> = HashSet::new();
                 let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
                 let mut by_depth: HashMap<u32, Vec<String>> = HashMap::new();
 
-                if let Some(neighbors) = reverse_graph.get(&file.id) {
-                    for &n in neighbors {
-                        if visited.insert(n) {
-                            queue.push_back((n, 1));
-                        }
+                let seeds: Vec<i64> = importers
+                    .iter()
+                    .filter(|(_, f, _)| f.id != file.id)
+                    .map(|(_, f, _)| f.id)
+                    .collect();
+                for seed in &seeds {
+                    if visited.insert(*seed) {
+                        queue.push_back((*seed, 1));
                     }
                 }
 

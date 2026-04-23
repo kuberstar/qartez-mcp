@@ -36,14 +36,30 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulDiffImpactParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_diff_impact")?;
         let concise = is_concise(&params.format);
         let include_tests = params.include_tests.unwrap_or(false);
+        // Read-only by default. Guard-ACK side effects are opt-in via
+        // `ack=true`; the previous behaviour wrote files under
+        // `.qartez/acks/` on every read call, which surprised callers
+        // doing static analysis and broke the tool's
+        // `read_only_hint = true` contract.
+        let ack_enabled = params.ack.unwrap_or(false);
 
         let changed = crate::git::diff::changed_files_in_range(&self.project_root, &params.base)
             .map_err(|e| format!("Git error: {e}"))?;
 
         if changed.is_empty() {
-            return Ok(format!("No files changed in range '{}'.", params.base));
+            // Worktree-vs-remote hint: `main..HEAD` is the canonical
+            // range, but in a fresh worktree `main` typically points at
+            // the same commit as `HEAD`, so the range resolves to zero
+            // deltas and the user gets a silent empty report. The hint
+            // steers them toward `origin/main..HEAD` instead.
+            let hint = diff_impact_worktree_hint(&self.project_root, &params.base);
+            return Ok(match hint {
+                Some(h) => format!("No files changed in range '{}'.\n{h}", params.base),
+                None => format!("No files changed in range '{}'.", params.base),
+            });
         }
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
@@ -54,7 +70,9 @@ impl QartezServer {
         for path in &changed {
             match read::get_file_by_path(&conn, path) {
                 Ok(Some(file)) => {
-                    guard::touch_ack(&self.project_root, &file.path);
+                    if ack_enabled {
+                        guard::touch_ack(&self.project_root, &file.path);
+                    }
                     indexed.push(file);
                 }
                 _ => not_indexed.push(path.as_str()),
@@ -111,9 +129,15 @@ impl QartezServer {
             .filter(|(_, sources)| sources.len() >= 2)
             .collect();
 
-        // Co-change omissions: partners not in the diff set.
+        // Co-change omissions: partners not in the diff set. Walk the
+        // `indexed` slice deterministically (sorted by path) so the
+        // partner list shape does not depend on HashMap iteration order;
+        // without this, `Cargo.toml` partner counts drifted (4 -> 12 ->
+        // 12) across consecutive calls against the same SHA.
+        let mut indexed_sorted: Vec<&crate::storage::models::FileRow> = indexed.iter().collect();
+        indexed_sorted.sort_by(|a, b| a.path.cmp(&b.path));
         let mut omissions_map: HashMap<String, Vec<(String, u32)>> = HashMap::new();
-        for file in &indexed {
+        for file in &indexed_sorted {
             let cochanges = read::get_cochanges(&conn, file.id, 10).unwrap_or_default();
             for (cc, partner) in cochanges {
                 if !changed_set.contains(partner.path.as_str())
@@ -126,11 +150,17 @@ impl QartezServer {
                 }
             }
         }
+        // Deterministic inner ordering too: per-partner pairs are sorted
+        // by source-file path so the rendered report is identical for the
+        // same git SHA + index.
+        for pairs in omissions_map.values_mut() {
+            pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        }
         let mut omissions: Vec<(String, Vec<(String, u32)>)> = omissions_map.into_iter().collect();
         omissions.sort_by(|a, b| {
             let max_a = a.1.iter().map(|(_, c)| c).max().unwrap_or(&0);
             let max_b = b.1.iter().map(|(_, c)| c).max().unwrap_or(&0);
-            max_b.cmp(max_a)
+            max_b.cmp(max_a).then_with(|| a.0.cmp(&b.0))
         });
 
         let risk_data: Option<Vec<(f64, f64, usize, bool)>> = if params.risk.unwrap_or(false) {
@@ -263,7 +293,7 @@ impl QartezServer {
             format_risk_summary(&mut out, &indexed, risks);
         }
 
-        if !indexed.is_empty() {
+        if ack_enabled && !indexed.is_empty() {
             out.push_str(&format!(
                 "\nGuard ACK written for {} indexed file(s).\n",
                 indexed.len(),
@@ -272,6 +302,55 @@ impl QartezServer {
 
         Ok(out)
     }
+}
+
+/// When a diff range resolves to zero deltas AND the two endpoints point
+/// at the same commit, emit a hint pointing the caller at the most
+/// common remedy (`origin/<branch>..HEAD`). This catches the worktree
+/// case where a freshly-checked-out branch tracks the same SHA as its
+/// upstream and `main..HEAD` therefore resolves to no commits. Returns
+/// `None` for ranges that legitimately produced no changes (same tree
+/// content across a real commit range).
+fn diff_impact_worktree_hint(project_root: &std::path::Path, base: &str) -> Option<String> {
+    let repo = git2::Repository::discover(project_root).ok()?;
+    let effective = if base.contains("..") {
+        base.to_string()
+    } else {
+        format!("{base}..HEAD")
+    };
+    let parsed = repo.revparse(&effective).ok()?;
+    let from = parsed.from()?.id();
+    let to = parsed.to()?.id();
+    if from != to {
+        return None;
+    }
+    // Extract the lhs of the revspec (`main` from `main..HEAD`) so the
+    // hint names the actual branch the caller passed in.
+    let lhs = effective.split("..").next().unwrap_or(base);
+
+    // Only emit the `origin/<lhs>` suggestion when there actually is an
+    // `origin` remote AND `origin/<lhs>` exists AND resolves to a
+    // commit different from the local `<lhs>`. Without these gates,
+    // every `base=main` call on a fresh worktree where `main == HEAD`
+    // printed "Did you mean origin/main?" even when `origin/main` was
+    // absent or identical - misleading callers into chasing an
+    // upstream divergence that did not exist.
+    let has_origin = repo.find_remote("origin").is_ok();
+    if !has_origin {
+        return None;
+    }
+    let origin_ref = format!("refs/remotes/origin/{lhs}");
+    let origin_oid = repo
+        .find_reference(&origin_ref)
+        .ok()
+        .and_then(|r| r.target())?;
+    if origin_oid == to {
+        return None;
+    }
+    Some(format!(
+        "Range resolved to no commits ({lhs}=HEAD={}). Did you mean to diff against origin/{lhs}?",
+        &to.to_string()[..7.min(to.to_string().len())],
+    ))
 }
 
 fn compute_risk_data(
@@ -408,6 +487,13 @@ fn format_risk_summary(
     indexed: &[crate::storage::models::FileRow],
     risks: &[(f64, f64, usize, bool)],
 ) {
+    // Both the numerator and denominator must exclude test files so a
+    // diff that changes 19 tests and 20 production files does not
+    // report "Untested files: 38 / 39" (previously every test file
+    // appeared in the numerator because `has_test` returned `false`
+    // and the denominator was the full changed set). `is_test_path`
+    // matches the same `tests/`, `_test.rs`, `_tests.rs`,
+    // `test_*.rs`, `/tests/` patterns the rest of the analyzer uses.
     let total_violations: usize = risks.iter().map(|(_, _, bv, _)| *bv).sum();
     let untested: usize = indexed
         .iter()

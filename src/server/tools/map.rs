@@ -35,7 +35,8 @@ impl QartezServer {
     pub(in crate::server) fn qartez_map(
         &self,
         Parameters(params): Parameters<QartezParams>,
-    ) -> String {
+    ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_map")?;
         let requested_top = params.top_n.unwrap_or(20);
         let all_files = params.all_files.unwrap_or(false) || requested_top == 0;
         let top_n = if all_files {
@@ -56,15 +57,15 @@ impl QartezServer {
             .map(|s| s.eq_ignore_ascii_case("symbols"))
             .unwrap_or(false);
         if by_symbols {
-            return self.build_symbol_overview(top_n, token_budget, concise);
+            return Ok(self.build_symbol_overview(top_n, token_budget, concise));
         }
-        self.build_overview(
+        Ok(self.build_overview(
             top_n,
             token_budget,
             params.boost_files.as_deref(),
             params.boost_terms.as_deref(),
             concise,
             all_files,
-        )
+        ))
     }
 }

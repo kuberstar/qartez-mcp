@@ -23,7 +23,7 @@
 //! user can relax the rules intentionally rather than accidentally
 //! ratifying drift.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use globset::{Glob, GlobMatcher};
@@ -250,29 +250,46 @@ pub fn suggest_boundaries(
     }
 
     let cluster_ids: Vec<i64> = prefixes.keys().copied().collect();
-    let mut rules: Vec<BoundaryRule> = Vec::new();
+    // Collect per-`from` deny sets into a map first: two clusters can
+    // share the same directory prefix (e.g. two Leiden communities that
+    // both live under `src/server/tools/`), so naively pushing one rule
+    // per cluster yields duplicate rules with identical `from` glob and
+    // overlapping `deny` arrays. Unioning the deny sets up front keeps
+    // the emitted TOML stable and duplicate-free.
+    let mut rules_by_from: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for &from_cid in &cluster_ids {
         let from_prefix = &prefixes[&from_cid];
-        let mut deny: Vec<String> = Vec::new();
+        let from_glob = format!("{from_prefix}/**");
+        let entry = rules_by_from.entry(from_glob).or_default();
         for &to_cid in &cluster_ids {
             if to_cid == from_cid {
                 continue;
             }
+            let to_prefix = &prefixes[&to_cid];
+            // Skip self-targeting denies that arise when two clusters
+            // share a prefix: the resulting `deny` would forbid a rule
+            // from importing itself, which is never the intended
+            // semantics for a `from`-keyed boundary.
+            if to_prefix == from_prefix {
+                continue;
+            }
             let count = edge_counts.get(&(from_cid, to_cid)).copied().unwrap_or(0);
             if count == 0 {
-                deny.push(format!("{}/**", prefixes[&to_cid]));
+                entry.insert(format!("{to_prefix}/**"));
             }
         }
-        if deny.is_empty() {
-            continue;
-        }
-        deny.sort();
-        rules.push(BoundaryRule {
-            from: format!("{from_prefix}/**"),
-            deny,
-            allow: Vec::new(),
-        });
     }
+
+    let mut rules: Vec<BoundaryRule> = rules_by_from
+        .into_iter()
+        .filter(|(_, deny)| !deny.is_empty())
+        .map(|(from, deny)| BoundaryRule {
+            from,
+            deny: deny.into_iter().collect(),
+            allow: Vec::new(),
+        })
+        .collect();
+    rules.sort_by(|a, b| a.from.cmp(&b.from));
 
     BoundaryConfig { boundary: rules }
 }
@@ -611,5 +628,104 @@ deny = ["src/db/**"]
         let cfg = load_config(&path).unwrap();
         assert_eq!(cfg.boundary.len(), 1);
         assert_eq!(cfg.boundary[0].from, "src/a/**");
+    }
+
+    #[test]
+    fn suggest_merges_rules_with_shared_from_prefix() {
+        // Two clusters share the same directory prefix (e.g. Leiden
+        // splits `src/server/tools/` into two communities). The emitted
+        // config must not contain two separate `[[boundary]]` entries
+        // with identical `from`; instead, the `deny` sets are unioned.
+        let files = vec![
+            file(1, "src/server/tools/a.rs"),
+            file(2, "src/server/tools/b.rs"),
+            file(3, "src/server/tools/c.rs"),
+            file(4, "src/server/tools/d.rs"),
+            file(5, "src/db/table.rs"),
+            file(6, "src/db/index.rs"),
+            file(7, "src/ui/page.rs"),
+            file(8, "src/ui/widget.rs"),
+        ];
+        // Cluster 1: files 1,2 (tools A). Cluster 2: files 3,4 (tools B).
+        // Cluster 3: files 5,6 (db). Cluster 4: files 7,8 (ui).
+        let clusters = vec![
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (6, 3),
+            (7, 4),
+            (8, 4),
+        ];
+        let edges: Vec<(i64, i64)> = Vec::new();
+        let cfg = suggest_boundaries(&files, &clusters, &edges);
+
+        let tools_rules: Vec<&BoundaryRule> = cfg
+            .boundary
+            .iter()
+            .filter(|r| r.from == "src/server/tools/**")
+            .collect();
+        assert_eq!(
+            tools_rules.len(),
+            1,
+            "clusters sharing a `from` prefix must collapse into one rule: {:?}",
+            cfg.boundary,
+        );
+        let rule = tools_rules[0];
+        let mut sorted = rule.deny.clone();
+        sorted.sort();
+        assert_eq!(rule.deny, sorted, "deny patterns must be sorted");
+        let mut deduped = rule.deny.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            rule.deny.len(),
+            deduped.len(),
+            "deny patterns must be unique: {:?}",
+            rule.deny,
+        );
+        // Unioned deny set must include both foreign cluster prefixes.
+        assert!(rule.deny.contains(&"src/db/**".to_string()));
+        assert!(rule.deny.contains(&"src/ui/**".to_string()));
+        // Self-targeting denies must not appear.
+        assert!(
+            !rule.deny.contains(&"src/server/tools/**".to_string()),
+            "deny must not contain the same glob as `from`: {:?}",
+            rule.deny,
+        );
+    }
+
+    #[test]
+    fn suggest_deduplicates_patterns_within_single_deny() {
+        // Two target clusters share the same directory prefix. A naive
+        // implementation emits the shared prefix twice in the same
+        // `deny` array. Dedup must keep each pattern at most once.
+        let files = vec![
+            file(1, "src/app/main.rs"),
+            file(2, "src/app/lib.rs"),
+            file(3, "src/infra/db.rs"),
+            file(4, "src/infra/cache.rs"),
+            file(5, "src/infra/queue.rs"),
+            file(6, "src/infra/metrics.rs"),
+        ];
+        // Cluster 1: app. Clusters 2 and 3: both under `src/infra/`.
+        let clusters = vec![(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)];
+        let cfg = suggest_boundaries(&files, &clusters, &[]);
+        let app_rule = cfg
+            .boundary
+            .iter()
+            .find(|r| r.from == "src/app/**")
+            .expect("app rule");
+        let infra_count = app_rule
+            .deny
+            .iter()
+            .filter(|d| *d == "src/infra/**")
+            .count();
+        assert_eq!(
+            infra_count, 1,
+            "duplicate `src/infra/**` patterns must be deduplicated: {:?}",
+            app_rule.deny,
+        );
     }
 }

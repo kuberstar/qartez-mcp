@@ -99,14 +99,33 @@ impl QartezServer {
 
         if !apply {
             let insert_line_1_based = insert_idx + 1;
+            let supplied_bytes = params.new_code.len();
+            let supplied_ends_with_newline = params.new_code.ends_with('\n');
+            let normalized_bytes = if supplied_ends_with_newline {
+                supplied_bytes
+            } else {
+                supplied_bytes + 1
+            };
             let mut out = format!(
                 "Preview: insert {pos_label} '{}' ({}) in {} at L{} ({} line(s))\n\n",
                 sym.name, sym.kind, source_file.path, insert_line_1_based, new_code_lines_count,
             );
+            out.push_str(&format!(
+                "new_code: {} bytes supplied, {} bytes after trailing-newline normalization ({}).\n",
+                supplied_bytes,
+                normalized_bytes,
+                if supplied_ends_with_newline {
+                    "trailing newline present"
+                } else {
+                    "trailing newline will be inserted"
+                },
+            ));
             out.push_str("Code to insert:\n```\n");
             out.push_str(&params.new_code);
             if !params.new_code.ends_with('\n') {
-                out.push('\n');
+                out.push_str("<newline-inserted>\n");
+            } else {
+                out.push_str("<newline-supplied>\n");
             }
             out.push_str("```\n");
             return Ok(out);

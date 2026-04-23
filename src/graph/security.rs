@@ -405,7 +405,14 @@ fn collect_cfg_test_mod_ranges(
     bytes: &[u8],
     ranges: &mut Vec<(u32, u32)>,
 ) {
-    if node.kind() == "mod_item"
+    // `mod_item` catches the conventional `#[cfg(test)] mod tests {}`
+    // wrapper. `function_item` catches the less common but still
+    // production-file pattern of decorating a single helper with
+    // `#[cfg(test)]` outside of any wrapping test module. Before this
+    // fix, such a lone helper kept its security findings even on the
+    // default `include_tests=false` path because the scanner only
+    // scoped by `mod_item` ranges.
+    if matches!(node.kind(), "mod_item" | "function_item")
         && let Some(attr_row) = preceding_cfg_test_attr_row(node, bytes)
     {
         let start = (attr_row + 1) as u32;
@@ -452,6 +459,151 @@ fn attr_text_targets_test(text: &str) -> bool {
         || stripped.contains("cfg(any(test")
         || stripped.contains(",test)")
         || stripped.contains(",test,")
+}
+
+/// Lines of attributes and comments to scan backward from `sym_start`
+/// when deciding whether a function is a test. Five covers the common
+/// cases (`#[cfg_attr(...)]` plus `#[test]` plus `#[should_panic]`).
+const ATTR_LOOKBACK: u32 = 5;
+
+/// Heuristic filter for "assert defense" false positives: a `#[test]` (or
+/// runtime-equivalent) function whose body matches a body-regex rule on
+/// the attack payload, paired with an error-assertion that proves the
+/// code under test rejected that payload. The finding would mislead a
+/// reader into hunting a vulnerability in the very symbol that PROVES
+/// the vulnerability is absent.
+///
+/// Returns `true` when BOTH gates pass:
+/// 1. An attribute within `ATTR_LOOKBACK` lines above `sym_start` names
+///    the function as a test (`#[test]`, `#[tokio::test]`,
+///    `#[async_std::test]`, etc.), OR the symbol sits inside a
+///    `#[cfg(test)]` attribute scope inferred from the lookback window.
+/// 2. Any line within `+/- ASSERT_WINDOW` of `match_line` contains one of
+///    the standard error-assertion markers (`.is_err()`,
+///    `.unwrap_err()`, `.expect_err(`, `matches!(_, Err(_))`,
+///    `assert_matches!(_, Err(_))`, `assert!(matches!(_, Err(_)))`).
+///
+/// The window is intentionally narrow to avoid swallowing genuine
+/// findings that happen to coexist with unrelated error assertions in
+/// long test bodies. Lines indexed beyond the slice are silently skipped.
+fn is_assert_defense(lines: &[&str], sym_start: u32, sym_end: u32, match_line: u32) -> bool {
+    const ASSERT_WINDOW: u32 = 10;
+
+    if !symbol_is_test_function(lines, sym_start) {
+        return false;
+    }
+
+    let sym_end_safe = sym_end.max(sym_start);
+    let low = match_line.saturating_sub(ASSERT_WINDOW).max(sym_start);
+    let high = match_line.saturating_add(ASSERT_WINDOW).min(sym_end_safe);
+    if low == 0 || high < low {
+        return false;
+    }
+    for ln in low..=high {
+        let idx = (ln as usize).saturating_sub(1);
+        if idx >= lines.len() {
+            break;
+        }
+        if line_has_error_assertion(lines[idx]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the symbol at `sym_start` is a Rust test function.
+///
+/// Looks at lines above `sym_start` for any attribute whose identifier
+/// path ends in `test` (covers `#[test]`, `#[tokio::test]`,
+/// `#[async_std::test]`, `#[actix_rt::test]`, `#[rstest]`,
+/// `#[proptest]`, etc. Also matches `#[cfg(test)]` applied directly
+/// to the function).
+fn symbol_is_test_function(lines: &[&str], sym_start: u32) -> bool {
+    if sym_start == 0 {
+        return false;
+    }
+    let end_idx = (sym_start as usize).saturating_sub(1);
+    let start_idx = end_idx.saturating_sub(ATTR_LOOKBACK as usize);
+    for idx in start_idx..end_idx {
+        if idx >= lines.len() {
+            break;
+        }
+        let trimmed = lines[idx].trim_start();
+        if !trimmed.starts_with("#[") && !trimmed.starts_with("#![") {
+            continue;
+        }
+        if attribute_marks_test(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when an attribute line names `test` either directly
+/// (`#[test]`, `#[tokio::test]`, `#[rstest]`, `#[proptest]`) or via
+/// `#[cfg(test)]` / `#[cfg_attr(..., test)]`. Works on the trimmed line
+/// text without running the full attribute parser.
+fn attribute_marks_test(attr_line: &str) -> bool {
+    if attr_text_targets_test(attr_line) {
+        return true;
+    }
+    let stripped: String = attr_line.split_whitespace().collect();
+    // Match `#[...test]`, `#[...test(...)`, or `#[...test,...]` where the
+    // last path segment before the delimiter is literally `test`. This
+    // keeps the helper narrow enough to skip `#[derive(Test)]` or
+    // identifiers that merely start with `test_`.
+    let body = match stripped
+        .strip_prefix("#[")
+        .or_else(|| stripped.strip_prefix("#!["))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    for attr in body.split([',', ']']) {
+        if attr.is_empty() {
+            continue;
+        }
+        // Strip off argument list and trailing markers.
+        let head = attr.split(['(', ')', ']']).next().unwrap_or("");
+        let last_segment = head.rsplit("::").next().unwrap_or(head);
+        if last_segment == "test"
+            || last_segment == "rstest"
+            || last_segment == "proptest"
+            || last_segment == "test_case"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a source line carries one of the canonical error-assertion
+/// shapes that signal "we expect the call above to fail". Keeps the
+/// detector lexical so it survives minor formatting differences.
+fn line_has_error_assertion(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    // Skip comment lines so `// assert_eq!(foo.is_err(), ...)` in a
+    // comment does not flip the gate.
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+        return false;
+    }
+    if trimmed.contains(".is_err()")
+        || trimmed.contains(".unwrap_err()")
+        || trimmed.contains(".expect_err(")
+        || trimmed.contains("assert_err!(")
+    {
+        return true;
+    }
+    if trimmed.contains("assert_matches!") && trimmed.contains("Err(") {
+        return true;
+    }
+    if (trimmed.contains("assert!(") || trimmed.contains("debug_assert!("))
+        && trimmed.contains("matches!")
+        && trimmed.contains("Err(")
+    {
+        return true;
+    }
+    false
 }
 
 /// Compiled version of a [`SecurityRule`] with its pre-built regex.
@@ -681,6 +833,20 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
 
                 let line_start = match_line.unwrap_or(sym.line_start);
                 let line_end = match_line.unwrap_or(sym.line_end);
+
+                // Tests that assert a security defense fires generate a
+                // finding on the attack input (e.g. `../../etc/passwd`)
+                // even though the symbol's role is to prove the code
+                // under test REJECTS that input. Apply this filter
+                // regardless of `include_tests` so inline `#[test]`
+                // functions in production sources also get cleansed.
+                // Only Rust has the attribute grammar this helper
+                // recognises; other languages fall through.
+                if file_lang == "rust"
+                    && is_assert_defense(&lines, sym.line_start, sym.line_end, line_start)
+                {
+                    continue;
+                }
 
                 findings.push(Finding {
                     rule_id: cr.rule.id.clone(),
@@ -2022,12 +2188,20 @@ description = "AWS access key"
     }
 
     #[test]
-    fn cfg_test_block_ignores_non_module_attr() {
+    fn cfg_test_block_catches_standalone_cfg_test_fn() {
         let src = "#[cfg(test)]\n\
                    fn standalone_test() { let p = \"../foo\"; }\n";
-        // Only `mod` declarations are recognised; standalone `#[cfg(test)]`
-        // fns are out of scope for this filter.
-        assert!(find_cfg_test_blocks(src).is_empty());
+        // Standalone `#[cfg(test)] fn` (outside any wrapping test
+        // module) is still a test-only symbol and must be scoped like
+        // a `#[cfg(test)] mod` block. Without this, the lone helper
+        // kept producing security findings on the default
+        // `include_tests=false` path because the scanner only
+        // recognised `mod_item` ranges.
+        let blocks = find_cfg_test_blocks(src);
+        assert_eq!(blocks.len(), 1, "expected 1 block, got {blocks:?}");
+        let (start, end) = blocks[0];
+        assert_eq!(start, 1, "block must start at the attribute line");
+        assert!(end >= 2, "block must cover the function body");
     }
 
     #[test]

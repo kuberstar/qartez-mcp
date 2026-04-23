@@ -36,10 +36,31 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulHealthParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_health")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
-        let limit = params.limit.unwrap_or(15) as usize;
-        let max_health = params.max_health.unwrap_or(5.0).clamp(0.0, 10.0);
+        // `limit=0` means "no cap" project-wide convention; `None` keeps the
+        // historical default of 15.
+        let limit = match params.limit {
+            None => 15,
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+        };
+        // Negative max_health is rejected outright: silently clamping a
+        // negative to 0 produced the "Avg health 10.0/10" stub on empty
+        // results, which read like success. Values above 10 clamp to 10
+        // for deterministic output (a 0-to-10 health scale cannot exceed
+        // 10, and callers using "999" as an "unbounded ceiling" idiom
+        // expect the same report as max_health=10).
+        if let Some(m) = params.max_health
+            && m < 0.0
+        {
+            return Err(format!(
+                "max_health must be >= 0.0, got {m}. Use a value in [0.0, 10.0]."
+            ));
+        }
+        let max_health = params.max_health.unwrap_or(5.0).min(10.0);
+        let min_cc_explicit = params.min_complexity;
         let min_cc = params.min_complexity.unwrap_or(15);
         let min_lines = params.min_lines.unwrap_or(50);
         let min_params = params.min_params.unwrap_or(5) as usize;
@@ -47,6 +68,25 @@ impl QartezServer {
         let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
         let all_symbols =
             read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?;
+
+        // When the caller EXPLICITLY raised min_complexity above every
+        // indexed function's CC, no file can ever qualify. Surface that
+        // as a clear signal rather than falling through to the generic
+        // "Review with qartez_outline" stub. We restrict this to
+        // explicit caller intent so a small clean repo using the default
+        // threshold still hits the standard "no unhealthy files" path.
+        let max_cc_seen = all_symbols
+            .iter()
+            .filter_map(|(s, _)| s.complexity)
+            .max()
+            .unwrap_or(0);
+        if let Some(explicit) = min_cc_explicit
+            && explicit > max_cc_seen
+        {
+            return Ok(format!(
+                "No files with min_complexity >= {explicit} found (max observed CC = {max_cc_seen}). Lower min_complexity to widen the search.",
+            ));
+        }
 
         let mut smells_by_file: HashMap<String, Vec<SmellEntry>> = HashMap::new();
         for (sym, path) in &all_symbols {
@@ -126,7 +166,9 @@ impl QartezServer {
             )
         });
         let total = rows.len();
-        rows.truncate(limit);
+        if limit != usize::MAX {
+            rows.truncate(limit);
+        }
 
         let avg_health = if rows.is_empty() {
             10.0

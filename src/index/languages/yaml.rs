@@ -237,6 +237,7 @@ fn extract_needs_refs(job_mapping: Node, source: &[u8], references: &mut Vec<Ext
                     kind: ReferenceKind::Use,
                     qualifier: None,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             } else if let Some(value_node) = pair.child_by_field_name("value") {
                 collect_sequence_values(value_node, source, |val, line| {
@@ -247,6 +248,7 @@ fn extract_needs_refs(job_mapping: Node, source: &[u8], references: &mut Vec<Ext
                         kind: ReferenceKind::Use,
                         qualifier: None,
                         receiver_type_hint: None,
+                        via_method_syntax: false,
                     });
                 });
             }
@@ -363,6 +365,7 @@ fn extract_gitlab_ci(
                         kind: ReferenceKind::Use,
                         qualifier: None,
                         receiver_type_hint: None,
+                        via_method_syntax: false,
                     });
                 }
 
@@ -443,6 +446,7 @@ fn extract_docker_compose(
                             kind: ReferenceKind::Use,
                             qualifier: None,
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                     });
                     if let Some(deps_mapping) = find_block_mapping_recursive(deps_node) {
@@ -455,6 +459,7 @@ fn extract_docker_compose(
                                     kind: ReferenceKind::Use,
                                     qualifier: None,
                                     receiver_type_hint: None,
+                                    via_method_syntax: false,
                                 });
                             }
                         }

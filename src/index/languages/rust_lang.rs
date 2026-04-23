@@ -226,6 +226,16 @@ fn record_reference(
         "call_expression" => {
             if let Some(func) = node.child_by_field_name("function") {
                 let (name, qualifier, module_qual) = extract_callee_info(func, source);
+                // Method-call syntax (`receiver.method(...)`) has a
+                // `field_expression` as the callee. The extractor cannot
+                // infer the receiver's type statically, so the resolver
+                // must treat these refs more carefully - otherwise common
+                // iterator / Option / Result method names (`filter`,
+                // `map`, `collect`) get fanned out to every same-named
+                // field and free function in the index. `via_method_syntax`
+                // is the signal the resolver uses to drop cross-file
+                // ambiguity for these refs.
+                let via_method_syntax = func.kind() == "field_expression";
                 if !name.is_empty() {
                     references.push(ExtractedReference {
                         name,
@@ -234,6 +244,7 @@ fn record_reference(
                         kind: ReferenceKind::Call,
                         qualifier: qualifier.clone(),
                         receiver_type_hint: None,
+                        via_method_syntax,
                     });
                     // Attribute a TypeRef to the immediate qualifier when
                     // it's a type (`QartezError` in `QartezError::Io(...)`,
@@ -262,6 +273,7 @@ fn record_reference(
                             kind: ReferenceKind::TypeRef,
                             qualifier: module_qual,
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                     }
                 }
@@ -290,6 +302,7 @@ fn record_reference(
                         kind: ReferenceKind::Call,
                         qualifier: None,
                         receiver_type_hint: None,
+                        via_method_syntax: false,
                     });
                 }
                 // Macro bodies are opaque token trees - tree-sitter cannot
@@ -354,6 +367,7 @@ fn record_reference(
                     kind: ReferenceKind::TypeRef,
                     qualifier: None,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }
@@ -365,10 +379,19 @@ fn record_reference(
             // shows 0 refs in `qartez_refs` / gets flagged by
             // `qartez_unused` despite heavy use.
             //
-            // Lowercase locals are intentionally ignored: every variable
-            // read would become a ref edge and the signal-to-noise would
-            // collapse. CamelCase is reached via `type_identifier` and
-            // doesn't need a fallback here.
+            // Lowercase identifiers are emitted ONLY when passed as a
+            // callback / function pointer to another call
+            // (`.map(expand_kind_alias)`, `foo(helper)`). Without this,
+            // intra-file `pub(super)` helpers that are only referenced
+            // via callback syntax look dead because the argument-
+            // position identifier produces no reference at all. Free-
+            // standing lowercase reads (`let x = foo; foo`) stay
+            // unemitted so the signal-to-noise stays usable; the
+            // resolver drops the rare false positive where the argument
+            // is actually a local binding rather than a symbol name
+            // (no candidate is indexed, so the edge never materialises).
+            // CamelCase is reached via `type_identifier` and doesn't
+            // need a fallback here.
             //
             // The parent-kind filter skips identifiers that are
             // self-definitions or binding names (so `const FOO:` /
@@ -411,7 +434,13 @@ fn record_reference(
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
                 && name.chars().any(|c| c.is_ascii_uppercase());
-            if !is_const_shape {
+            // Tree-sitter-rust wraps call arguments in an `arguments` node,
+            // so a bare `identifier` inside `arguments` is either a local
+            // read or a function pointer passed as a callback. Emitting a
+            // Use ref here lets the resolver match it against an indexed
+            // symbol when one exists; locals get dropped as `no candidate`.
+            let in_call_arguments = parent_kind == "arguments";
+            if !is_const_shape && !in_call_arguments {
                 return;
             }
             references.push(ExtractedReference {
@@ -421,6 +450,7 @@ fn record_reference(
                 kind: ReferenceKind::Use,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
         "scoped_identifier" => {
@@ -480,6 +510,7 @@ fn record_reference(
                 kind: ReferenceKind::Use,
                 qualifier: qualifier.clone(),
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
             // If the immediate qualifier is uppercase, it names an enum or
             // struct being referenced via variant/associated-item syntax
@@ -498,6 +529,7 @@ fn record_reference(
                     kind: ReferenceKind::TypeRef,
                     qualifier: module_qual,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }
@@ -566,6 +598,7 @@ fn emit_macro_body_refs(
                             kind: ReferenceKind::Call,
                             qualifier: None,
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                     } else if mode == MacroEmitMode::Full
                         && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
@@ -579,6 +612,7 @@ fn emit_macro_body_refs(
                             kind: ReferenceKind::Use,
                             qualifier: None,
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                     }
                 }
@@ -605,6 +639,7 @@ fn emit_macro_body_refs(
                             kind: ReferenceKind::Call,
                             qualifier: qualifier.clone(),
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                         if let Some(q) = qualifier
                             && q.starts_with(|c: char| c.is_uppercase())
@@ -617,6 +652,7 @@ fn emit_macro_body_refs(
                                 kind: ReferenceKind::TypeRef,
                                 qualifier: None,
                                 receiver_type_hint: None,
+                                via_method_syntax: false,
                             });
                         }
                     } else if mode == MacroEmitMode::Full
@@ -631,6 +667,7 @@ fn emit_macro_body_refs(
                             kind: ReferenceKind::Use,
                             qualifier: None,
                             receiver_type_hint: None,
+                            via_method_syntax: false,
                         });
                     }
                 }
@@ -742,6 +779,7 @@ fn extract_serde_path_refs(
                 kind: ReferenceKind::Use,
                 qualifier,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
         // Recurse into nested token_trees.
@@ -2890,9 +2928,11 @@ fn pick() -> i64 {
 
     #[test]
     fn test_refs_lowercase_identifier_does_not_emit_use() {
-        // Lowercase local identifiers are NOT emitted as references - the
-        // noise would dwarf the signal. Only UPPER_SNAKE_CASE passes the
-        // const-shape filter.
+        // Lowercase local identifiers outside of call-argument position
+        // are NOT emitted as references. Only UPPER_SNAKE_CASE bare reads
+        // pass the const-shape filter; lowercase identifiers show up as
+        // Use refs only when passed as callback / function pointer
+        // arguments (see `test_refs_lowercase_fn_as_callback_arg`).
         let result = parse_rust(
             r#"
 fn pick() -> i64 {
@@ -2906,6 +2946,81 @@ fn pick() -> i64 {
         assert!(
             x_refs.is_empty(),
             "lowercase locals must not emit Use refs: {x_refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_refs_lowercase_fn_as_callback_arg() {
+        // Regression: intra-file `pub(super)` helpers passed to
+        // `.map(expand_kind_alias)` were invisible to `qartez_refs`
+        // because the identifier in argument position emitted no ref at
+        // all. tree-sitter-rust wraps call arguments in an `arguments`
+        // node; the identifier arm of `record_reference` now emits a
+        // Use ref when it sees that parent, letting the resolver match
+        // against an indexed helper.
+        let result = parse_rust(
+            r#"
+fn helper(x: i32) -> i32 { x * 2 }
+fn caller(list: Vec<i32>) -> Vec<i32> {
+    list.into_iter().map(helper).collect()
+}
+"#,
+        );
+        let helper_use_refs: Vec<&ExtractedReference> = result
+            .references
+            .iter()
+            .filter(|r| r.name == "helper" && matches!(r.kind, ReferenceKind::Use))
+            .collect();
+        assert!(
+            !helper_use_refs.is_empty(),
+            "function-pointer argument `helper` must emit a Use ref; refs: {:?}",
+            result.references
+        );
+    }
+
+    #[test]
+    fn test_refs_method_syntax_call_is_flagged() {
+        // `.filter(...)` parses as a `call_expression` whose `function`
+        // child is a `field_expression`. The emitted Call ref must carry
+        // `via_method_syntax=true` so the resolver can drop cross-file
+        // ambiguity against fields / functions sharing the method name.
+        let result = parse_rust(
+            r#"
+fn caller(list: Vec<i32>) -> Vec<i32> {
+    list.into_iter().filter(|_| true).collect()
+}
+"#,
+        );
+        let filter_ref = result
+            .references
+            .iter()
+            .find(|r| r.name == "filter" && matches!(r.kind, ReferenceKind::Call))
+            .expect("filter call ref");
+        assert!(
+            filter_ref.via_method_syntax,
+            "method-syntax call must flip via_method_syntax: {filter_ref:?}"
+        );
+    }
+
+    #[test]
+    fn test_refs_scoped_call_is_not_method_syntax() {
+        // Positive counter-test: `Foo::new()` is a scoped call, not a
+        // method-syntax call. It must NOT flip `via_method_syntax` -
+        // otherwise the resolver would drop legitimate cross-file
+        // associated-function resolution.
+        let result = parse_rust(
+            r#"
+fn caller() { Foo::new(); }
+"#,
+        );
+        let new_ref = result
+            .references
+            .iter()
+            .find(|r| r.name == "new" && matches!(r.kind, ReferenceKind::Call))
+            .expect("new call ref");
+        assert!(
+            !new_ref.via_method_syntax,
+            "scoped call must not flip via_method_syntax: {new_ref:?}"
         );
     }
 

@@ -17,7 +17,7 @@ use super::refactor_common::{
 impl QartezServer {
     #[tool(
         name = "qartez_replace_symbol",
-        description = "Replace a symbol's whole source range (lines L[line_start..line_end]) with `new_code`. Caller supplies the new definition including its signature - this is a precise line-range rewrite, not a body-only splice. Preview by default; set apply=true to execute. Use `kind` / `file_path` to disambiguate when the name is shared.",
+        description = "Replace a symbol's whole source range (lines L[line_start..line_end]) with `new_code`. Caller supplies the new definition including its signature - this is a precise line-range rewrite, not a body-only splice. The tool refuses to run when `new_code` does not start with a recognised definition introducer (`fn`, `pub fn`, `struct`, `class`, `def`, etc.). Preview by default; set apply=true to execute. Use `kind` / `file_path` to disambiguate when the name is shared.",
         annotations(
             title = "Replace Symbol",
             read_only_hint = false,
@@ -54,6 +54,16 @@ impl QartezServer {
         let content = std::fs::read_to_string(&abs_path)
             .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
         let (lines, start_idx, end_idx) = validate_range(&content, &sym, &source_file.path)?;
+
+        // Signature sanity check. `qartez_replace_symbol` is a whole-symbol
+        // rewrite (line range -> new_code); passing body-only code silently
+        // corrupts the file by dropping the `fn name(...) {` line. Compare
+        // the original symbol's first introducer token with the supplied
+        // new_code; refuse when the new_code is clearly a body splice.
+        if let Some(err) = check_signature_shape(&sym, &lines[start_idx..end_idx], &params.new_code)
+        {
+            return Err(err);
+        }
 
         let apply = params.apply.unwrap_or(false);
         let replaced_lines = end_idx - start_idx;
@@ -115,4 +125,137 @@ impl QartezServer {
             new_lines_count,
         ))
     }
+}
+
+/// Verify the supplied `new_code` still looks like a full definition of the
+/// symbol it is about to replace. Compares the introducer token of the
+/// first non-blank line in the original range against the first non-blank
+/// line of `new_code` and returns an explanatory error when the new_code
+/// is clearly a body-only splice.
+///
+/// Language-aware for Rust (`fn`, `struct`, `trait`, `impl`, `enum`,
+/// `async fn`, `const`, `static`, `type`, `mod`, `pub` prefixes, macros),
+/// TypeScript / JavaScript (`function`, `class`, `interface`, `type`,
+/// `enum`, `export`, `async`, `public/private/protected/static` for
+/// methods), and Python (`def`, `async def`, `class`). When the kind is
+/// unknown or the original range is blank the check is a no-op.
+fn check_signature_shape(
+    sym: &crate::storage::models::SymbolRow,
+    old_lines: &[&str],
+    new_code: &str,
+) -> Option<String> {
+    let old_first = old_lines.iter().map(|l| l.trim()).find(|l| !l.is_empty())?;
+    let new_first = new_code.lines().map(|l| l.trim()).find(|l| !l.is_empty())?;
+
+    fn is_introducer(line: &str, introducers: &[&str]) -> bool {
+        for intro in introducers {
+            if line == *intro {
+                return true;
+            }
+            if let Some(after) = line.strip_prefix(intro) {
+                if let Some(ch) = after.chars().next()
+                    && !ch.is_alphanumeric()
+                    && ch != '_'
+                {
+                    return true;
+                }
+                if after.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    let rust_introducers: &[&str] = &[
+        "pub",
+        "fn",
+        "async",
+        "struct",
+        "trait",
+        "impl",
+        "enum",
+        "const",
+        "static",
+        "type",
+        "mod",
+        "use",
+        "unsafe",
+        "extern",
+        "macro_rules!",
+        "#[",
+        "#!",
+        "///",
+        "//!",
+    ];
+    let ts_introducers: &[&str] = &[
+        "export",
+        "function",
+        "class",
+        "interface",
+        "type",
+        "enum",
+        "async",
+        "public",
+        "private",
+        "protected",
+        "static",
+        "readonly",
+        "abstract",
+        "declare",
+        "const",
+        "let",
+        "var",
+        "get",
+        "set",
+        "@",
+        "/**",
+        "//",
+        "*",
+    ];
+    let python_introducers: &[&str] = &["def", "async", "class", "@", "#"];
+
+    let introducers: &[&str] = match sym.kind.as_str() {
+        "function" | "method" | "struct" | "trait" | "impl" | "enum" | "const" | "static"
+        | "type_alias" | "module" | "macro" => rust_introducers,
+        "class" | "interface" | "type" => ts_introducers,
+        _ => {
+            // Unknown kind: sniff by the first old line itself.
+            if is_introducer(old_first, rust_introducers)
+                || is_introducer(old_first, ts_introducers)
+                || is_introducer(old_first, python_introducers)
+            {
+                // Merge all of them as an acceptance set.
+                let all: Vec<&str> = rust_introducers
+                    .iter()
+                    .chain(ts_introducers.iter())
+                    .chain(python_introducers.iter())
+                    .copied()
+                    .collect();
+                return if is_introducer(new_first, &all) {
+                    None
+                } else {
+                    Some(format!(
+                        "Refusing to replace '{}' ({}): `new_code` does not start with a definition introducer. The first non-blank line is:\n  {}\nExpected a line beginning with something like `fn`, `pub fn`, `struct`, `class`, `def`, `interface`, etc. `qartez_replace_symbol` is a whole-symbol rewrite - include the full signature, not just the body.",
+                        sym.name, sym.kind, new_first,
+                    ))
+                };
+            }
+            return None;
+        }
+    };
+
+    if !is_introducer(old_first, introducers) {
+        return None;
+    }
+    if is_introducer(new_first, introducers) {
+        return None;
+    }
+    Some(format!(
+        "Refusing to replace '{}' ({}): `new_code` does not start with a definition introducer. The first non-blank line is:\n  {}\nExpected a line beginning with one of: {}. `qartez_replace_symbol` is a whole-symbol rewrite - include the full signature, not just the body.",
+        sym.name,
+        sym.kind,
+        new_first,
+        introducers.join(", "),
+    ))
 }

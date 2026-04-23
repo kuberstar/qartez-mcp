@@ -36,6 +36,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulSecurityParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_security")?;
         use crate::graph::security::{
             ScanOptions, Severity, apply_config, builtin_rules, load_custom_config, scan,
         };

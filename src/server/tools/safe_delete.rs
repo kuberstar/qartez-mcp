@@ -40,20 +40,52 @@ impl QartezServer {
             params.file_path.as_deref(),
         )?;
 
-        // Gather every file that imports the defining file. This is the
-        // same signal `qartez_move` uses; it covers glob-imports and
-        // parent-module re-exports that a naive specifier filter drops.
+        // Unify two reference signals so the blast-radius count matches
+        // what `qartez_refs` would show:
+        //   - `edges` table: file-level `use` imports of the defining file,
+        //   - `symbol_refs` table: symbol-level usage edges, which pick up
+        //     glob imports, re-exports, and parent-module qualified calls
+        //     that never became `use` edges.
+        // A naive `get_edges_to` alone showed "1 file(s) import" when
+        // `qartez_refs` returned 8.
         let edges =
             read::get_edges_to(&conn, source_file.id).map_err(|e| format!("DB error: {e}"))?;
-        let mut importer_paths: Vec<String> = Vec::new();
+        let mut edge_importers: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for edge in &edges {
             if let Ok(Some(f)) = read::get_file_by_id(&conn, edge.from_file)
-                && !importer_paths.contains(&f.path)
                 && f.path != source_file.path
             {
-                importer_paths.push(f.path);
+                edge_importers.insert(f.path);
             }
         }
+        let sym_refs = read::get_symbol_references_filtered(
+            &conn,
+            &sym.name,
+            Some(&sym.kind),
+            Some(&source_file.path),
+        )
+        .map_err(|e| format!("DB error: {e}"))?;
+        let mut ref_importers: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Track intra-file references (from a DIFFERENT symbol in the same
+        // file) separately so the tool still refuses to delete a helper
+        // that is reached only through a sibling in the same module. Pure
+        // self-references (recursion) are dropped - deletion removes both
+        // sides of that edge at once.
+        for (_, _, importers) in &sym_refs {
+            for (_, importer_file, from_symbol_id) in importers {
+                if *from_symbol_id == sym.id {
+                    continue;
+                }
+                ref_importers.insert(importer_file.path.clone());
+            }
+        }
+        let mut combined: std::collections::BTreeSet<String> = edge_importers.clone();
+        combined.extend(ref_importers.iter().cloned());
+        let importer_paths: Vec<String> = combined.into_iter().collect();
+        let edge_count = edge_importers.len();
+        let ref_count = ref_importers.len();
         drop(conn);
 
         let apply = params.apply.unwrap_or(false);
@@ -75,12 +107,18 @@ impl QartezServer {
                 end_idx - start_idx,
             );
             if importer_paths.is_empty() {
-                out.push_str("No files import this file. Safe to delete.\n");
+                // `qartez_safe_delete` targets a symbol inside the
+                // source file, not the file itself; wording the
+                // success line with "this symbol" avoids misleading
+                // callers into believing the file would be removed.
+                out.push_str("No files import this symbol. Safe to delete.\n");
             } else {
                 out.push_str(&format!(
-                    "WARNING: {} file(s) import '{}' and may break after delete:\n",
+                    "WARNING: {} file(s) reference '{}' (use-edges: {}, symbol-refs: {}) and may break after delete:\n",
                     importer_paths.len(),
                     source_file.path,
+                    edge_count,
+                    ref_count,
                 ));
                 for p in &importer_paths {
                     out.push_str(&format!("  {p}\n"));

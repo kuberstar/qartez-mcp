@@ -39,6 +39,17 @@ impl QartezServer {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let limit = params.limit.unwrap_or(20).max(1) as i64;
         let offset = params.offset.unwrap_or(0) as i64;
+        // `min_lines=0` is meaningless: every symbol has `line_end >=
+        // line_start` so the SQL predicate `(line_end - line_start + 1)
+        // >= 0` matches every indexed symbol, inflating the raw count but
+        // producing nothing actionable after the group-by + HAVING filter.
+        // Silently coercing to 1 hid the caller's intent; reject with a
+        // clear message instead.
+        if let Some(0) = params.min_lines {
+            return Err(
+                "min_lines must be >= 1 (0 matches every symbol and produces nothing useful after the duplicate-group filter).".into(),
+            );
+        }
         // Default raised from 5 to 8 because short dispatch boilerplate
         // (e.g. 37 parallel `fn parse_X(source) -> Tree` helpers that all
         // wrap a tree-sitter parser on a language-specific `LANGUAGE`
@@ -59,9 +70,6 @@ impl QartezServer {
             );
         }
 
-        let groups = read::get_clone_groups(&conn, min_lines, limit, offset)
-            .map_err(|e| format!("DB error: {e}"))?;
-
         // Default behaviour mirrors `qartez_security`: drop symbols whose
         // file path looks like a test file and symbols whose line range
         // sits inside a Rust `#[cfg(test)] mod tests {}` block. Parallel
@@ -71,15 +79,50 @@ impl QartezServer {
         // without being refactorable; keep them out of the default view
         // so real production duplicates surface. Pass
         // `include_tests=true` to restore the old behaviour.
+        //
+        // When the test filter is active we oversample the DB: a narrow
+        // `LIMIT N OFFSET M` query against raw clone groups returned
+        // empty pages for small `limit` values when the top groups were
+        // all tests. Loop-fetch pages of FETCH_PAGE_SIZE until we have
+        // `limit` post-filter groups or the source is exhausted. The
+        // reported "total" still reflects the raw group count so the
+        // pagination contract stays compatible with older callers.
         let cfg_test_cache = CfgTestBlockCache::new(&self.project_root);
-        let groups: Vec<read::CloneGroup> = if include_tests {
-            groups
-        } else {
-            groups
-                .into_iter()
-                .filter_map(|g| filter_test_members(g, &cfg_test_cache))
-                .collect()
-        };
+        const FETCH_PAGE_SIZE: i64 = 64;
+        let mut groups: Vec<read::CloneGroup> = Vec::new();
+        let mut fetch_offset = offset;
+        let mut raw_consumed: i64 = 0;
+        loop {
+            let batch = read::get_clone_groups(&conn, min_lines, FETCH_PAGE_SIZE, fetch_offset)
+                .map_err(|e| format!("DB error: {e}"))?;
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len() as i64;
+            fetch_offset += batch_len;
+            raw_consumed += batch_len;
+            let filtered: Vec<read::CloneGroup> = if include_tests {
+                batch
+                    .into_iter()
+                    .filter(|g| !is_entry_point_boilerplate(&self.project_root, g))
+                    .collect()
+            } else {
+                batch
+                    .into_iter()
+                    .filter_map(|g| filter_test_members(g, &cfg_test_cache))
+                    .filter(|g| !is_entry_point_boilerplate(&self.project_root, g))
+                    .collect()
+            };
+            groups.extend(filtered);
+            if groups.len() as i64 >= limit {
+                groups.truncate(limit as usize);
+                break;
+            }
+            if batch_len < FETCH_PAGE_SIZE {
+                break;
+            }
+        }
+        let next_raw_offset = offset + raw_consumed;
 
         if groups.is_empty() {
             return Ok(format!(
@@ -90,8 +133,7 @@ impl QartezServer {
         let shown = groups.len() as i64;
         let mut out = if shown < total {
             format!(
-                "{total} clone group(s) (min {min_lines} lines); showing {shown} from offset {offset} (next: offset={}).\n\n",
-                offset + shown
+                "{total} clone group(s) (min {min_lines} lines); showing {shown} from offset {offset} (next: offset={next_raw_offset}).\n\n",
             )
         } else {
             format!("{total} clone group(s) (min {min_lines} lines).\n\n")
@@ -110,17 +152,41 @@ impl QartezServer {
                 .first()
                 .map(|(s, _)| s.line_end.saturating_sub(s.line_start) + 1)
                 .unwrap_or(0);
+            let boilerplate = detect_trait_boilerplate(&conn, group);
 
             if concise {
-                out.push_str(&format!("#{group_num} ({size}x, ~{lines}L):"));
+                out.push_str(&format!("#{group_num} ({size}x, ~{lines}L"));
+                if boilerplate.is_some() {
+                    out.push_str(", trait-boilerplate");
+                }
+                out.push_str("):");
                 for (sym, file) in &group.symbols {
                     out.push_str(&format!(" {}:{}", file.path, sym.line_start));
                 }
                 out.push('\n');
             } else {
                 out.push_str(&format!(
-                    "## Clone group #{group_num} — {size} duplicates, ~{lines} lines each\n"
+                    "## Clone group #{group_num} - {size} duplicates, ~{lines} lines each\n"
                 ));
+                if let Some(ref label) = boilerplate {
+                    let method_name = group
+                        .symbols
+                        .first()
+                        .map(|(s, _)| s.name.as_str())
+                        .unwrap_or("method");
+                    let trait_hint = label
+                        .trait_name
+                        .as_deref()
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "[trait boilerplate{trait_hint} - candidate for default method]\n"
+                    ));
+                    out.push_str(&format!(
+                        "  Consider promoting `fn {method_name}` to a default \
+                         method on the trait so impls opt out only when needed.\n"
+                    ));
+                }
                 for (sym, file) in &group.symbols {
                     let kind_char = sym.kind.chars().next().unwrap_or(' ');
                     out.push_str(&format!(
@@ -132,6 +198,118 @@ impl QartezServer {
             }
         }
         Ok(out)
+    }
+}
+
+/// Verdict for a clone group that matches the trait-boilerplate pattern.
+///
+/// `trait_name` is populated when every member resolves to the same
+/// `impl <Trait> for <Struct>` block via `type_hierarchy`. When the
+/// enclosing trait cannot be resolved cheaply the proxy heuristic
+/// (same method name, distinct owner types, distinct files, method
+/// kind on every member) still fires with `trait_name = None`.
+struct TraitBoilerplate {
+    trait_name: Option<String>,
+}
+
+/// Detect clone groups that are trait-impl boilerplate and recommend a
+/// default method implementation instead.
+///
+/// A group qualifies when every member is a method sharing the same
+/// base name, every member lives in a distinct file, and every member
+/// has a distinct `owner_type`. When all members also share a single
+/// `super_name` in `type_hierarchy`, that trait name is returned
+/// alongside the verdict so the report can name it explicitly.
+fn detect_trait_boilerplate(
+    conn: &rusqlite::Connection,
+    group: &read::CloneGroup,
+) -> Option<TraitBoilerplate> {
+    if group.symbols.len() < 2 {
+        return None;
+    }
+
+    let first_name = &group.symbols[0].0.name;
+    let mut seen_files: HashSet<i64> = HashSet::new();
+    let mut seen_owners: HashSet<String> = HashSet::new();
+    for (sym, file) in &group.symbols {
+        // Every member must be a method/function: trait impls surface
+        // as `method` on Rust-style backends and `function` on some
+        // other language backends.
+        let is_method = matches!(sym.kind.as_str(), "method" | "function");
+        if !is_method {
+            return None;
+        }
+        if &sym.name != first_name {
+            return None;
+        }
+        let owner = sym.owner_type.as_deref()?;
+        if !seen_files.insert(file.id) {
+            return None;
+        }
+        if !seen_owners.insert(owner.to_string()) {
+            return None;
+        }
+    }
+
+    // The proxy heuristic holds. Try to recover the enclosing trait
+    // name by intersecting `type_hierarchy` rows for every
+    // (owner_type, file_id) pair. A single shared `super_name` means
+    // every member sits inside `impl <Trait> for <Struct>` with the
+    // same trait; anything else falls back to the proxy label.
+    let trait_name = intersect_trait_names(conn, &group.symbols).ok().flatten();
+    Some(TraitBoilerplate { trait_name })
+}
+
+/// Intersect `type_hierarchy.super_name` rows across every group member.
+///
+/// Returns `Ok(Some(trait))` when exactly one trait is shared by all
+/// members, `Ok(None)` when the intersection is empty or ambiguous, and
+/// `Err` when the SQL query fails. Each lookup is scoped to the
+/// member's `(file_id, sub_name)` so implementations of the same trait
+/// in unrelated files do not cross-pollinate.
+#[allow(clippy::question_mark)]
+fn intersect_trait_names(
+    conn: &rusqlite::Connection,
+    symbols: &[(
+        crate::storage::models::SymbolRow,
+        crate::storage::models::FileRow,
+    )],
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT super_name
+         FROM type_hierarchy
+         WHERE sub_name = ?1 AND file_id = ?2 AND kind = 'implements'",
+    )?;
+
+    let mut common: Option<HashSet<String>> = None;
+    for (sym, file) in symbols {
+        // `?` on `Option` would short-circuit this `Result<Option<_>>`
+        // function to `Ok(Some(None))`, not `Ok(None)`, so keep the
+        // explicit `let...else` here.
+        let Some(owner) = sym.owner_type.as_deref() else {
+            return Ok(None);
+        };
+        let rows = stmt
+            .query_map(rusqlite::params![owner, file.id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect::<HashSet<_>>();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        common = Some(match common {
+            Some(prev) => prev.intersection(&rows).cloned().collect(),
+            None => rows,
+        });
+        if common.as_ref().is_some_and(|s| s.is_empty()) {
+            return Ok(None);
+        }
+    }
+
+    match common {
+        Some(set) if set.len() == 1 => Ok(set.into_iter().next()),
+        _ => Ok(None),
     }
 }
 
@@ -173,6 +351,128 @@ impl<'a> CfgTestBlockCache<'a> {
             .insert(rel_path.to_string(), ranges.clone());
         ranges
     }
+}
+
+/// Returns `true` when every member of a clone group is a shallow
+/// dispatcher entry-point that wraps a language-specific constant
+/// with otherwise-identical AST shape - the kind of parallel
+/// `fn parse_foo() -> Tree { dispatch::parse_generic(SRC, "foo") }`
+/// pattern that dominates qartez's parser-fixture layer and is not
+/// mechanically refactorable without a typeid map.
+///
+/// Three gates must all pass:
+///   1. Every member shares a common alphanumeric prefix of >= 4
+///      characters ending in `_` (e.g. `parse_`, `extract_`,
+///      `handle_`). Shorter shared prefixes trigger too many false
+///      positives on incidental naming collisions.
+///   2. Every member's body has at most MAX_ENTRY_POINT_LINES
+///      non-comment lines after stripping the signature and closing
+///      brace.
+///   3. Every body literally mentions its per-member stem (either
+///      as an identifier or as a string literal). Bodies that do
+///      unique per-member work will not carry the stem, so this
+///      gate reliably distinguishes parallel entry-points from
+///      genuine parallel duplicates.
+///
+/// Heuristic is conservative: any member that fails any gate keeps
+/// the group visible, so genuine 40-line duplicates sharing a prefix
+/// still surface as refactor candidates. This handles Issue 18
+/// (40-way `parse_<lang>` group) without suppressing real tech debt.
+fn is_entry_point_boilerplate(project_root: &std::path::Path, group: &read::CloneGroup) -> bool {
+    const MAX_ENTRY_POINT_LINES: usize = 2;
+
+    if group.symbols.len() < 2 {
+        return false;
+    }
+    // All members must be free functions - methods with an owner type
+    // already participate in the trait-boilerplate detector.
+    if group
+        .symbols
+        .iter()
+        .any(|(s, _)| s.kind != "function" || s.owner_type.is_some())
+    {
+        return false;
+    }
+    let names: Vec<&str> = group.symbols.iter().map(|(s, _)| s.name.as_str()).collect();
+    let prefix = common_prefix(&names);
+    // Require a strong shared prefix (>= 4 ascii chars, ending in
+    // `_`). Shorter values like `do_` are common accidents that
+    // should not trigger suppression.
+    if prefix.len() < 4 || !prefix.ends_with('_') {
+        return false;
+    }
+    let mut stems: Vec<String> = Vec::new();
+    for n in &names {
+        let stem = n.strip_prefix(prefix).unwrap_or(n);
+        if stem.is_empty() || !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        stems.push(stem.to_string());
+    }
+
+    // Gate 2 + gate 3: each body is tiny AND mentions the stem.
+    // Read each source file at most once.
+    let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
+    for ((sym, file), stem) in group.symbols.iter().zip(stems.iter()) {
+        let body_lines = file_cache.entry(file.path.clone()).or_insert_with(|| {
+            let abs = project_root.join(&file.path);
+            std::fs::read_to_string(&abs)
+                .ok()
+                .map(|s| s.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        });
+        let start = sym.line_start as usize;
+        let end = sym.line_end as usize;
+        if start == 0 || start > body_lines.len() {
+            return false;
+        }
+        let end = end.min(body_lines.len());
+        let span = &body_lines[start - 1..end];
+        let effective_lines = span
+            .iter()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("//")
+            })
+            .count();
+        // Subtract 2 for the function signature + closing brace so
+        // the comparison is against pure body content.
+        let body_only = effective_lines.saturating_sub(2);
+        if body_only > MAX_ENTRY_POINT_LINES {
+            return false;
+        }
+        // Gate 3: the body must literally mention the member's stem.
+        // Accept either an identifier mention (`dispatch::foo`) or a
+        // string-literal mention (`dispatch::parse("foo")`).
+        let body_text = span.join("\n");
+        if !body_text.contains(stem.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Longest leading substring shared by every entry in `names`. Returns
+/// an empty slice when the input is empty or shares no common start.
+fn common_prefix<'a>(names: &[&'a str]) -> &'a str {
+    let Some(first) = names.first() else {
+        return "";
+    };
+    let mut end = first.len();
+    for n in names.iter().skip(1) {
+        end = end.min(n.len());
+        let a = first.as_bytes();
+        let b = n.as_bytes();
+        let mut i = 0;
+        while i < end && a[i] == b[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    &first[..end]
 }
 
 /// Drop every member of `group` whose file path looks like a test file or

@@ -716,7 +716,18 @@ fn resolve_symbol_references(
             // Fall back to the raw list if kind-filtering erased every
             // option - avoids silently dropping edges when a language
             // extractor emits a kind this resolver has not mapped.
+            //
+            // Exception: when the ref is a method-syntax Call
+            // (`via_method_syntax`) and kind-filtering dropped everything,
+            // the candidates are guaranteed to be the wrong kind (fields,
+            // variables, or constants named `filter`, `map`, ...). Falling
+            // back would resolve `.filter()` to a struct field named
+            // `filter` in an imported file. Drop as no-candidate instead.
             let candidates: Vec<&Candidate> = if filtered.is_empty() {
+                if reference.via_method_syntax && reference.kind == ReferenceKind::Call {
+                    dropped_no_candidate += 1;
+                    continue;
+                }
                 raw_candidates.iter().collect()
             } else {
                 filtered
@@ -857,18 +868,59 @@ fn resolve_symbol_references(
             // class. Candidates are narrowed to methods only before the
             // fan-out, so a same-named free function in the pool never gets
             // a phantom reference from what is syntactically a method call.
+            //
+            // Refinement for `via_method_syntax`: when the extractor
+            // flagged the callee as `receiver.method(...)` we additionally
+            // restrict the fan-out to methods in the SAME file as the
+            // caller or in a file the caller imports. Global cross-file
+            // fan-out on method syntax is the main FP source for generic
+            // iterator / Option / Result method names (`filter`, `map`,
+            // `collect`) that collide with same-named fields or functions
+            // in unrelated files. Dropping those cases silently preserves
+            // PageRank accuracy at the cost of the "method looks unused"
+            // FP on types disconnected from the caller's import graph.
             if picked.is_empty() {
                 if candidates.len() == 1 {
-                    picked.push(candidates[0].0);
+                    // The single-candidate shortcut is safe when either:
+                    //  * the reference is NOT a method-syntax Call (plain
+                    //    path references have a stable meaning), or
+                    //  * the sole candidate is in the caller's file or one
+                    //    it imports (the call graph can vouch for it).
+                    // Otherwise a `.filter()` whose only same-named indexed
+                    // symbol is a free fn in an unrelated file would bind
+                    // to that FP. Drop those as ambiguous.
+                    let (sole_sid, sole_fid, _, _) = candidates[0];
+                    let locally_reachable =
+                        *sole_fid == entry.file_id || imported.contains(sole_fid);
+                    let method_syntax_cross_file = reference.via_method_syntax
+                        && reference.kind == ReferenceKind::Call
+                        && reference.qualifier.is_none()
+                        && reference.receiver_type_hint.is_none()
+                        && !locally_reachable;
+                    if method_syntax_cross_file {
+                        dropped_ambiguous += 1;
+                        continue;
+                    }
+                    picked.push(*sole_sid);
                 } else if reference.kind == ReferenceKind::Call
                     && reference.qualifier.is_none()
                     && reference.receiver_type_hint.is_none()
                 {
-                    let method_candidates: Vec<i64> = candidates
-                        .iter()
-                        .filter(|(_, _, k, _)| k == "method")
-                        .map(|c| c.0)
-                        .collect();
+                    let method_candidates: Vec<i64> = if reference.via_method_syntax {
+                        candidates
+                            .iter()
+                            .filter(|(_, fid, k, _)| {
+                                k == "method" && (*fid == entry.file_id || imported.contains(fid))
+                            })
+                            .map(|c| c.0)
+                            .collect()
+                    } else {
+                        candidates
+                            .iter()
+                            .filter(|(_, _, k, _)| k == "method")
+                            .map(|c| c.0)
+                            .collect()
+                    };
                     if !method_candidates.is_empty() {
                         picked.extend(method_candidates);
                     } else {

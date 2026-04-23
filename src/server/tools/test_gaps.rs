@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-04-22
+
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -17,7 +19,57 @@ use crate::graph::blast;
 use crate::guard;
 use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
+use crate::test_paths::is_testable_source_language;
 use crate::toolchain;
+
+/// Extract the module-stem used by crate-rooted `use` imports in Rust.
+///
+/// Rust's `use <crate>::<mod>` refers to a module by its file stem with
+/// hyphens already normalised to underscores; the test-gaps FTS fallback
+/// uses that stem to probe whether any test file body references the
+/// source module even though the edge resolver dropped the import.
+///
+/// Returns `None` for paths the predicate cannot meaningfully probe:
+/// non-file paths, `mod.rs` / `lib.rs` / `main.rs` (their identifier is
+/// the parent directory, not the file), and stems that are not valid
+/// Rust identifiers.
+fn rust_module_stem(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let stem = name.strip_suffix(".rs")?;
+    if matches!(stem, "mod" | "lib" | "main") {
+        return None;
+    }
+    if stem.is_empty() {
+        return None;
+    }
+    if !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    if stem.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// Returns true when any test-file symbol body indexed in the FTS table
+/// mentions `stem` as a token. Used as a fallback coverage signal for
+/// Rust crate-rooted imports (`use <crate>::<stem>`) and subprocess-
+/// style binary tests that the edge graph cannot observe. FTS failures
+/// (missing index, malformed query) are non-fatal and treated as "no
+/// mention" so the caller falls back to the normal edge-based gap rule.
+fn stem_mentioned_in_any_test(
+    conn: &rusqlite::Connection,
+    stem: &str,
+    test_paths: &HashSet<&str>,
+) -> bool {
+    if test_paths.is_empty() {
+        return false;
+    }
+    let Ok(paths) = read::find_file_paths_by_body_text(conn, stem) else {
+        return false;
+    };
+    paths.iter().any(|p| test_paths.contains(p.as_str()))
+}
 
 #[tool_router(router = qartez_test_gaps_router, vis = "pub(super)")]
 impl QartezServer {
@@ -36,6 +88,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulTestGapsParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_test_gaps")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let limit = params.limit.unwrap_or(30) as usize;
         let concise = is_concise(&params.format);
@@ -123,6 +176,21 @@ impl QartezServer {
             }
         }
 
+        // Dispatcher-table fallback: tests that exercise a source file
+        // via a string-keyed dispatcher (e.g.
+        // `server.call_tool_by_name("qartez_find", args)`) never emit
+        // an `import` edge for `tools/find.rs`. Scan every test file
+        // source for string-literal tool names and, when a literal
+        // matches a source file stem (with an optional `<prefix>_`
+        // namespace), credit that source with coverage from this
+        // test. Each test file is read at most once per call.
+        augment_map_with_dispatcher_calls(
+            &self.project_root,
+            ctx,
+            &mut source_to_tests,
+            &mut test_to_sources,
+        );
+
         if let Some(ref fp) = params.file_path {
             let resolved = self.safe_resolve(fp).map_err(|e| e.to_string())?;
             let rel = crate::index::to_forward_slash(
@@ -167,13 +235,34 @@ impl QartezServer {
             if params.include_symbols.unwrap_or(false)
                 && let Some(&file_id) = ctx.path_to_id.get(rel.as_str())
             {
-                let symbols = read::get_symbols_for_file(conn, file_id)
-                    .map_err(|e| format!("DB error: {e}"))?;
-                let exported: Vec<_> = symbols.iter().filter(|s| s.is_exported).collect();
-                if !exported.is_empty() {
-                    out.push_str(&format!("\n{} exported symbols:\n", exported.len(),));
-                    for sym in exported.iter().take(20) {
-                        out.push_str(&format!("  - {} ({})\n", sym.name, sym.kind));
+                // Intersection of `def(file)` and `ref(by test files)`:
+                // show the symbols from the source file that are actually
+                // exercised by its mapped test files. The old behaviour
+                // listed all exports, which misled callers into thinking
+                // every export was covered.
+                let test_ids: Vec<i64> = tests
+                    .iter()
+                    .filter_map(|t| ctx.path_to_id.get(*t).copied())
+                    .collect();
+                if test_ids.is_empty() {
+                    out.push_str(
+                        "\nReferenced symbols: none - tests reach this file via path / FTS mapping, not indexed symbol edges.\n",
+                    );
+                } else {
+                    let referenced = read::test_gaps_referenced_by_tests(conn, file_id, &test_ids)
+                        .map_err(|e| format!("DB error: {e}"))?;
+                    if referenced.is_empty() {
+                        out.push_str(
+                            "\nReferenced symbols: none - no indexed symbol edges from the mapped test files resolve into this source.\n",
+                        );
+                    } else {
+                        out.push_str(&format!(
+                            "\n{} symbol(s) referenced by tests:\n",
+                            referenced.len(),
+                        ));
+                        for sym in referenced.iter().take(20) {
+                            out.push_str(&format!("  - {} ({})\n", sym.name, sym.kind));
+                        }
                     }
                 }
             }
@@ -185,10 +274,14 @@ impl QartezServer {
         entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
 
         let total_covered = entries.len();
+        // Source-file counts exclude file types that cannot
+        // meaningfully hold unit tests (shell scripts, TOML manifests,
+        // YAML, Dockerfile). Keeping them in the denominator would
+        // understate the coverage ratio the tool reports to the user.
         let total_source = ctx
             .all_files
             .iter()
-            .filter(|f| !is_test_path(&f.path))
+            .filter(|f| !is_test_path(&f.path) && is_testable_source_language(&f.language))
             .count();
         let total_test = ctx
             .all_files
@@ -235,6 +328,29 @@ impl QartezServer {
     ) -> Result<String, String> {
         let min_pagerank = params.min_pagerank.unwrap_or(0.0);
 
+        // Resolve the optional scope filter. Without this, `gaps` ignored
+        // `file_path` entirely and always walked the whole project, which
+        // contradicts the documented "scope to a single file path" contract.
+        // Two modes are supported:
+        //   - exact file path match (e.g. `src/foo.rs`)
+        //   - directory prefix match (e.g. `src/` or `src/server`)
+        // The prefix form lets callers narrow gaps to a subtree without
+        // listing every file.
+        let scope_rel: Option<String> = match params.file_path.as_ref() {
+            None => None,
+            Some(raw) => {
+                let resolved = self.safe_resolve(raw).map_err(|e| e.to_string())?;
+                let rel = crate::index::to_forward_slash(
+                    resolved
+                        .strip_prefix(&self.project_root)
+                        .unwrap_or(&resolved)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                Some(rel)
+            }
+        };
+
         let all_syms =
             read::get_all_symbols_with_path(conn).map_err(|e| format!("DB error: {e}"))?;
         let mut max_cc_by_path: HashMap<&str, u32> = HashMap::new();
@@ -254,11 +370,46 @@ impl QartezServer {
             (cc_h + coupling_h + churn_h) / 3.0
         };
 
+        // Precompute the set of test-file paths so the FTS-body fallback
+        // can classify a lookup hit as "mentioned by a test" without a
+        // second pass over `all_files`.
+        let test_paths: HashSet<&str> = ctx
+            .all_files
+            .iter()
+            .filter(|f| is_test_path(&f.path))
+            .map(|f| f.path.as_str())
+            .collect();
+
         let mut gaps: Vec<(&crate::storage::models::FileRow, f64)> = Vec::new();
 
         for file in ctx.all_files {
             if is_test_path(&file.path) || file.pagerank < min_pagerank {
                 continue;
+            }
+            // Filter out indexed-but-not-testable file types (shell
+            // scripts, Cargo manifests, Dockerfile, YAML, etc.). They
+            // enter the DB for dependency / security analysis but do
+            // not support unit tests, so flagging them as coverage
+            // gaps is always a false positive.
+            if !is_testable_source_language(&file.language) {
+                continue;
+            }
+            // Honour the optional `file_path` scope. Accept either an
+            // exact path match or a directory prefix so callers can
+            // narrow to a subtree (e.g. `src/server`) without listing
+            // every leaf file.
+            if let Some(ref scope) = scope_rel {
+                let fp = file.path.as_str();
+                let under_dir = {
+                    let dir = scope.trim_end_matches('/');
+                    !dir.is_empty()
+                        && (fp == dir
+                            || fp.starts_with(&format!("{dir}/"))
+                            || scope.ends_with('/') && fp.starts_with(scope.as_str()))
+                };
+                if fp != scope.as_str() && !under_dir {
+                    continue;
+                }
             }
 
             let has_test_importer = ctx.reverse.get(&file.id).is_some_and(|importers| {
@@ -269,8 +420,23 @@ impl QartezServer {
                 })
             });
 
-            let covered =
+            let mut covered =
                 has_test_importer || has_inline_rust_tests(&self.project_root, &file.path);
+
+            // FTS-body fallback for Rust crate-rooted imports. The
+            // edge resolver only recognises `crate::`, `super::`, and
+            // `self::` prefixes, so `use <crate_name>::<module>` in a
+            // tests/*.rs file never emits an import edge. Before
+            // flagging the source as untested, probe whether any test
+            // file body mentions the module stem - this catches both
+            // crate-rooted imports and subprocess-style tests that
+            // spawn `cargo run --bin <name>`.
+            if !covered
+                && let Some(stem) = rust_module_stem(&file.path)
+                && stem_mentioned_in_any_test(conn, &stem, &test_paths)
+            {
+                covered = true;
+            }
 
             if !covered {
                 let max_cc = max_cc_by_path.get(file.path.as_str()).copied().unwrap_or(0) as f64;
@@ -284,16 +450,32 @@ impl QartezServer {
         gaps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         if gaps.is_empty() {
-            return Ok(
-                "No untested source files found. All source files are covered by an external test file import or inline Rust tests (`#[cfg(test)]` / `#[test]`)."
-                    .to_string(),
-            );
+            let msg = match scope_rel.as_deref() {
+                Some(scope) => format!(
+                    "No untested source files found under scope `{scope}`. All files within the scope are covered by an external test file import or inline Rust tests (`#[cfg(test)]` / `#[test]`)."
+                ),
+                None => "No untested source files found. All source files are covered by an external test file import or inline Rust tests (`#[cfg(test)]` / `#[test]`).".to_string(),
+            };
+            return Ok(msg);
         }
 
+        // Denominator tracks the same scope the gap list reports against.
+        // Without this, scoping to `src/server` would still show the
+        // project-wide count of testable source files, which is
+        // misleading.
         let total_source = ctx
             .all_files
             .iter()
-            .filter(|f| !is_test_path(&f.path))
+            .filter(|f| !is_test_path(&f.path) && is_testable_source_language(&f.language))
+            .filter(|f| match scope_rel.as_deref() {
+                None => true,
+                Some(scope) => {
+                    let dir = scope.trim_end_matches('/');
+                    f.path == scope
+                        || (!dir.is_empty()
+                            && (f.path.as_str() == dir || f.path.starts_with(&format!("{dir}/"))))
+                }
+            })
             .count();
         let gap_count = gaps.len();
         let shown = gap_count.min(limit);
@@ -356,11 +538,29 @@ impl QartezServer {
             .iter()
             .map(|s| s.as_str())
             .filter(|p| !is_test_path(p))
+            .filter(|p| {
+                // Skip non-testable file types (shell scripts, Cargo
+                // manifests, YAML, Dockerfile). Flagging them as
+                // "needs new tests" is noise. Unindexed paths fall
+                // through (handled as untested below).
+                ctx.path_to_id
+                    .get(p)
+                    .and_then(|id| ctx.id_to_file.get(id))
+                    .map(|f| is_testable_source_language(&f.language))
+                    .unwrap_or(true)
+            })
             .collect();
         let changed_tests: Vec<&str> = changed
             .iter()
             .map(|s| s.as_str())
             .filter(|p| is_test_path(p))
+            .collect();
+
+        let test_paths: HashSet<&str> = ctx
+            .all_files
+            .iter()
+            .filter(|f| is_test_path(&f.path))
+            .map(|f| f.path.as_str())
             .collect();
 
         let mut tests_to_run: HashMap<String, Vec<String>> = HashMap::new();
@@ -396,7 +596,18 @@ impl QartezServer {
                 }
             }
 
-            if found_tests.is_empty() && !has_inline_rust_tests(&self.project_root, src_path) {
+            // Crate-rooted import fallback (see `test_gaps_find`): a
+            // tests/*.rs calling `qartez_mcp::cli_runner::run(...)`
+            // emits no import edge, so back-stop with the FTS body
+            // index over the full test-file set.
+            let has_fts_mention = rust_module_stem(src_path)
+                .map(|stem| stem_mentioned_in_any_test(conn, &stem, &test_paths))
+                .unwrap_or(false);
+
+            if found_tests.is_empty()
+                && !has_inline_rust_tests(&self.project_root, src_path)
+                && !has_fts_mention
+            {
                 untested_sources.push(src_path);
             } else if !found_tests.is_empty() {
                 for t in &found_tests {
@@ -467,5 +678,104 @@ impl QartezServer {
         }
 
         Ok(out)
+    }
+}
+
+/// Regex source for the string-literal arguments of `call_tool_by_name`
+/// style dispatchers. Keep this open to whitespace after the opener and
+/// between the literal and the comma so clippy-formatted callers match.
+/// The captured literal's trailing quote is dropped by the match end.
+const DISPATCHER_CALL_REGEX: &str = r#"call_tool_by_name\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)""#;
+
+/// Augment the import-based `source_to_tests` / `test_to_sources` maps
+/// with a dispatcher-table fallback. When a test file body contains a
+/// `call_tool_by_name("X", ...)` style pattern and `X` (or a
+/// `<prefix>_<stem>` shape) matches a non-test source file stem in the
+/// index, credit that source with coverage from the test file.
+///
+/// `test_paths` are the tests to scan (already filtered from
+/// `ctx.all_files`); `source_stems` maps lowercased source stems to
+/// the `&str` slice inside `ctx.all_files` so the borrowed lifetimes
+/// of the resulting HashMaps stay consistent with the import-based
+/// entries populated earlier.
+fn augment_map_with_dispatcher_calls<'a>(
+    project_root: &std::path::Path,
+    ctx: &'a TestGapsCtx<'a>,
+    source_to_tests: &mut HashMap<&'a str, Vec<&'a str>>,
+    test_to_sources: &mut HashMap<&'a str, Vec<&'a str>>,
+) {
+    let Ok(re) = regex::Regex::new(DISPATCHER_CALL_REGEX) else {
+        return;
+    };
+
+    // Build `stem -> source file path slice` index once up front. A
+    // given stem can resolve to multiple files (e.g. two languages
+    // defining the same module name); every match is credited.
+    let mut stem_to_sources: HashMap<String, Vec<&'a str>> = HashMap::new();
+    for file in ctx.all_files {
+        if is_test_path(&file.path) {
+            continue;
+        }
+        let Some(name) = file.path.rsplit('/').next() else {
+            continue;
+        };
+        let stem = match name.rfind('.') {
+            Some(dot) => &name[..dot],
+            None => name,
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        stem_to_sources
+            .entry(stem.to_ascii_lowercase())
+            .or_default()
+            .push(file.path.as_str());
+    }
+
+    // Track existing edges so dispatcher-only coverage never
+    // double-credits a source that already has an import edge.
+    let mut seen: HashSet<(&'a str, &'a str)> = HashSet::new();
+    for (&src, tests) in source_to_tests.iter() {
+        for &t in tests {
+            seen.insert((src, t));
+        }
+    }
+
+    for file in ctx.all_files {
+        if !is_test_path(&file.path) {
+            continue;
+        }
+        let abs = project_root.join(&file.path);
+        let Ok(body) = std::fs::read_to_string(&abs) else {
+            continue;
+        };
+        let mut literals: HashSet<String> = HashSet::new();
+        for cap in re.captures_iter(&body) {
+            if let Some(m) = cap.get(1) {
+                literals.insert(m.as_str().to_ascii_lowercase());
+            }
+        }
+        if literals.is_empty() {
+            continue;
+        }
+        let test_path: &'a str = file.path.as_str();
+        for literal in &literals {
+            // Accept direct-stem and `<prefix>_<stem>` shapes so
+            // dispatcher keys that namespace tool names (e.g.
+            // `qartez_find` -> `find.rs`) resolve to the right file.
+            let candidates: Vec<&str> = std::iter::once(literal.as_str())
+                .chain(literal.split('_').skip(1).take(1))
+                .collect();
+            for cand in candidates {
+                if let Some(sources) = stem_to_sources.get(cand) {
+                    for &src_path in sources {
+                        if seen.insert((src_path, test_path)) {
+                            source_to_tests.entry(src_path).or_default().push(test_path);
+                            test_to_sources.entry(test_path).or_default().push(src_path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

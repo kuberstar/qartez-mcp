@@ -225,6 +225,7 @@ fn record_reference(
                     kind: ReferenceKind::Call,
                     qualifier: None,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }
@@ -247,6 +248,7 @@ fn record_reference(
                     kind: ReferenceKind::Call,
                     qualifier: None,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }
@@ -270,6 +272,7 @@ fn record_reference(
                     kind: ReferenceKind::TypeRef,
                     qualifier: None,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }

@@ -83,8 +83,14 @@ impl QartezServer {
             0
         };
 
+        // `edges=N` is the number of distinct directed file-to-file import
+        // edges. Per-file `importers` / `imports` counters are slices of
+        // this same set grouped by the `to_file` / `from_file` column, so
+        // summing the per-file importer counts over every file equals the
+        // global edge total. The qualifier is spelled out so callers do
+        // not confuse it with a pair count or a symbol-ref count.
         let mut out = format!(
-            "files={} (src={}/test={}) loc={}/{} syms={} edges={} with_symbols={}/{}\n",
+            "files={} (src={}/test={}) loc={}/{} syms={} edges={} (distinct directed file imports) with_symbols={}/{}\n",
             file_count,
             src_files.len(),
             test_files.len(),

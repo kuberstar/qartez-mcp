@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-04-22
+
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -23,7 +25,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_hierarchy",
-        description = "Query the type hierarchy: find all types that implement a trait/interface, or all traits/interfaces a type implements. Works across Rust (impl Trait for Type), TypeScript/Java (extends/implements), Python (base classes), and Go (interface embedding)."
+        description = "Query the type hierarchy: find all types that implement a trait/interface, or all traits/interfaces a type implements. Works across Rust (impl Trait for Type), TypeScript/Java (extends/implements), Python (base classes), and Go (interface embedding). `max_depth=0` returns only the seed symbol with no children or parents."
     )]
     pub(in crate::server) fn qartez_hierarchy(
         &self,
@@ -42,6 +44,25 @@ impl QartezServer {
                 transitive,
                 max_depth,
             );
+        }
+
+        if max_depth == 0 {
+            // max_depth=0 is the documented "seed-only" shortcut: the
+            // caller just wants to confirm the symbol itself is in scope
+            // without paying for either a direct or a transitive walk.
+            match direction.as_str() {
+                "sub" | "down" | "implementors" | "super" | "up" | "supertypes" => {
+                    return Ok(format!(
+                        "# Seed symbol only (max_depth=0): '{}'\n\nNo children or parents traversed. Increase max_depth to walk the hierarchy.\n",
+                        params.symbol
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "Invalid direction '{direction}'. Use 'sub' (what implements this?) or 'super' (what does this implement?)."
+                    ));
+                }
+            }
         }
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
@@ -187,6 +208,11 @@ impl QartezServer {
 
 impl QartezServer {
     /// Render type hierarchy as a Mermaid flowchart.
+    ///
+    /// Honors the "seed-only" shortcut: `max_depth=0` renders a single
+    /// node representing the requested symbol, matching the textual
+    /// tool's contract so the mermaid path doesn't silently return a
+    /// full traversal.
     fn qartez_hierarchy_mermaid(
         &self,
         symbol: &str,
@@ -194,6 +220,26 @@ impl QartezServer {
         transitive: bool,
         max_depth: u32,
     ) -> Result<String, String> {
+        if max_depth == 0 {
+            match direction {
+                "sub" | "down" | "implementors" | "super" | "up" | "supertypes" => {
+                    let root_id = helpers::mermaid_node_id(symbol);
+                    let root_label = helpers::mermaid_label(symbol);
+                    let dir_tag = if matches!(direction, "super" | "up" | "supertypes") {
+                        "BT"
+                    } else {
+                        "TD"
+                    };
+                    return Ok(format!("graph {dir_tag}\n  {root_id}[\"{root_label}\"]\n"));
+                }
+                _ => {
+                    return Err(format!(
+                        "Invalid direction '{direction}'. Use 'sub' or 'super'."
+                    ));
+                }
+            }
+        }
+
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let max_nodes = 50;
         let mut count = 0usize;

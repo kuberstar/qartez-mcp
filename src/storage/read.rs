@@ -68,8 +68,11 @@ pub fn sanitize_fts_query(raw: &str) -> String {
 }
 
 /// One symbol resolution: the symbol itself, the file that defines it, and the
-/// edges + source files that import the defining file.
-pub type SymbolWithImporters = (SymbolRow, FileRow, Vec<(EdgeRow, FileRow)>);
+/// edges + source files that import the defining file. The trailing `i64`
+/// carries the `from_symbol_id` so callers can distinguish a recursive
+/// self-reference (caller == target symbol) from a legitimate intra-file
+/// reference (caller is a different symbol in the same file).
+pub type SymbolWithImporters = (SymbolRow, FileRow, Vec<(EdgeRow, FileRow, i64)>);
 
 fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
     Ok(FileRow {
@@ -341,6 +344,45 @@ pub fn get_all_symbol_refs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     Ok(refs)
 }
 
+/// Test-gaps helper: symbols defined in `source_file_id` that are referenced
+/// by at least one symbol inside any of `test_file_ids`. Used by
+/// `qartez_test_gaps mode=map include_symbols=true` to answer the question
+/// "which exports of this source are actually exercised by its mapped test
+/// files?" - the intersection of `def(source)` and `ref(by tests)`.
+pub fn test_gaps_referenced_by_tests(
+    conn: &Connection,
+    source_file_id: i64,
+    test_file_ids: &[i64],
+) -> Result<Vec<crate::storage::models::SymbolRow>> {
+    if test_file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; test_file_ids.len()].join(",");
+    let sql = format!(
+        "SELECT DISTINCT s.id, s.file_id, s.name, s.kind, s.line_start, s.line_end,
+                s.signature, s.is_exported, s.shape_hash, s.parent_id, s.pagerank,
+                s.complexity, s.owner_type
+         FROM symbols s
+         JOIN symbol_refs r ON r.to_symbol_id = s.id
+         JOIN symbols fs ON fs.id = r.from_symbol_id
+         WHERE s.file_id = ?1 AND fs.file_id IN ({placeholders})
+         ORDER BY s.line_start",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(1 + test_file_ids.len());
+    params.push(Box::new(source_file_id));
+    for id in test_file_ids {
+        params.push(Box::new(*id));
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), row_to_symbol)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// All symbols in the DB, used as the node set for `compute_symbol_pagerank`
 /// so even unreferenced symbols end up with a valid (zero-ish) rank. Wraps
 /// `get_symbols_for_file` across every file with a single query instead of N.
@@ -565,6 +607,95 @@ pub struct CloneGroup {
     pub symbols: Vec<(SymbolRow, FileRow)>,
 }
 
+/// Return every clone group unpaginated, ordered by group size desc with
+/// a deterministic tiebreaker derived from the first member's
+/// `(file.path, symbol.line_start, shape_hash)`. Intended for callers
+/// that need to apply their own in-memory filter (e.g. dropping
+/// test-only groups) before paging, since SQL-level pagination becomes
+/// unstable once rows are filtered out post-query.
+///
+/// Applies the same `(file_id, line_start, line_end)` dedup rule as
+/// [`count_clone_groups`]: multi-indexed symbols at the same physical
+/// span count once, and groups that collapse below the 2-member
+/// threshold are dropped.
+pub fn clones_get_all_ordered_groups(conn: &Connection, min_lines: u32) -> Result<Vec<CloneGroup>> {
+    let mut hash_stmt = conn.prepare(
+        "SELECT shape_hash,
+                COUNT(DISTINCT file_id || ':' || line_start || ':' || line_end) as cnt
+         FROM symbols
+         WHERE shape_hash IS NOT NULL
+           AND (line_end - line_start + 1) >= ?1
+         GROUP BY shape_hash
+         HAVING cnt >= 2",
+    )?;
+
+    let hashes: Vec<(String, i64)> = hash_stmt
+        .query_map(rusqlite::params![min_lines], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let members_sql = format!(
+        "SELECT {SYMBOL_FILE_JOIN_COLS}
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.shape_hash = ?1
+         ORDER BY f.path, s.line_start"
+    );
+    let mut members_stmt = conn.prepare(&members_sql)?;
+
+    let mut groups = Vec::<(i64, CloneGroup)>::with_capacity(hashes.len());
+    for (hash, cnt) in &hashes {
+        let raw: Vec<(SymbolRow, FileRow)> = members_stmt
+            .query_map([hash], |row| {
+                Ok((row_to_symbol(row)?, row_to_file_joined(row)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut seen: std::collections::HashSet<(i64, u32, u32)> = std::collections::HashSet::new();
+        let syms: Vec<(SymbolRow, FileRow)> = raw
+            .into_iter()
+            .filter(|(sym, _)| seen.insert((sym.file_id, sym.line_start, sym.line_end)))
+            .collect();
+        groups.push((
+            *cnt,
+            CloneGroup {
+                shape_hash: hash.clone(),
+                symbols: syms,
+            },
+        ));
+    }
+
+    // Stable sort: size desc, then first member's (path, line_start) asc,
+    // then shape_hash asc so two groups with identical tiebreakers still
+    // produce a deterministic ordering.
+    groups.sort_by(|a, b| {
+        let (cnt_a, ga) = a;
+        let (cnt_b, gb) = b;
+        cnt_b
+            .cmp(cnt_a)
+            .then_with(|| {
+                let (first_a_path, first_a_line) = ga
+                    .symbols
+                    .first()
+                    .map(|(s, f)| (f.path.as_str(), s.line_start))
+                    .unwrap_or(("", 0));
+                let (first_b_path, first_b_line) = gb
+                    .symbols
+                    .first()
+                    .map(|(s, f)| (f.path.as_str(), s.line_start))
+                    .unwrap_or(("", 0));
+                first_a_path
+                    .cmp(first_b_path)
+                    .then_with(|| first_a_line.cmp(&first_b_line))
+            })
+            .then_with(|| ga.shape_hash.cmp(&gb.shape_hash))
+    });
+
+    Ok(groups.into_iter().map(|(_, g)| g).collect())
+}
+
 /// Return clone groups ordered by group size (largest first), with pagination.
 ///
 /// Applies the same `(file_id, line_start, line_end)` dedup rule as
@@ -651,19 +782,25 @@ pub fn get_symbol_references(
 
     for (sym, file) in symbols {
         // Query symbol_refs for every symbol that points at this definition
-        // and hydrate the caller's file row in a single JOIN.
+        // and hydrate the caller's file row in a single JOIN. `DISTINCT` is
+        // intentionally dropped on the `(from_symbol_id, file_id)` pair so
+        // refs.rs can tell a self-reference apart from a sibling-symbol
+        // reference that happens to live in the same file.
         let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT f.id, f.path, f.mtime_ns, f.size_bytes, f.language,
-                             f.line_count, f.pagerank, f.indexed_at, f.change_count
+            "SELECT DISTINCT s.id AS from_symbol_id, f.id, f.path, f.mtime_ns, f.size_bytes,
+                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count
              FROM symbol_refs r
              JOIN symbols s ON s.id = r.from_symbol_id
              JOIN files f ON f.id = s.file_id
              WHERE r.to_symbol_id = ?1",
         )?;
-        let rows = stmt.query_map([sym.id], row_to_file)?;
-        let mut importers: Vec<(EdgeRow, FileRow)> = Vec::new();
+        let rows = stmt.query_map([sym.id], |row| {
+            let from_sym: i64 = row.get("from_symbol_id")?;
+            Ok((from_sym, row_to_file(row)?))
+        })?;
+        let mut importers: Vec<(EdgeRow, FileRow, i64)> = Vec::new();
         for row in rows {
-            let importer_file = row?;
+            let (from_symbol_id, importer_file) = row?;
             // Synthesise an EdgeRow so callers that still read
             // `edge.from_file` / `edge.kind` keep compiling. The `id` field
             // is meaningless for synthesised edges and is set to 0 so any
@@ -678,6 +815,7 @@ pub fn get_symbol_references(
                     specifier: None,
                 },
                 importer_file,
+                from_symbol_id,
             ));
         }
         results.push((sym, file, importers));
@@ -724,32 +862,98 @@ pub fn get_symbol_count(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// Aggregate per-language stats: file count, total LOC, total bytes, total
+/// symbol count.
+///
+/// Historically this LEFT JOINed `files` with `symbols` and applied
+/// `SUM(f.line_count)` plus `SUM(f.size_bytes)` on the joined row set,
+/// which multiplied each file's LOC and byte count by the number of
+/// symbols it defined. A 94 kLOC Rust codebase with ~100 symbols per
+/// file then reported line counts in the millions. The fix aggregates
+/// symbol counts in a subquery so the outer sum runs over distinct
+/// files only.
+///
+/// JavaScript files are routed through the TypeScript language support
+/// at index time and stored with `language = "typescript"`. This is
+/// convenient for the parser-level code path but misleading at report
+/// time; this function re-buckets files whose path ends in a JS
+/// extension (`.js`, `.jsx`, `.mjs`, `.cjs`) back to `"javascript"` so
+/// callers see a faithful language breakdown.
 pub fn get_language_stats(conn: &Connection) -> Result<Vec<LanguageStat>> {
     let mut stmt = conn.prepare(
         "SELECT f.language,
-                COUNT(DISTINCT f.id) as count,
-                COALESCE(SUM(f.line_count), 0) as lines,
-                COALESCE(SUM(f.size_bytes), 0) as bytes,
-                COALESCE(COUNT(s.id), 0) as symbols
+                f.path,
+                f.line_count,
+                f.size_bytes,
+                COALESCE(s.sym_count, 0) AS sym_count
          FROM files f
-         LEFT JOIN symbols s ON s.file_id = f.id
-         GROUP BY f.language
-         ORDER BY count DESC",
+         LEFT JOIN (
+             SELECT file_id, COUNT(*) AS sym_count
+             FROM symbols
+             GROUP BY file_id
+         ) s ON s.file_id = f.id",
     )?;
+
+    struct FileRowForLang {
+        language: String,
+        path: String,
+        line_count: i64,
+        byte_count: i64,
+        symbol_count: i64,
+    }
     let rows = stmt.query_map([], |row| {
-        Ok(LanguageStat {
+        Ok(FileRowForLang {
             language: row.get::<_, String>(0)?,
-            file_count: row.get::<_, i64>(1)?,
+            path: row.get::<_, String>(1)?,
             line_count: row.get::<_, i64>(2)?,
             byte_count: row.get::<_, i64>(3)?,
             symbol_count: row.get::<_, i64>(4)?,
         })
     })?;
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
+
+    let mut bucket: std::collections::HashMap<String, LanguageStat> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let r = r?;
+        let lang = reclassify_language(&r.language, &r.path);
+        let entry = bucket.entry(lang.clone()).or_insert(LanguageStat {
+            language: lang,
+            file_count: 0,
+            line_count: 0,
+            byte_count: 0,
+            symbol_count: 0,
+        });
+        entry.file_count += 1;
+        entry.line_count += r.line_count;
+        entry.byte_count += r.byte_count;
+        entry.symbol_count += r.symbol_count;
     }
+    let mut results: Vec<LanguageStat> = bucket.into_values().collect();
+    results.sort_by(|a, b| {
+        b.file_count
+            .cmp(&a.file_count)
+            .then_with(|| a.language.cmp(&b.language))
+    });
     Ok(results)
+}
+
+/// Map a stored `language` label back to a user-facing label based on the
+/// file extension. Currently rebuckets JavaScript files (stored as
+/// `typescript` because they share a `LanguageSupport` impl) back to
+/// `javascript`. Extend here if other language families collapse into a
+/// single bucket at index time.
+fn reclassify_language(stored: &str, path: &str) -> String {
+    if stored == "typescript" {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".js")
+            || lower.ends_with(".jsx")
+            || lower.ends_with(".mjs")
+            || lower.ends_with(".cjs")
+        {
+            return "javascript".to_string();
+        }
+    }
+    stored.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1072,6 +1276,137 @@ fn row_to_symbol_at(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<Symb
         complexity: row.get(offset + 11)?,
         owner_type: row.get(offset + 12)?,
     })
+}
+
+/// Narrow `find_symbol_by_name` to a single `(kind, file_path)` slot without
+/// re-issuing the SQL query. Returns every symbol that matches the name, a
+/// case-insensitive kind equality when `kind_hint` is set, and an exact
+/// file-path match when `file_path_hint` is set.
+///
+/// Used by the refactor tools (`qartez_rename`, `qartez_safe_delete`,
+/// `qartez_replace_symbol`, etc.) to apply disambiguation filters on top
+/// of the generic name lookup.
+pub fn find_symbol_by_name_filtered(
+    conn: &Connection,
+    name: &str,
+    kind_hint: Option<&str>,
+    file_path_hint: Option<&str>,
+) -> Result<Vec<(SymbolRow, FileRow)>> {
+    let mut results = find_symbol_by_name(conn, name)?;
+    if let Some(k) = kind_hint.filter(|s| !s.is_empty()) {
+        results.retain(|(s, _)| s.kind.eq_ignore_ascii_case(k));
+    }
+    if let Some(fp) = file_path_hint.filter(|s| !s.is_empty()) {
+        let fp_norm = crate::index::to_forward_slash(fp.to_string());
+        results.retain(|(_, f)| f.path == fp_norm);
+    }
+    Ok(results)
+}
+
+/// Filtered variant of `get_symbol_references` that narrows the resolution
+/// step by `kind` / `file_path` before computing the reference set. Used
+/// by `qartez_rename` and `qartez_safe_delete` so the returned importers
+/// belong to exactly one disambiguated symbol rather than every same-named
+/// definition in the project.
+pub fn get_symbol_references_filtered(
+    conn: &Connection,
+    symbol_name: &str,
+    kind_hint: Option<&str>,
+    file_path_hint: Option<&str>,
+) -> Result<Vec<SymbolWithImporters>> {
+    let symbols = find_symbol_by_name_filtered(conn, symbol_name, kind_hint, file_path_hint)?;
+    let mut results = Vec::new();
+
+    for (sym, file) in symbols {
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT s.id AS from_symbol_id, f.id, f.path, f.mtime_ns, f.size_bytes,
+                             f.language, f.line_count, f.pagerank, f.indexed_at, f.change_count
+             FROM symbol_refs r
+             JOIN symbols s ON s.id = r.from_symbol_id
+             JOIN files f ON f.id = s.file_id
+             WHERE r.to_symbol_id = ?1",
+        )?;
+        let rows = stmt.query_map([sym.id], |row| {
+            let from_sym: i64 = row.get("from_symbol_id")?;
+            Ok((from_sym, row_to_file(row)?))
+        })?;
+        let mut importers: Vec<(EdgeRow, FileRow, i64)> = Vec::new();
+        for row in rows {
+            let (from_symbol_id, importer_file) = row?;
+            importers.push((
+                EdgeRow {
+                    id: 0,
+                    from_file: importer_file.id,
+                    to_file: file.id,
+                    kind: "symbol_ref".to_string(),
+                    specifier: None,
+                },
+                importer_file,
+                from_symbol_id,
+            ));
+        }
+        results.push((sym, file, importers));
+    }
+
+    Ok(results)
+}
+
+// Tool-scoped helpers below. These are thin wrappers over existing
+// readers used by `qartez_wiki`, `qartez_boundaries` and
+// `qartez_hierarchy`. They exist so the tool implementations can
+// reference storage queries through a single, stable surface without
+// widening the public API of the generic helpers above.
+
+/// Returns the number of rows in the `file_clusters` table.
+///
+/// Used by `qartez_wiki` and `qartez_boundaries` to decide whether a
+/// clustering pass has ever been run for this project. A zero count is
+/// the signal that `qartez_boundaries suggest=true` would otherwise
+/// fail with `No cluster assignment found`.
+pub fn wiki_cluster_row_count(conn: &Connection) -> Result<i64> {
+    get_file_clusters_count(conn)
+}
+
+/// Returns every `(file_id, cluster_id)` pair stored in `file_clusters`.
+///
+/// Exposed to `qartez_boundaries` so the `suggest=true` path can read
+/// the live cluster assignment without depending on the generic reader
+/// name.
+pub fn boundaries_file_cluster_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    get_all_file_clusters(conn)
+}
+
+/// Returns every `(src_file_id, dst_file_id)` edge, used by
+/// `qartez_boundaries suggest=true` when deriving candidate rules from
+/// the current clustering.
+pub fn boundaries_edge_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    get_all_edges(conn)
+}
+
+/// Returns every file row, used by `qartez_boundaries suggest=true`.
+pub fn boundaries_all_files(conn: &Connection) -> Result<Vec<FileRow>> {
+    get_all_files(conn)
+}
+
+/// Returns direct subtypes (implementors / extenders) of `name`.
+///
+/// Exposed so `qartez_hierarchy` can short-circuit the "max_depth=0"
+/// path without reaching into the generic reader. Callers that want the
+/// transitive closure should still use [`get_subtypes`] plus their own
+/// BFS bound.
+pub fn hierarchy_direct_subtypes(
+    conn: &Connection,
+    name: &str,
+) -> Result<Vec<(crate::storage::models::TypeHierarchyRow, FileRow)>> {
+    get_subtypes(conn, name)
+}
+
+/// Returns direct supertypes (traits / interfaces / parents) of `name`.
+pub fn hierarchy_direct_supertypes(
+    conn: &Connection,
+    name: &str,
+) -> Result<Vec<(crate::storage::models::TypeHierarchyRow, FileRow)>> {
+    get_supertypes(conn, name)
 }
 
 #[cfg(test)]

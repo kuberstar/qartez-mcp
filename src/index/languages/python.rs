@@ -194,6 +194,7 @@ fn record_reference(
                 kind: ReferenceKind::Call,
                 qualifier: None,
                 receiver_type_hint: None,
+                via_method_syntax: false,
             });
         }
     }

@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-04-22
+
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -18,6 +20,34 @@ use crate::guard;
 use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
 use crate::toolchain;
+
+/// Hard ceiling on traversal depth. Hub-function call graphs can explode
+/// combinatorially, so even with an explicit user request the walker will
+/// never recurse more than this many levels.
+const MAX_CALL_DEPTH: usize = 10;
+/// Default per-section row cap when the caller does not pass `limit`.
+const DEFAULT_LIMIT: usize = 50;
+/// Default output token budget when the caller does not pass `token_budget`.
+const DEFAULT_TOKEN_BUDGET: usize = 4000;
+
+/// One call site extracted from a caller body with its full prefix path
+/// (e.g. `Foo::new`, `self.method`, `obj.method`). The prefix is used to
+/// disambiguate same-named callees that belong to different types.
+#[derive(Clone)]
+struct CallSite {
+    name: String,
+    line: usize,
+    /// The left-hand qualifier before the final call name, if any. For
+    /// `Foo::bar()` this is `Some("Foo")`; for `self.bar()` this is
+    /// `Some("self")`; for bare `bar()` this is `None`.
+    qualifier: Option<String>,
+    /// True when the call uses `receiver.method(...)` syntax. Callees
+    /// of this shape cannot safely bind to cross-file free functions
+    /// that are not reachable through the caller's imports - those are
+    /// almost always same-named unrelated symbols (e.g. a field named
+    /// `filter` colliding with `Iterator::filter`).
+    via_method_syntax: bool,
+}
 
 #[tool_router(router = qartez_calls_router, vis = "pub(super)")]
 impl QartezServer {
@@ -41,8 +71,13 @@ impl QartezServer {
         let want_callers = matches!(direction, CallDirection::Callers | CallDirection::Both);
         let want_callees = matches!(direction, CallDirection::Callees | CallDirection::Both);
         // Depth=1 is the default after the 2026-04 compaction: depth=2 can
-        // explode on hub functions, so callers opt in explicitly.
-        let max_depth = params.depth.unwrap_or(1) as usize;
+        // explode on hub functions, so callers opt in explicitly. Clamp to
+        // MAX_CALL_DEPTH so pathological requests do not recurse forever.
+        let requested_depth = params.depth.unwrap_or(1) as usize;
+        let max_depth = requested_depth.clamp(1, MAX_CALL_DEPTH);
+        let limit = params.limit.unwrap_or(DEFAULT_LIMIT as u32) as usize;
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
+        let include_tests = params.include_tests.unwrap_or(false);
 
         // Lock 1: resolve the target symbol and fetch the file list.
         let (symbols, all_files) = {
@@ -109,15 +144,34 @@ impl QartezServer {
                     &mut file_syms_cache,
                     &mut out,
                     concise,
+                    limit,
+                    token_budget,
+                    include_tests,
                 )?;
             }
 
             if want_callees {
-                self.append_callees(sym, def_file, &mut resolve_cache, &mut out, concise)?;
+                self.append_callees(
+                    sym,
+                    def_file,
+                    &mut resolve_cache,
+                    &mut out,
+                    concise,
+                    limit,
+                    token_budget,
+                )?;
             }
 
             if max_depth > 1 && want_callees {
-                self.append_depth2(sym, def_file, &mut resolve_cache, &mut out)?;
+                self.append_deep_callees(
+                    sym,
+                    def_file,
+                    &mut resolve_cache,
+                    &mut out,
+                    max_depth,
+                    limit,
+                    token_budget,
+                )?;
             }
         }
 
@@ -126,6 +180,7 @@ impl QartezServer {
 }
 
 impl QartezServer {
+    #[allow(clippy::too_many_arguments)]
     fn append_callers(
         &self,
         name: &str,
@@ -133,11 +188,17 @@ impl QartezServer {
         file_syms_cache: &mut HashMap<i64, Vec<crate::storage::models::SymbolRow>>,
         out: &mut String,
         concise: bool,
+        limit: usize,
+        token_budget: usize,
+        include_tests: bool,
     ) -> Result<(), String> {
         // Scan phase (no lock): FS reads + tree-sitter parsing for every
         // file. This is the heaviest phase and must not hold the db mutex.
         let mut raw_sites: Vec<(i64, String, Vec<usize>)> = Vec::new();
         for file in all_files {
+            if !include_tests && helpers::is_test_path(&file.path) {
+                continue;
+            }
             let source = match self.cached_source(&file.path) {
                 Some(s) => s,
                 None => continue,
@@ -157,9 +218,12 @@ impl QartezServer {
         }
 
         // Resolve phase (lock 2): fetch per-file symbol lists to find the
-        // enclosing function for each call site.
+        // enclosing function for each call site. Also augment with
+        // `symbol_refs` edges so callers that arrive through non-call
+        // syntax (e.g. `.map(helper)` passes `helper` as a callback, not
+        // a call_expression) are still surfaced.
         let mut sites: Vec<(String, usize, Option<String>)> = Vec::new();
-        if !raw_sites.is_empty() {
+        {
             let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
             for (file_id, file_path, matching) in &raw_sites {
                 let file_syms = file_syms_cache.entry(*file_id).or_insert_with(|| {
@@ -178,6 +242,43 @@ impl QartezServer {
                     sites.push((file_path.clone(), *line, enclosing));
                 }
             }
+
+            // Reverse lookup through `symbol_refs`: any symbol whose body
+            // records an edge to a same-named target is treated as a
+            // caller. This catches callback-style usages
+            // (`.map(helper)`) that never produce a call_expression for
+            // `helper` and therefore do not surface through the
+            // cached_calls-based text scan above. Merged with the text-
+            // scan sites and deduplicated by `(path, line_start)` so we
+            // do not double-count syntactic calls.
+            let refs =
+                read::get_symbol_references(&conn, name).map_err(|e| format!("DB error: {e}"))?;
+            let mut existing: std::collections::HashSet<(String, usize)> =
+                sites.iter().map(|(p, l, _)| (p.clone(), *l)).collect();
+            for (target_sym, _target_file, importers) in &refs {
+                for (_, importer_file, from_symbol_id) in importers {
+                    if *from_symbol_id == target_sym.id {
+                        continue;
+                    }
+                    if !include_tests && helpers::is_test_path(&importer_file.path) {
+                        continue;
+                    }
+                    let caller_syms =
+                        file_syms_cache.entry(importer_file.id).or_insert_with(|| {
+                            read::get_symbols_for_file(&conn, importer_file.id).unwrap_or_default()
+                        });
+                    if let Some(caller_sym) = caller_syms.iter().find(|s| s.id == *from_symbol_id) {
+                        let line = caller_sym.line_start as usize;
+                        if existing.insert((importer_file.path.clone(), line)) {
+                            sites.push((
+                                importer_file.path.clone(),
+                                line,
+                                Some(caller_sym.name.clone()),
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         if sites.is_empty() {
@@ -185,17 +286,29 @@ impl QartezServer {
         } else {
             out.push_str(&format!("callers: {}\n", sites.len()));
             if !concise {
-                for (path, line, encl) in &sites {
-                    match encl {
-                        Some(fn_name) => out.push_str(&format!("  {fn_name} @ {path}:L{line}\n")),
-                        None => out.push_str(&format!("  (top) @ {path}:L{line}\n")),
+                let shown = sites.len().min(limit);
+                for (idx, (path, line, encl)) in sites.iter().take(shown).enumerate() {
+                    let row = match encl {
+                        Some(fn_name) => format!("  {fn_name} @ {path}:L{line}\n"),
+                        None => format!("  (top) @ {path}:L{line}\n"),
+                    };
+                    if estimate_tokens(out) + estimate_tokens(&row) > token_budget {
+                        let remaining = sites.len() - idx;
+                        out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n"));
+                        return Ok(());
                     }
+                    out.push_str(&row);
+                }
+                if sites.len() > shown {
+                    let remaining = sites.len() - shown;
+                    out.push_str(&format!("  ... +{remaining} more, raise limit=\n"));
                 }
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_callees(
         &self,
         sym: &crate::storage::models::SymbolRow,
@@ -209,21 +322,27 @@ impl QartezServer {
         >,
         out: &mut String,
         concise: bool,
+        limit: usize,
+        token_budget: usize,
     ) -> Result<(), String> {
-        let all_calls = self.cached_calls(&def_file.path);
         let start = sym.line_start as usize;
         let end = sym.line_end as usize;
-        // Dedup by name; keep the first-seen line only so long functions
-        // don't blow up the output.
-        let mut seen_order: Vec<String> = Vec::new();
-        let mut first_line: HashMap<String, usize> = HashMap::new();
-        for (name, line) in all_calls.iter() {
-            if *line < start || *line > end {
-                continue;
-            }
-            if !first_line.contains_key(name) {
-                first_line.insert(name.clone(), *line);
-                seen_order.push(name.clone());
+        let sites = self.collect_call_sites_with_qualifiers(&def_file.path, start, end);
+        // Dedup by (name, qualifier, via_method_syntax); keep the first-seen
+        // line per pair so `Foo::new` and `Bar::new` stay distinct. Tracking
+        // via_method_syntax lets the renderer drop cross-file unrelated
+        // candidates for `.filter()`-style method calls.
+        let mut seen_order: Vec<(String, Option<String>, bool)> = Vec::new();
+        let mut first_line: HashMap<(String, Option<String>, bool), usize> = HashMap::new();
+        for site in &sites {
+            let key = (
+                site.name.clone(),
+                site.qualifier.clone(),
+                site.via_method_syntax,
+            );
+            if !first_line.contains_key(&key) {
+                first_line.insert(key.clone(), site.line);
+                seen_order.push(key);
             }
         }
 
@@ -239,23 +358,43 @@ impl QartezServer {
 
         {
             let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-            for callee_name in &seen_order {
+            for (callee_name, _, _) in &seen_order {
                 resolve_cache.entry(callee_name.clone()).or_insert_with(|| {
                     read::find_symbol_by_name(&conn, callee_name).unwrap_or_default()
                 });
             }
         }
-        for callee_name in &seen_order {
+
+        let shown = seen_order.len().min(limit);
+        for (idx, (callee_name, qualifier, via_method)) in seen_order.iter().take(shown).enumerate()
+        {
             let resolved = resolve_cache.get(callee_name).unwrap();
-            match resolved.first() {
-                Some((_, f)) => out.push_str(&format!("  {callee_name} @ {}\n", f.path)),
-                None => out.push_str(&format!("  {callee_name} (extern)\n")),
+            let row = render_callee_row(
+                callee_name,
+                qualifier.as_deref(),
+                resolved,
+                *via_method,
+                &def_file.path,
+            );
+            if estimate_tokens(out) + estimate_tokens(&row) > token_budget {
+                let remaining = seen_order.len() - idx;
+                out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n"));
+                return Ok(());
             }
+            out.push_str(&row);
+        }
+        if seen_order.len() > shown {
+            let remaining = seen_order.len() - shown;
+            out.push_str(&format!("  ... +{remaining} more, raise limit=\n"));
         }
         Ok(())
     }
 
-    fn append_depth2(
+    /// Walk callees up to `max_depth` BFS levels. Replaces the old
+    /// `append_depth2`: depth=3+ used to be silently clamped to depth 2
+    /// because only a single extra level was ever walked.
+    #[allow(clippy::too_many_arguments)]
+    fn append_deep_callees(
         &self,
         sym: &crate::storage::models::SymbolRow,
         def_file: &crate::storage::models::FileRow,
@@ -267,75 +406,349 @@ impl QartezServer {
             )>,
         >,
         out: &mut String,
+        max_depth: usize,
+        limit: usize,
+        token_budget: usize,
     ) -> Result<(), String> {
-        let all_calls = self.cached_calls(&def_file.path);
         let start = sym.line_start as usize;
         let end = sym.line_end as usize;
-        let direct: Vec<String> = {
-            let mut seen = HashSet::new();
-            let mut ordered = Vec::new();
-            for (n, l) in all_calls.iter() {
-                if *l >= start && *l <= end && seen.insert(n.clone()) {
-                    ordered.push(n.clone());
-                }
-            }
-            ordered
-        };
+        let root_sites = self.collect_call_sites_with_qualifiers(&def_file.path, start, end);
 
-        // Global visited set protects against cycles and hub blow-up: the
-        // root function and every direct callee are seeded so A → B → A
-        // or self-recursion doesn't reappear at depth 2, and a target
-        // reached from one root isn't re-listed under another.
+        // BFS frontier: each entry is (callee_name, parent_chain) at a
+        // given depth. `parent_chain` is the `A -> B -> C` string used to
+        // render the path in the output.
+        //
+        // A global `visited` set seeded with the root symbol and every
+        // direct callee guards against cycles and keeps hub blow-up in
+        // check: reaching X from two distinct roots prints it only under
+        // the first one. Same invariant as the pre-fix `depth2` walker,
+        // just generalized to N levels.
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(sym.name.clone());
+        let mut direct: Vec<String> = Vec::new();
+        {
+            let mut seen_direct = HashSet::new();
+            for site in &root_sites {
+                if seen_direct.insert(site.name.clone()) {
+                    direct.push(site.name.clone());
+                }
+            }
+        }
         for d in &direct {
             visited.insert(d.clone());
         }
 
-        {
-            let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-            for callee_name in &direct {
-                resolve_cache.entry(callee_name.clone()).or_insert_with(|| {
-                    read::find_symbol_by_name(&conn, callee_name).unwrap_or_default()
-                });
-            }
-        }
+        // Depth-keyed output buckets. Level 2 is "targets reached via a
+        // direct callee", level 3 via a depth-2 callee, and so on.
+        let mut by_depth: HashMap<usize, Vec<(String, String)>> = HashMap::new();
 
-        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
-        for callee_name in &direct {
-            let resolved = resolve_cache.get(callee_name).unwrap();
-            let mut targets: Vec<String> = Vec::new();
-            for (s2, f2) in resolved.iter() {
-                if !matches!(s2.kind.as_str(), "function" | "method") {
-                    continue;
+        let mut frontier: Vec<(String, String)> =
+            direct.iter().map(|n| (n.clone(), n.clone())).collect();
+        for depth in 2..=max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier: Vec<(String, String)> = Vec::new();
+            {
+                let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                for (name, _) in &frontier {
+                    resolve_cache.entry(name.clone()).or_insert_with(|| {
+                        read::find_symbol_by_name(&conn, name).unwrap_or_default()
+                    });
                 }
-                let calls2 = self.cached_calls(&f2.path);
-                let s2start = s2.line_start as usize;
-                let s2end = s2.line_end as usize;
-                for (n, l) in calls2.iter() {
-                    if *l >= s2start && *l <= s2end && !visited.contains(n) {
-                        visited.insert(n.clone());
-                        targets.push(n.clone());
+            }
+            for (name, chain) in &frontier {
+                let resolved = resolve_cache.get(name).cloned().unwrap_or_default();
+                for (s2, f2) in resolved.iter() {
+                    if !matches!(s2.kind.as_str(), "function" | "method") {
+                        continue;
+                    }
+                    let s2start = s2.line_start as usize;
+                    let s2end = s2.line_end as usize;
+                    let child_sites =
+                        self.collect_call_sites_with_qualifiers(&f2.path, s2start, s2end);
+                    for child in &child_sites {
+                        if visited.insert(child.name.clone()) {
+                            let new_chain = format!("{chain} -> {}", child.name);
+                            by_depth
+                                .entry(depth)
+                                .or_default()
+                                .push((child.name.clone(), new_chain.clone()));
+                            next_frontier.push((child.name.clone(), new_chain));
+                        }
                     }
                 }
             }
-            if !targets.is_empty() {
-                grouped.push((callee_name.clone(), targets));
-            }
+            frontier = next_frontier;
         }
-        if grouped.is_empty() {
-            out.push_str("depth2: none\n");
-        } else {
-            out.push_str("depth2:\n");
-            for (root, targets) in &grouped {
-                if targets.len() == 1 {
-                    out.push_str(&format!("  {} → {}\n", root, targets[0]));
-                } else {
-                    out.push_str(&format!("  {} → {{{}}}\n", root, targets.join(", ")));
+
+        if by_depth.is_empty() {
+            out.push_str("deeper: none\n");
+            return Ok(());
+        }
+
+        out.push_str("deeper:\n");
+        let mut depths: Vec<usize> = by_depth.keys().copied().collect();
+        depths.sort();
+        let total_available: usize = by_depth.values().map(|v| v.len()).sum();
+        let mut total_emitted = 0usize;
+        'outer: for depth in depths {
+            if let Some(entries) = by_depth.get(&depth) {
+                for (_, chain) in entries {
+                    if total_emitted >= limit {
+                        break 'outer;
+                    }
+                    let row = format!("  [depth {depth}] {chain}\n");
+                    if estimate_tokens(out) + estimate_tokens(&row) > token_budget {
+                        let remaining = total_available - total_emitted;
+                        out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n"));
+                        return Ok(());
+                    }
+                    out.push_str(&row);
+                    total_emitted += 1;
                 }
             }
         }
+        if total_emitted < total_available {
+            let over = total_available - total_emitted;
+            out.push_str(&format!("  ... +{over} more, raise limit=\n"));
+        }
         Ok(())
+    }
+
+    /// Walk the cached AST of `file_path`, collecting every call inside
+    /// the inclusive line range `[start, end]` together with the prefix
+    /// path before the call name. The prefix is used by
+    /// `append_callees` to distinguish `Foo::new` from `Bar::new` when
+    /// resolving a same-named candidate set.
+    fn collect_call_sites_with_qualifiers(
+        &self,
+        file_path: &str,
+        start: usize,
+        end: usize,
+    ) -> Vec<CallSite> {
+        let Some((source_arc, tree_arc)) = self.cached_tree(file_path) else {
+            return self
+                .cached_calls(file_path)
+                .iter()
+                .filter(|(_, l)| *l >= start && *l <= end)
+                .map(|(n, l)| CallSite {
+                    name: n.clone(),
+                    line: *l,
+                    qualifier: None,
+                    via_method_syntax: false,
+                })
+                .collect();
+        };
+        let source_bytes = source_arc.as_bytes();
+        let mut results: Vec<CallSite> = Vec::new();
+        collect_call_sites_with_qualifiers_tree(
+            &mut tree_arc.walk(),
+            source_bytes,
+            &mut results,
+            start,
+            end,
+        );
+        results
+    }
+}
+
+/// Render one callee row, disambiguating same-named candidates.
+///
+/// - Zero matches: emit `<name> (extern)`.
+/// - Single match: emit `<name> @ <file>`.
+/// - Multiple matches with a qualifier that matches `owner_type` on exactly
+///   one candidate: pick that candidate.
+/// - Multiple matches, no usable qualifier or no unique owner-type hit:
+///   emit every candidate prefixed with `ambiguous (N candidates)`.
+fn render_callee_row(
+    callee_name: &str,
+    qualifier: Option<&str>,
+    resolved: &[(
+        crate::storage::models::SymbolRow,
+        crate::storage::models::FileRow,
+    )],
+    via_method_syntax: bool,
+    caller_file_path: &str,
+) -> String {
+    let func_like: Vec<&(
+        crate::storage::models::SymbolRow,
+        crate::storage::models::FileRow,
+    )> = resolved
+        .iter()
+        .filter(|(s, _)| matches!(s.kind.as_str(), "function" | "method" | "constructor"))
+        .collect();
+    if func_like.is_empty() {
+        // A method-syntax call (`.filter(...)`) whose only same-named
+        // candidates are fields, variables, or constants in an unrelated
+        // file is almost always the stdlib (Iterator::filter) colliding
+        // with a user symbol. Report as extern rather than binding to
+        // the spurious match.
+        if via_method_syntax
+            && let Some((_, f)) = resolved.first()
+            && f.path != caller_file_path
+        {
+            return format!("  {callee_name} (extern)\n");
+        }
+        if let Some((_, f)) = resolved.first() {
+            return format!("  {callee_name} @ {}\n", f.path);
+        }
+        return format!("  {callee_name} (extern)\n");
+    }
+    if func_like.len() == 1 {
+        let (_, f) = func_like[0];
+        // Same protection for a single cross-file func-like match: a
+        // method-syntax call should not silently bind to a free fn that
+        // is not reachable from the caller's file.
+        if via_method_syntax && f.path != caller_file_path {
+            return format!("  {callee_name} (extern)\n");
+        }
+        return format!("  {callee_name} @ {}\n", f.path);
+    }
+    if let Some(qual) = qualifier
+        && qual != "self"
+        && qual != "Self"
+    {
+        let matching: Vec<&(
+            crate::storage::models::SymbolRow,
+            crate::storage::models::FileRow,
+        )> = func_like
+            .iter()
+            .copied()
+            .filter(|(s, _)| s.owner_type.as_deref() == Some(qual))
+            .collect();
+        if matching.len() == 1 {
+            let (_, f) = matching[0];
+            return format!("  {qual}::{callee_name} @ {}\n", f.path);
+        }
+    }
+    let mut buf = format!(
+        "  {callee_name} ambiguous ({} candidates)\n",
+        func_like.len()
+    );
+    for (s, f) in &func_like {
+        let label = match s.owner_type.as_deref() {
+            Some(t) => format!("{t}::{callee_name}"),
+            None => callee_name.to_string(),
+        };
+        buf.push_str(&format!("    - {label} @ {}\n", f.path));
+    }
+    buf
+}
+
+/// Tree-walking version of [`collect_call_names`] that also records the
+/// left-hand qualifier of every call. Only emits sites whose source line
+/// falls inside `[start, end]` so callers can scope to one function body.
+fn collect_call_sites_with_qualifiers_tree(
+    cursor: &mut tree_sitter::TreeCursor,
+    source: &[u8],
+    results: &mut Vec<CallSite>,
+    start: usize,
+    end: usize,
+) {
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        if CALL_NODE_KINDS.contains(&node.kind()) {
+            let line = node.start_position().row + 1;
+            if line >= start && line <= end {
+                let mut found = None;
+                for field in CALLEE_FIELD_NAMES {
+                    if let Some(callee) = node.child_by_field_name(field) {
+                        let via_method = matches!(
+                            callee.kind(),
+                            "field_expression" | "member_expression" | "attribute"
+                        );
+                        let (name, qual) = split_callee(callee, source);
+                        if !name.is_empty() {
+                            found = Some(CallSite {
+                                name,
+                                line,
+                                qualifier: qual,
+                                via_method_syntax: via_method,
+                            });
+                        }
+                        break;
+                    }
+                }
+                if found.is_none()
+                    && let Some(first_child) = node.child(0)
+                {
+                    let via_method = matches!(
+                        first_child.kind(),
+                        "field_expression" | "member_expression" | "attribute"
+                    );
+                    let (name, qual) = split_callee(first_child, source);
+                    if !name.is_empty() {
+                        found = Some(CallSite {
+                            name,
+                            line,
+                            qualifier: qual,
+                            via_method_syntax: via_method,
+                        });
+                    }
+                }
+                if let Some(site) = found {
+                    results.push(site);
+                }
+            }
+        }
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// Decompose a callee AST node into `(name, qualifier)`. For a
+/// field/scoped expression the qualifier is the text left of the final
+/// `.` / `::`, with a best-effort fallback to the first identifier
+/// child when no `object`/`value`/`scope` field is exposed by the grammar.
+fn split_callee(node: tree_sitter::Node, source: &[u8]) -> (String, Option<String>) {
+    match node.kind() {
+        "identifier" | "simple_identifier" | "property_identifier" => {
+            (node.utf8_text(source).unwrap_or("").to_string(), None)
+        }
+        "field_expression" | "member_expression" | "scoped_identifier" | "attribute" => {
+            let name = node
+                .child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("property"))
+                .or_else(|| node.child_by_field_name("name"))
+                .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                .unwrap_or_else(|| {
+                    let count = node.child_count();
+                    if count == 0 {
+                        return String::new();
+                    }
+                    node.child((count - 1) as u32)
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("")
+                        .to_string()
+                });
+            let qual = node
+                .child_by_field_name("object")
+                .or_else(|| node.child_by_field_name("value"))
+                .or_else(|| node.child_by_field_name("scope"))
+                .or_else(|| node.child_by_field_name("path"))
+                .or_else(|| node.child(0))
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != &name);
+            (name, qual)
+        }
+        _ => (node.utf8_text(source).unwrap_or("").to_string(), None),
     }
 }
 
@@ -431,9 +844,34 @@ impl QartezServer {
                     if !seen.insert(name.clone()) {
                         continue;
                     }
+                    // Count function-like candidates for this callee
+                    // so the mermaid edge can surface ambiguous
+                    // resolutions. Text output prints
+                    // `ambiguous (N candidates)` plus a listing; the
+                    // mermaid path used to collapse every candidate
+                    // into one solid edge, hiding the fact that the
+                    // resolver could not pick a unique target. A
+                    // dashed edge (`-.->`) with a `|?N|` label echoes
+                    // the same signal in graph form.
+                    let candidates = {
+                        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                        read::find_symbol_by_name(&conn, name).unwrap_or_default()
+                    };
+                    let func_like = candidates
+                        .iter()
+                        .filter(|(s, _)| {
+                            matches!(s.kind.as_str(), "function" | "method" | "constructor")
+                        })
+                        .count();
                     let cid = helpers::mermaid_node_id(name);
                     let clabel = helpers::mermaid_label(name);
-                    out.push_str(&format!("  {target_id} --> {cid}[\"{clabel}\"]\n"));
+                    if func_like >= 2 {
+                        out.push_str(&format!(
+                            "  {target_id} -.->|?{func_like}| {cid}[\"{clabel}\"]\n",
+                        ));
+                    } else {
+                        out.push_str(&format!("  {target_id} --> {cid}[\"{clabel}\"]\n"));
+                    }
                     count += 1;
                 }
             }

@@ -705,7 +705,7 @@ fn test_symbol_refs_multiple_referrers() {
     let (_, _, importers) = &refs[0];
     assert_eq!(importers.len(), 2, "two files reference SharedType");
 
-    let importer_paths: HashSet<&str> = importers.iter().map(|(_, f)| f.path.as_str()).collect();
+    let importer_paths: HashSet<&str> = importers.iter().map(|(_, f, _)| f.path.as_str()).collect();
     assert!(importer_paths.contains("src/a.rs"));
     assert!(importer_paths.contains("src/b.rs"));
 }

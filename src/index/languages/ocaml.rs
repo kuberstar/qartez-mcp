@@ -510,6 +510,7 @@ fn record_reference(
                         kind: ReferenceKind::Call,
                         qualifier,
                         receiver_type_hint: None,
+                        via_method_syntax: false,
                     });
                 }
             }
@@ -529,6 +530,7 @@ fn record_reference(
                     kind: ReferenceKind::Use,
                     qualifier,
                     receiver_type_hint: None,
+                    via_method_syntax: false,
                 });
             }
         }

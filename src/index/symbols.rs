@@ -131,11 +131,12 @@ pub struct ExtractedImport {
 /// How an identifier in source code refers to another symbol. Used to tag
 /// symbol-level edges so the resolver can weight a `Call` differently from a
 /// plain type reference later if needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReferenceKind {
     /// A call expression such as `foo()` or `self.bar(x)`.
     Call,
     /// A plain identifier use (variable read, path expression, field access).
+    #[default]
     Use,
     /// A type position: `let x: Foo`, `fn f() -> Bar`, `impl Baz for _`.
     TypeRef,
@@ -151,7 +152,7 @@ impl ReferenceKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExtractedReference {
     /// Identifier the referring site used. Resolution later matches this
     /// against `symbols.name` with a same-file → imported-file → global
@@ -176,6 +177,15 @@ pub struct ExtractedReference {
     /// was declared as `Foo`. The resolver uses this to narrow candidates to
     /// methods whose parent class matches.
     pub receiver_type_hint: Option<String>,
+    /// True when the reference was produced by method-call syntax
+    /// (`receiver.method(...)` / tree-sitter `field_expression` callee)
+    /// and the extractor could not resolve the receiver's type. The
+    /// resolver uses this to drop cross-file method fan-out that would
+    /// otherwise resolve common iterator / Option / Result method names
+    /// (`filter`, `map`, `collect`, ...) to unrelated same-named fields
+    /// or free functions. Default `false` preserves existing behaviour
+    /// for every language that does not opt in.
+    pub via_method_syntax: bool,
 }
 
 /// A type hierarchy relationship extracted from source code.

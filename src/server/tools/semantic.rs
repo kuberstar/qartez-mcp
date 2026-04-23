@@ -46,6 +46,13 @@ fn qartez_semantic_dispatch(
 ) -> Result<String, String> {
     use std::sync::OnceLock;
 
+    // Input validation runs before any model work so callers get a precise
+    // error on empty queries instead of an encoded zero-length embedding
+    // that falls through to a misleading "no matches" result.
+    if params.query.trim().is_empty() {
+        return Err("query must be non-empty".to_string());
+    }
+
     // OnceLock caches the first result (success or failure) for the process
     // lifetime. If model loading fails (e.g., missing files), subsequent
     // calls return the cached error until the server is restarted.
@@ -69,7 +76,13 @@ fn qartez_semantic_dispatch(
         .db
         .lock()
         .map_err(|e| format!("DB lock error: {e}"))?;
-    let limit = params.limit.unwrap_or(10) as i64;
+    // `limit=0` means "no cap" project-wide convention; `None` keeps the
+    // historical default of 10.
+    let limit = match params.limit {
+        None => 10_i64,
+        Some(0) => i64::MAX,
+        Some(n) => n as i64,
+    };
     let concise = is_concise(&params.format);
 
     let results = read::hybrid_search(&conn, &params.query, &query_vec, limit)

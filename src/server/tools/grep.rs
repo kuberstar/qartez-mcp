@@ -36,8 +36,15 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulGrepParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_grep")?;
+        if params.query.trim().is_empty() {
+            return Err("query must be non-empty".to_string());
+        }
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let limit = params.limit.unwrap_or(20) as i64;
+        // Default is large so the token_budget stays the active governor for
+        // output volume. Callers that need a hard cap still set `limit` or
+        // `token_budget` explicitly.
+        let limit = params.limit.unwrap_or(200) as i64;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
         let use_regex = params.regex.unwrap_or(false);
@@ -95,7 +102,86 @@ impl QartezServer {
                 break;
             }
             out.push_str(&line);
+
+            // When search_bodies=true, the symbol header only reports the
+            // enclosing range. Add per-line snippets that show which lines
+            // inside the body actually matched, so callers do not have to
+            // follow up with qartez_read just to locate the hit.
+            if search_bodies {
+                let preview =
+                    self.body_match_preview(file_path, sym, &params.query, use_regex, budget);
+                if estimate_tokens(&out) + estimate_tokens(&preview) > budget {
+                    out.push_str("  ... (truncated by token budget)\n");
+                    break;
+                }
+                out.push_str(&preview);
+            }
         }
         Ok(out)
+    }
+
+    /// Render up to a few concrete line-level matches inside a symbol's
+    /// body. Best-effort: on read failure we simply skip the preview so
+    /// the caller still sees the symbol-level hit.
+    fn body_match_preview(
+        &self,
+        file_path: &str,
+        sym: &crate::storage::models::SymbolRow,
+        query: &str,
+        use_regex: bool,
+        budget: usize,
+    ) -> String {
+        const MAX_PREVIEW_LINES: usize = 5;
+        const MAX_SNIPPET_LEN: usize = 120;
+
+        let Ok(abs_path) = self.safe_resolve(file_path) else {
+            return String::new();
+        };
+        let Ok(source) = std::fs::read_to_string(&abs_path) else {
+            return String::new();
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        let start_idx = (sym.line_start as usize).saturating_sub(1);
+        let end_idx = (sym.line_end as usize).min(lines.len());
+        if start_idx >= end_idx {
+            return String::new();
+        }
+
+        let re = if use_regex {
+            regex::Regex::new(query).ok()
+        } else {
+            None
+        };
+        let needle_lower = query.to_lowercase();
+
+        let mut out = String::new();
+        let mut shown = 0usize;
+        for (offset, raw_line) in lines[start_idx..end_idx].iter().enumerate() {
+            let line_no = start_idx + offset + 1;
+            let hit = match (&re, use_regex) {
+                (Some(pat), true) => pat.is_match(raw_line),
+                _ => raw_line.to_lowercase().contains(&needle_lower),
+            };
+            if !hit {
+                continue;
+            }
+            let trimmed = raw_line.trim();
+            let snippet = if trimmed.chars().count() > MAX_SNIPPET_LEN {
+                let cut: String = trimmed.chars().take(MAX_SNIPPET_LEN).collect();
+                format!("{cut}...")
+            } else {
+                trimmed.to_string()
+            };
+            let row = format!("      L{line_no}: {snippet}\n");
+            if estimate_tokens(&out) + estimate_tokens(&row) > budget {
+                break;
+            }
+            out.push_str(&row);
+            shown += 1;
+            if shown >= MAX_PREVIEW_LINES {
+                break;
+            }
+        }
+        out
     }
 }

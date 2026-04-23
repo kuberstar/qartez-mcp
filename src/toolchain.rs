@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
 pub struct DetectedToolchain {
     pub name: String,
     pub build_tool: String,
@@ -9,6 +10,11 @@ pub struct DetectedToolchain {
     pub build_cmd: Vec<String>,
     pub lint_cmd: Option<Vec<String>>,
     pub typecheck_cmd: Option<Vec<String>>,
+    /// Relative subdirectory that owns this toolchain. `None` means the
+    /// project root. Set by `detect_subdir_toolchains` so monorepo
+    /// reports can tell the caller "Cargo.toml under qartez-public/"
+    /// instead of silently reporting no build command.
+    pub subdir: Option<String>,
 }
 
 /// (test_cmd, build_cmd, lint_cmd, typecheck_cmd)
@@ -37,6 +43,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["cargo".into(), "build".into()],
             lint_cmd: Some(vec!["cargo".into(), "clippy".into()]),
             typecheck_cmd: Some(vec!["cargo".into(), "check".into()]),
+            subdir: None,
         });
     }
 
@@ -48,6 +55,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["go".into(), "build".into(), "./...".into()],
             lint_cmd: Some(vec!["golangci-lint".into(), "run".into()]),
             typecheck_cmd: Some(vec!["go".into(), "vet".into(), "./...".into()]),
+            subdir: None,
         });
     }
 
@@ -63,6 +71,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd,
             lint_cmd,
             typecheck_cmd,
+            subdir: None,
         });
     }
 
@@ -74,6 +83,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["python".into(), "-m".into(), "build".into()],
             lint_cmd: Some(vec!["ruff".into(), "check".into(), ".".into()]),
             typecheck_cmd: Some(vec!["mypy".into(), ".".into()]),
+            subdir: None,
         });
     }
 
@@ -85,6 +95,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["mvn".into(), "package".into()],
             lint_cmd: None,
             typecheck_cmd: Some(vec!["mvn".into(), "compile".into()]),
+            subdir: None,
         });
     }
 
@@ -100,6 +111,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["./gradlew".into(), "build".into()],
             lint_cmd: None,
             typecheck_cmd: Some(vec!["./gradlew".into(), "compileJava".into()]),
+            subdir: None,
         });
     }
 
@@ -111,6 +123,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["sbt".into(), "compile".into()],
             lint_cmd: None,
             typecheck_cmd: None,
+            subdir: None,
         });
     }
 
@@ -127,6 +140,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             ],
             lint_cmd: Some(vec!["bundle".into(), "exec".into(), "rubocop".into()]),
             typecheck_cmd: None,
+            subdir: None,
         });
     }
 
@@ -161,6 +175,7 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             lint_cmd: Some(vec![driver.into(), "analyze".into()]),
             // `dart analyze` covers static type checking - no separate typechecker.
             typecheck_cmd: Some(vec![driver.into(), "analyze".into()]),
+            subdir: None,
         });
     }
 
@@ -172,10 +187,68 @@ pub fn detect_all_toolchains(project_root: &Path) -> Vec<DetectedToolchain> {
             build_cmd: vec!["make".into(), "build".into()],
             lint_cmd: Some(vec!["make".into(), "lint".into()]),
             typecheck_cmd: None,
+            subdir: None,
         });
     }
 
     toolchains
+}
+
+/// Walk the first-level subdirectories of `project_root` looking for
+/// project manifests (`Cargo.toml`, `package.json`, `go.mod`, etc.) and
+/// return a `DetectedToolchain` for each hit, tagged with the subdir
+/// path so the caller can distinguish "root Cargo" from "workspace
+/// member Cargo". Only one level deep; nested monorepos (e.g. Nx /
+/// turborepo trees) need a dedicated recursive detector.
+///
+/// Skips hidden directories and the conventional VCS/build ignore set
+/// (`target/`, `node_modules/`, `.git/`, etc.) so a large build cache
+/// cannot burn IO budget.
+pub fn detect_subdir_toolchains(project_root: &Path, max_subdirs: usize) -> Vec<DetectedToolchain> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return out;
+    };
+    let mut subdirs: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().ok().is_some_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            if name.starts_with('.') {
+                return false;
+            }
+            !matches!(
+                name,
+                "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | "__pycache__"
+                    | "venv"
+                    | ".venv"
+                    | "vendor"
+                    | ".cache"
+            )
+        })
+        .collect();
+    subdirs.sort();
+    subdirs.truncate(max_subdirs);
+
+    for subdir in &subdirs {
+        let rel = subdir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let Some(rel) = rel else { continue };
+        for mut tc in detect_all_toolchains(subdir) {
+            tc.subdir = Some(rel.clone());
+            out.push(tc);
+        }
+    }
+    out
 }
 
 /// Checks whether a binary is available on PATH using pure Rust PATH search.

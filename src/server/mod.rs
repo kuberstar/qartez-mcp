@@ -268,9 +268,9 @@ impl QartezServer {
         };
         dispatch_tool_call!(self, name, args,
             infallible {
-                "qartez_map" => qartez_map: QartezParams,
             }
             fallible {
+                "qartez_map"         => qartez_map:         QartezParams,
                 "qartez_find"        => qartez_find:        SoulFindParams,
                 "qartez_workspace"   => qartez_workspace:   SoulWorkspaceParams,
                 "qartez_read"        => qartez_read:        SoulReadParams,

@@ -50,7 +50,8 @@ fn write_test_files(dir: &std::path::Path) {
     fs::write(
         src.join("utils.rs"),
         "pub fn helper(name: &str) -> String {\n\
-             format!(\"Hello, {}\", name)\n\
+             let sum = compute(1, 2);\n\
+             format!(\"Hello, {} ({})\", name, sum)\n\
          }\n\
          \n\
          pub fn compute(x: i32, y: i32) -> i32 {\n\
@@ -2978,6 +2979,7 @@ fn qartez_rename_handles_aliased_imports() {
             old_name: "original_fn".into(),
             new_name: "new_fn".into(),
             apply: Some(true),
+            ..Default::default()
         }))
         .unwrap();
     assert!(
@@ -3119,6 +3121,7 @@ fn qartez_wiki_returns_markdown_inline_when_write_to_omitted() {
             min_cluster_size: Some(1),
             max_files_per_section: Some(20),
             recompute: Some(true),
+            token_budget: None,
         }))
         .expect("qartez_wiki should succeed on the test fixture");
     assert!(md.contains("# Architecture of"));
@@ -3137,6 +3140,7 @@ fn qartez_wiki_writes_file_and_returns_summary() {
             min_cluster_size: Some(1),
             max_files_per_section: Some(20),
             recompute: Some(true),
+            token_budget: None,
         }))
         .expect("qartez_wiki should write the wiki without error");
     assert!(summary.starts_with("Wrote "));
@@ -3157,6 +3161,7 @@ fn qartez_wiki_assigns_every_file_to_exactly_one_cluster() {
             min_cluster_size: Some(1),
             max_files_per_section: Some(50),
             recompute: Some(true),
+            token_budget: None,
         }))
         .unwrap();
     for path in ["src/main.rs", "src/utils.rs", "src/models.rs", "src/lib.rs"] {
@@ -3292,7 +3297,9 @@ fn qartez_hotspots_file_level_returns_results() {
             ..Default::default()
         }))
         .unwrap();
-    assert!(out.contains("Hotspot Analysis"), "header expected");
+    // Small result sets (<= 3 files) drop the verbose banner by design;
+    // assert on the column header and data row instead so the test
+    // stays compatible with the compact-header path.
     assert!(out.contains("Health"), "health column header expected");
     assert!(
         out.contains("src/utils.rs"),
@@ -3312,11 +3319,17 @@ fn qartez_hotspots_symbol_level_returns_results() {
             ..Default::default()
         }))
         .unwrap();
+    // Small result sets (<= 3 symbols) suppress the verbose banner
+    // (`# Hotspot Analysis (symbol level)`); fall back to the
+    // column-header signal or the explicit empty-result message.
+    let rendered = out.contains("symbol level")
+        || out.contains("| Kind")
+        || out.contains("# score health name kind file");
     assert!(
-        out.contains("symbol level") || out.contains("No symbol hotspots"),
+        rendered || out.contains("No symbol hotspots"),
         "should produce symbol-level output or explain no data: {out}"
     );
-    if out.contains("symbol level") {
+    if rendered {
         assert!(
             out.contains("compute"),
             "highest-complexity function should appear"
@@ -3413,7 +3426,8 @@ fn qartez_hotspots_sort_by_churn() {
             ..Default::default()
         }))
         .unwrap();
-    assert!(out.contains("Hotspot Analysis"), "header expected");
+    // Small-fixture result sets drop the verbose banner; assert on the
+    // column header instead.
     assert!(out.contains("Health"), "health column expected");
     assert!(output_within_bounds(&out));
 }
@@ -3430,7 +3444,9 @@ fn qartez_hotspots_sort_by_health() {
             ..Default::default()
         }))
         .unwrap();
-    assert!(out.contains("Hotspot Analysis"), "header expected");
+    // Small-fixture result sets drop the verbose banner; fall back to
+    // the column header as the renderer signal.
+    assert!(out.contains("Health"), "health column expected");
     assert!(output_within_bounds(&out));
 }
 
@@ -3759,7 +3775,8 @@ fn qartez_hotspots_call_tool_by_name_with_new_params() {
             serde_json::json!({"sort_by": "health", "limit": 5}),
         )
         .unwrap();
-    assert!(out.contains("Hotspot Analysis"), "header expected");
+    // Small-fixture result sets drop the verbose banner; fall back to
+    // the column header as the renderer signal.
     assert!(out.contains("Health"), "health column expected");
 
     // Test with threshold
@@ -3769,9 +3786,10 @@ fn qartez_hotspots_call_tool_by_name_with_new_params() {
             serde_json::json!({"threshold": 3, "limit": 10}),
         )
         .unwrap();
-    // Should either have results or "No hotspots" (if all health > 3)
+    // Should either render the column header or the explicit empty
+    // message (when all files score above the threshold).
     assert!(
-        out.contains("Hotspot Analysis") || out.contains("No hotspots"),
+        out.contains("Health") || out.contains("No hotspots"),
         "should produce valid output"
     );
 
@@ -4671,6 +4689,7 @@ fn qartez_move_preview_shows_plan() {
             to_file: "src/new_module.rs".into(),
             apply: Some(false),
             kind: None,
+            file_path: None,
         }))
         .unwrap();
     assert!(out.contains("Preview"), "preview mode should say 'Preview'");
@@ -4691,6 +4710,7 @@ fn qartez_move_apply_extracts_symbol() {
             to_file: "src/new_module.rs".into(),
             apply: Some(true),
             kind: None,
+            file_path: None,
         }))
         .unwrap();
     assert!(out.contains("Moved"), "apply mode should confirm the move");
@@ -4712,6 +4732,7 @@ fn qartez_move_symbol_not_found() {
             to_file: "src/dest.rs".into(),
             apply: None,
             kind: None,
+            file_path: None,
         }))
         .unwrap_err();
     assert!(
@@ -4729,6 +4750,7 @@ fn qartez_move_kind_filter_disambiguates() {
             to_file: "src/dest.rs".into(),
             apply: Some(false),
             kind: Some("struct".into()),
+            file_path: None,
         }))
         .unwrap_err();
     assert!(
@@ -4750,6 +4772,7 @@ fn qartez_boundaries_no_config_suggests_generation() {
             suggest: None,
             write_to: None,
             format: None,
+            auto_cluster: None,
         }))
         .unwrap();
     assert!(
@@ -4761,18 +4784,21 @@ fn qartez_boundaries_no_config_suggests_generation() {
 #[test]
 fn qartez_boundaries_suggest_needs_clusters() {
     let (server, _dir) = setup();
-    let out = server
+    // With `auto_cluster=false` the tool must surface the explicit
+    // remediation path; with the default (true) it would have run the
+    // clustering silently.
+    let err = server
         .qartez_boundaries(Parameters(SoulBoundariesParams {
             config_path: None,
             suggest: Some(true),
             write_to: None,
             format: None,
+            auto_cluster: Some(false),
         }))
-        .unwrap();
-    // Without clusters, suggest mode should explain why it can't generate rules.
+        .expect_err("auto_cluster=false with empty clusters must fail");
     assert!(
-        out.contains("No cluster") || out.contains("qartez_wiki") || out.contains("[[boundary]]"),
-        "suggest without clusters should explain what's needed or produce rules: {out}"
+        err.contains("No cluster") || err.contains("qartez_wiki"),
+        "suggest without clusters must explain what's needed: {err}"
     );
 }
 
@@ -4788,6 +4814,7 @@ fn qartez_boundaries_suggest_after_wiki_generates_toml() {
             min_cluster_size: Some(1),
             max_files_per_section: Some(50),
             recompute: Some(true),
+            token_budget: None,
         }))
         .unwrap();
 
@@ -4797,6 +4824,7 @@ fn qartez_boundaries_suggest_after_wiki_generates_toml() {
             suggest: Some(true),
             write_to: None,
             format: None,
+            auto_cluster: None,
         }))
         .unwrap();
     // With clusters populated, we get either TOML rules or a "no directory-aligned" message.
@@ -4816,6 +4844,7 @@ fn qartez_boundaries_suggest_writes_to_disk() {
             min_cluster_size: Some(1),
             max_files_per_section: Some(50),
             recompute: Some(true),
+            token_budget: None,
         }))
         .unwrap();
 
@@ -4825,6 +4854,7 @@ fn qartez_boundaries_suggest_writes_to_disk() {
             suggest: Some(true),
             write_to: Some(".qartez/boundaries.toml".into()),
             format: None,
+            auto_cluster: None,
         }))
         .unwrap();
     // It should either write the file or explain no rules were generated.
@@ -4855,6 +4885,7 @@ fn qartez_boundaries_check_with_valid_config() {
             suggest: None,
             write_to: None,
             format: None,
+            auto_cluster: None,
         }))
         .unwrap();
     assert!(
@@ -4882,6 +4913,7 @@ fn qartez_boundaries_detects_violation() {
             suggest: None,
             write_to: None,
             format: None,
+            auto_cluster: None,
         }))
         .unwrap();
     assert!(
@@ -4905,6 +4937,7 @@ fn qartez_trend_no_git_depth_returns_error() {
         symbol_name: None,
         limit: None,
         format: None,
+        token_budget: None,
     }));
     assert!(result.is_err(), "should error when git_depth is 0");
     assert!(result.unwrap_err().contains("git history"));
@@ -4927,6 +4960,7 @@ fn qartez_trend_nonexistent_file_returns_empty() {
             symbol_name: None,
             limit: Some(5),
             format: None,
+            token_budget: None,
         }))
         .unwrap();
     assert!(
@@ -4966,6 +5000,7 @@ fn qartez_trend_with_git_history() {
             symbol_name: Some("work".into()),
             limit: Some(10),
             format: None,
+            token_budget: None,
         }))
         .unwrap();
 
@@ -5004,6 +5039,7 @@ fn qartez_trend_concise_format() {
             symbol_name: None,
             limit: Some(10),
             format: Some(Format::Concise),
+            token_budget: None,
         }))
         .unwrap();
 
@@ -5129,6 +5165,7 @@ fn rename_apply_single_file_happy_path() {
             old_name: "compute".into(),
             new_name: "calculate".into(),
             apply: Some(true),
+            ..Default::default()
         }))
         .unwrap();
     assert!(
@@ -5149,6 +5186,7 @@ fn rename_apply_multi_file_updates_importers() {
             old_name: "Config".into(),
             new_name: "AppConfig".into(),
             apply: Some(true),
+            ..Default::default()
         }))
         .unwrap();
     assert!(
@@ -5183,6 +5221,7 @@ fn rename_preview_does_not_modify_files() {
             old_name: "compute".into(),
             new_name: "calculate".into(),
             apply: Some(false),
+            ..Default::default()
         }))
         .unwrap();
     assert!(result.contains("occ"), "expected preview output");
@@ -5198,6 +5237,7 @@ fn rename_nonexistent_symbol_returns_error() {
         old_name: "nonexistent_fn_xyz".into(),
         new_name: "something_else".into(),
         apply: Some(true),
+        ..Default::default()
     }));
     assert!(result.is_err(), "renaming nonexistent symbol should fail");
 }
@@ -5213,6 +5253,7 @@ fn move_apply_happy_path() {
             to_file: "src/math.rs".into(),
             apply: Some(true),
             kind: None,
+            file_path: None,
         }))
         .unwrap();
     assert!(
@@ -5249,6 +5290,7 @@ fn move_apply_into_existing_file() {
             to_file: "src/extra.rs".into(),
             apply: Some(true),
             kind: None,
+            file_path: None,
         }))
         .unwrap();
     assert!(result.contains("Moved"), "expected move confirmation");
@@ -5275,6 +5317,7 @@ fn move_preview_does_not_modify_files() {
             to_file: "src/math.rs".into(),
             apply: Some(false),
             kind: None,
+            file_path: None,
         }))
         .unwrap();
 
@@ -5294,6 +5337,7 @@ fn move_nonexistent_symbol_returns_error() {
         to_file: "src/other.rs".into(),
         apply: Some(true),
         kind: None,
+        file_path: None,
     }));
     assert!(result.is_err(), "moving nonexistent symbol should fail");
 }
@@ -5309,6 +5353,7 @@ fn move_detects_name_conflict_in_target() {
         to_file: "src/utils.rs".into(),
         apply: Some(true),
         kind: None,
+        file_path: None,
     }));
     // Moving helper to the file it already lives in is a same-file scenario;
     // the move should work (noop or detect properly). The important check is
@@ -5991,6 +6036,7 @@ fn qartez_diff_impact_without_risk_preserves_all_sections() {
         .qartez_diff_impact(Parameters(SoulDiffImpactParams {
             base: "HEAD~1..HEAD".into(),
             format: Some(Format::Detailed),
+            ack: Some(true),
             ..Default::default()
         }))
         .unwrap();
@@ -6508,19 +6554,19 @@ fn qartez_calls_depth2_only_with_callees() {
         }))
         .unwrap();
     assert!(
-        with_d2.contains("depth2:"),
-        "depth=2 should produce depth2 section: {with_d2}"
+        with_d2.contains("[depth 2]"),
+        "depth=2 should produce depth-2 entries in deeper section: {with_d2}"
     );
     assert!(
-        !without_d2.contains("depth2:"),
-        "depth=1 should NOT produce depth2 section: {without_d2}"
+        !without_d2.contains("[depth 2]"),
+        "depth=1 should NOT produce depth-2 entries: {without_d2}"
     );
 }
 
 #[test]
 fn qartez_calls_depth2_skipped_for_callers_only() {
     let (server, _dir) = setup();
-    // depth=2 only fires when callees is requested
+    // Deeper-walk output only fires when callees is requested
     let result = server
         .qartez_calls(Parameters(SoulCallsParams {
             name: "helper".into(),
@@ -6531,8 +6577,8 @@ fn qartez_calls_depth2_skipped_for_callers_only() {
         }))
         .unwrap();
     assert!(
-        !result.contains("depth2:"),
-        "depth2 should not run when only callers requested: {result}"
+        !result.contains("[depth 2]"),
+        "deeper walk should not run when only callers requested: {result}"
     );
 }
 
@@ -6606,7 +6652,7 @@ fn setup_test_gaps_fixture() -> (QartezServer, TempDir) {
     let f_test_utils =
         write::upsert_file(&conn, "tests/test_utils.rs", 1000, 50, "rust", 5).unwrap();
 
-    write::insert_symbols(
+    let helper_ids = write::insert_symbols(
         &conn,
         f_utils,
         &[SymbolInsert {
@@ -6642,6 +6688,30 @@ fn setup_test_gaps_fixture() -> (QartezServer, TempDir) {
         }],
     )
     .unwrap();
+    // Test file has a test function that calls `helper` via a symbol_ref.
+    // The new `include_symbols=true` semantic walks `symbol_refs` to
+    // surface exactly the source symbols exercised by tests, so the
+    // fixture needs both a symbol in the test file AND a symbol_ref
+    // edge - file-level `edges` alone are not enough.
+    let test_helper_ids = write::insert_symbols(
+        &conn,
+        f_test_utils,
+        &[SymbolInsert {
+            name: "test_helper".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 3,
+            signature: Some("fn test_helper()".into()),
+            is_exported: false,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: Some(1),
+            owner_type: None,
+        }],
+    )
+    .unwrap();
+    write::insert_symbol_refs(&conn, &[(test_helper_ids[0], helper_ids[0], "call")]).unwrap();
 
     // Test file imports source file (this is what 'gaps' detection looks for)
     write::insert_edge(&conn, f_test_utils, f_utils, "import", Some("helper")).unwrap();
@@ -6799,7 +6869,7 @@ fn qartez_test_gaps_map_per_file_uncovered_source() {
 }
 
 #[test]
-fn qartez_test_gaps_map_include_symbols_lists_exports() {
+fn qartez_test_gaps_map_include_symbols_lists_referenced() {
     let (server, _dir) = setup_test_gaps_fixture();
     let out = server
         .qartez_test_gaps(Parameters(SoulTestGapsParams {
@@ -6810,12 +6880,12 @@ fn qartez_test_gaps_map_include_symbols_lists_exports() {
         }))
         .unwrap();
     assert!(
-        out.contains("exported symbols"),
-        "include_symbols should list exports:\n{out}"
+        out.contains("referenced by tests"),
+        "include_symbols should list symbols referenced by tests:\n{out}"
     );
     assert!(
         out.contains("helper"),
-        "exported symbol 'helper' should appear:\n{out}"
+        "symbol 'helper' referenced by tests must appear:\n{out}"
     );
 }
 

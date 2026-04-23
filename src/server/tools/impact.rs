@@ -36,6 +36,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulImpactParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_impact")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
         let include_tests = params.include_tests.unwrap_or(false);
@@ -79,16 +80,16 @@ impl QartezServer {
         let cochanges = read::get_cochanges(&conn, file.id, 10).unwrap_or_default();
 
         if concise {
-            let mut out = format!(
-                "Impact: {} | direct: {} | transitive: {} | cochange: {}\n",
+            // Concise mode emits counts only; callers that want the actual
+            // file lists drop the format flag. Prevents single-line spew
+            // when a hub file has hundreds of importers.
+            let out = format!(
+                "Impact: {} | direct_importers={} transitive={} cochange={}\n",
                 params.file_path,
                 direct_names.len(),
                 transitive_names.len(),
                 cochanges.len(),
             );
-            if !direct_names.is_empty() {
-                out.push_str(&format!("Direct: {}\n", direct_names.join(", ")));
-            }
             return Ok(out);
         }
 

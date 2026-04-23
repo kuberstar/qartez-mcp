@@ -85,8 +85,20 @@ impl QartezServer {
         max_bytes: usize,
     ) -> Result<String, String> {
         let abs_path = self.safe_resolve(fp)?;
-        let source = std::fs::read_to_string(&abs_path)
-            .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
+        if looks_binary(&abs_path) {
+            return Err(format!(
+                "{fp} appears to be binary; qartez_read supports text only"
+            ));
+        }
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData
+                || e.to_string().contains("did not contain valid UTF-8")
+            {
+                format!("{fp} appears to be binary; qartez_read supports text only")
+            } else {
+                format!("Cannot read {}: {e}", abs_path.display())
+            }
+        })?;
         let lines: Vec<&str> = source.lines().collect();
         let total_lines = lines.len();
         if total_lines == 0 {
@@ -127,16 +139,34 @@ impl QartezServer {
         }
         let end_idx = (end as usize).min(total_lines);
 
-        let mut out = format!("{fp} L{start}-{end_idx}\n");
+        let mut body = String::new();
         let mut truncated_at: Option<usize> = None;
+        let mut last_written_line: Option<usize> = None;
+        // Reserve a conservative header budget so the final response still
+        // fits under max_bytes after we stamp the real range on top. The
+        // header is bounded by file-path length + a few digits, so 160 is
+        // plenty in practice.
+        let header_reserve = 160usize;
+        let body_cap = max_bytes.saturating_sub(header_reserve);
         for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
             let formatted = format!("{:>4} | {}\n", start_idx + i + 1, line);
-            if out.len() + formatted.len() > max_bytes {
+            if body.len() + formatted.len() > body_cap {
                 truncated_at = Some(start_idx + i);
                 break;
             }
-            out.push_str(&formatted);
+            body.push_str(&formatted);
+            last_written_line = Some(start_idx + i + 1);
         }
+        let shown_end = last_written_line.unwrap_or(end_idx);
+        let header = if truncated_at.is_some() {
+            format!(
+                "{fp} L{start}-{shown_end} shown, full range L{start}-{end_idx} (total lines: {total_lines})\n",
+            )
+        } else {
+            format!("{fp} L{start}-{shown_end}\n")
+        };
+        let mut out = header;
+        out.push_str(&body);
         if let Some(cut) = truncated_at {
             out.push_str(&format!(
                 "// ... (truncated at line {}, response reached {max_bytes}-byte cap; raise `max_bytes` or page with `start_line`/`limit`)\n",
@@ -203,6 +233,36 @@ impl QartezServer {
 
         let total_symbols: usize = per_query.iter().map(|(_, f)| f.len()).sum();
         let mut out = String::new();
+
+        // Ambiguity warning: when a single query matched definitions in
+        // two or more distinct files and the caller did not pin a
+        // `file_path`, surface every hit up front so the caller knows the
+        // concatenated output spans multiple translation units. We still
+        // return all matches - this is advisory, not an error.
+        if file_filter.is_none() {
+            for (_idx, filtered) in &per_query {
+                let mut seen_files: std::collections::BTreeSet<&str> =
+                    std::collections::BTreeSet::new();
+                for (_, file) in filtered.iter() {
+                    seen_files.insert(file.path.as_str());
+                }
+                if seen_files.len() >= 2
+                    && let Some((sym, _)) = filtered.first()
+                {
+                    let joined: Vec<String> = seen_files.iter().map(|s| (*s).to_string()).collect();
+                    out.push_str(&format!(
+                        "// warning: symbol '{}' defined in {} files: {}. Pass file_path=<one-of> to disambiguate.\n",
+                        sym.name,
+                        seen_files.len(),
+                        joined.join(", "),
+                    ));
+                }
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+        }
+
         let mut rendered_any = false;
         let mut rendered_count: usize = 0;
         let mut truncated = false;
@@ -213,9 +273,12 @@ impl QartezServer {
 
                 // Stop before writing if this section would push us past the
                 // cap. We still include at least one full section even if it
-                // exceeds the budget alone — truncating a symbol mid-line is
-                // worse than returning a single over-budget response.
-                if !out.is_empty() && out.len() + section.len() > max_bytes {
+                // exceeds the budget alone - truncating a symbol mid-line is
+                // worse than returning a single over-budget response. We key
+                // off `rendered_any` (not `out.is_empty()`) so ambiguity
+                // warnings prepended above do not short-circuit the first
+                // section's "always render at least one" rule.
+                if rendered_any && out.len() + section.len() > max_bytes {
                     truncated = true;
                     break 'outer;
                 }
@@ -226,6 +289,19 @@ impl QartezServer {
         }
 
         if !rendered_any {
+            // Tailor the message to the request arity: single-name
+            // lookups read naturally as `No symbol found with name
+            // 'Foo'`, while multi-name batches keep the `name(s)
+            // [a, b, c]` array form. This avoids the awkward
+            // `[NoSuchSymbol]` bracket-wrap for the common single
+            // lookup without losing the list form when it matters.
+            if queries.len() == 1 {
+                let name = &queries[0];
+                if let Some(fp) = file_filter {
+                    return Err(format!("No symbol '{name}' found in file matching '{fp}'"));
+                }
+                return Err(format!("No symbol found with name '{name}'"));
+            }
             let joined = queries.join(", ");
             if let Some(fp) = file_filter {
                 return Err(format!(
@@ -265,8 +341,24 @@ impl QartezServer {
         blast_radii: &HashMap<i64, i64>,
     ) -> Result<String, String> {
         let abs_path = self.safe_resolve(&file.path)?;
-        let source = std::fs::read_to_string(&abs_path)
-            .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
+        if looks_binary(&abs_path) {
+            return Err(format!(
+                "{} appears to be binary; qartez_read supports text only",
+                file.path
+            ));
+        }
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData
+                || e.to_string().contains("did not contain valid UTF-8")
+            {
+                format!(
+                    "{} appears to be binary; qartez_read supports text only",
+                    file.path
+                )
+            } else {
+                format!("Cannot read {}: {e}", abs_path.display())
+            }
+        })?;
 
         let lines: Vec<&str> = source.lines().collect();
         // Expand the window by `context_lines` on the start side;
@@ -300,6 +392,35 @@ impl QartezServer {
 /// not have to clear `symbol_name` explicitly. Empty strings in the list
 /// are dropped as no-ops rather than erroring, so callers can freely
 /// splat variable-length arrays.
+/// Decide whether `path` points at binary content before we try to pull
+/// it into a `String`. A two-layer probe: (1) extension blacklist for
+/// the common visual / archive / compiled asset types, (2) NUL-byte scan
+/// of the first 8 KiB, which is the same heuristic `git` and `grep -I`
+/// use. Keeps us from leaking UTF-8 decode errors to callers and lets us
+/// return a human-friendly "file is binary" message instead.
+fn looks_binary(path: &std::path::Path) -> bool {
+    const BINARY_EXTS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "bmp", "tiff", "ico", "webp", "pdf", "zip", "gz", "tgz",
+        "bz2", "xz", "7z", "rar", "tar", "exe", "dll", "so", "dylib", "a", "lib", "class", "o",
+        "wasm", "jar", "mp3", "mp4", "mov", "avi", "mkv", "webm", "ogg", "flac", "wav", "woff",
+        "woff2", "ttf", "otf", "eot", "db", "sqlite", "bin",
+    ];
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && BINARY_EXTS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext.trim_start_matches('.')))
+    {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].contains(&0u8)
+}
+
 fn parse_symbol_queries(
     symbols: Option<Vec<String>>,
     symbol_name: Option<String>,

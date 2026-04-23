@@ -65,7 +65,7 @@ The installer downloads a pre-built binary for your platform (under 10 seconds),
 Windows (native PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "iwr https://qartez.dev/install.ps1 -useb | iex"
+powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1 -useb | iex"
 ```
 
 Open any project in your IDE - Qartez indexes it automatically on session start. No manual step needed. The file watcher keeps the index fresh as you edit.
@@ -131,7 +131,7 @@ Configure a specific subset of IDEs only. Detected paths:
 | Goose | `~/.config/goose/config.yaml` |
 | Warp | `~/.warp/mcp_settings.json` |
 | Augment | `~/.augment/settings.json` |
-| OpenCode | `~/.config/opencode/opencode.json` |
+| OpenCode | `~/.config/opencode/opencode.json` (or `opencode.jsonc`) |
 | Codex CLI | `~/.codex/config.toml` |
 | Antigravity | `~/.gemini/antigravity/mcp_config.json` |
 

@@ -36,6 +36,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulKnowledgeParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_knowledge")?;
         if self.git_depth == 0 {
             return Err(
                 "Knowledge analysis requires git history. Re-index with --git-depth > 0.".into(),
@@ -43,7 +44,13 @@ impl QartezServer {
         }
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let limit = params.limit.unwrap_or(20) as usize;
+        // `limit=0` means "no cap" project-wide convention. `limit=None`
+        // keeps the historical default of 20.
+        let limit = match params.limit {
+            None => 20,
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+        };
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(KnowledgeLevel::File);
 
@@ -71,16 +78,39 @@ impl QartezServer {
 
         drop(conn);
 
-        let file_authorships = crate::git::knowledge::analyze_knowledge(
-            &self.project_root,
-            &file_paths,
-            params.author.as_deref(),
-        )
-        .map_err(|e| format!("knowledge analysis failed: {e}"))?;
+        // Run blame without the author filter up front. Applying the filter
+        // after the sweep lets us detect "no matches" and emit the real
+        // roster instead of the old misleading "no blame data" message.
+        let mut full_authorships =
+            crate::git::knowledge::analyze_knowledge(&self.project_root, &file_paths, None)
+                .map_err(|e| format!("knowledge analysis failed: {e}"))?;
 
-        if file_authorships.is_empty() {
+        if full_authorships.is_empty() {
             return Ok("No blame data available. Ensure the repository has commit history.".into());
         }
+
+        let file_authorships = if let Some(author_query) = params.author.as_deref() {
+            let filter_lower = author_query.to_lowercase();
+            let any_match = full_authorships.iter().any(|f| {
+                f.authors
+                    .iter()
+                    .any(|(name, _)| name.to_lowercase().contains(&filter_lower))
+            });
+            if !any_match {
+                let roster = top_authors(&full_authorships, 5);
+                return Ok(format!(
+                    "No files touched by author matching '{author_query}'. Available authors: {roster}.",
+                ));
+            }
+            full_authorships.retain(|f| {
+                f.authors
+                    .iter()
+                    .any(|(name, _)| name.to_lowercase().contains(&filter_lower))
+            });
+            full_authorships
+        } else {
+            full_authorships
+        };
 
         match level {
             KnowledgeLevel::File => {
@@ -91,7 +121,9 @@ impl QartezServer {
                         .cmp(&b.bus_factor)
                         .then(b.total_lines.cmp(&a.total_lines))
                 });
-                files.truncate(limit);
+                if limit != usize::MAX {
+                    files.truncate(limit);
+                }
 
                 if concise {
                     let mut out = String::from("# bus_factor lines authors file\n");
@@ -153,7 +185,9 @@ impl QartezServer {
             }
             KnowledgeLevel::Module => {
                 let mut modules = crate::git::knowledge::rollup_modules(&file_authorships);
-                modules.truncate(limit);
+                if limit != usize::MAX {
+                    modules.truncate(limit);
+                }
 
                 if modules.is_empty() {
                     return Ok("No module data available.".into());
@@ -211,4 +245,29 @@ impl QartezServer {
             }
         }
     }
+}
+
+/// Sum per-author line counts across every file in `authorships` and
+/// return the top `n` names as a comma-separated roster. Used to salvage
+/// a useful error message when the caller's `author=` filter matches no
+/// one - surfacing the real roster lets them correct a typo without
+/// re-running blame manually.
+fn top_authors(authorships: &[crate::git::knowledge::FileAuthorship], n: usize) -> String {
+    let mut totals: HashMap<String, u32> = HashMap::new();
+    for f in authorships {
+        for (name, lines) in &f.authors {
+            *totals.entry(name.clone()).or_insert(0) += *lines;
+        }
+    }
+    let mut ranked: Vec<(String, u32)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.truncate(n);
+    if ranked.is_empty() {
+        return "(none)".to_string();
+    }
+    ranked
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }

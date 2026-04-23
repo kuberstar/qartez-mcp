@@ -36,14 +36,53 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulContextParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_context")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
         let explain = params.explain.unwrap_or(false);
-        let limit = params.limit.unwrap_or(15) as usize;
+        // `limit=0` means "no cap" - uniform across qartez query tools.
+        let limit = match params.limit {
+            None => 15,
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+        };
 
         if params.files.is_empty() {
             return Err("Provide at least one file path in 'files' parameter".to_string());
+        }
+
+        // Verify every input path exists in the index before any scoring.
+        // An unindexed path used to fall through to "No related context
+        // files found. The specified files may be isolated." which reads
+        // like a legitimate but empty answer; callers could not tell the
+        // file was simply missing.
+        let mut missing: Vec<&String> = Vec::new();
+        for file_path in &params.files {
+            if read::get_file_by_path(&conn, file_path)
+                .map_err(|e| format!("DB error: {e}"))?
+                .is_none()
+            {
+                missing.push(file_path);
+            }
+        }
+        if !missing.is_empty() {
+            // Singleton errors mirror the `File '<path>' not found in
+            // index` format used across `qartez_stats` / `qartez_impact` /
+            // `qartez_outline` / `qartez_cochange`. Multi-file errors keep
+            // a compact list-form that still begins with "Files '<a>',
+            // '<b>' not found in index" so callers can grep consistently.
+            if missing.len() == 1 {
+                return Err(format!("File '{}' not found in index", missing[0]));
+            }
+            return Err(format!(
+                "Files {} not found in index",
+                missing
+                    .iter()
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
         }
 
         // Per-reason breakdown. Keyed by path, each entry tracks the

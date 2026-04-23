@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_rename",
-        description = "Rename a symbol across the entire codebase: definition, imports, and all usages. Uses tree-sitter AST matching when available, falls back to word-boundary matching. Preview by default; set apply=true to execute.",
+        description = "Rename a symbol across the entire codebase: definition, imports, and all usages. Uses tree-sitter AST matching when available, falls back to word-boundary matching. When the name is shared by multiple kinds or defined in multiple files, pass `kind` and/or `file_path` to disambiguate - the tool refuses to run otherwise. Set `allow_collision=true` to proceed when `new_name` already exists as a defined symbol in a touched file. Preview by default; set apply=true to execute.",
         annotations(
             title = "Rename Symbol",
             read_only_hint = false,
@@ -36,16 +36,92 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRenameParams>,
     ) -> Result<String, String> {
-        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let refs = read::get_symbol_references(&conn, &params.old_name)
-            .map_err(|e| format!("DB error: {e}"))?;
+        if params.old_name == params.new_name {
+            return Ok(format!(
+                "No-op: old_name and new_name are identical ('{}').",
+                params.old_name,
+            ));
+        }
 
-        if refs.is_empty() {
+        let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+
+        // Resolve candidate definitions with the caller-supplied kind /
+        // file_path filters. When multiple definitions remain AND the caller
+        // has not narrowed via either filter, refuse - a silent match-all
+        // rename across method/free-fn or cross-file same-name symbols was
+        // the root cause of the rewrite-every-HashMap::new() incident.
+        let candidates = read::find_symbol_by_name_filtered(
+            &conn,
+            &params.old_name,
+            params.kind.as_deref(),
+            params.file_path.as_deref(),
+        )
+        .map_err(|e| format!("DB error: {e}"))?;
+
+        if candidates.is_empty() {
             return Err(format!("No symbol found with name '{}'", params.old_name));
         }
 
+        let distinct_kinds: std::collections::BTreeSet<String> =
+            candidates.iter().map(|(s, _)| s.kind.clone()).collect();
+        let distinct_files: std::collections::BTreeSet<String> =
+            candidates.iter().map(|(_, f)| f.path.clone()).collect();
+
+        let kind_set = params.kind.as_deref().filter(|s| !s.is_empty()).is_some();
+        let file_hint_set = params
+            .file_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        if candidates.len() > 1 && !kind_set && !file_hint_set {
+            let locations: Vec<String> = candidates
+                .iter()
+                .map(|(s, f)| {
+                    format!(
+                        "  {} ({}) in {} [L{}-L{}]",
+                        s.name, s.kind, f.path, s.line_start, s.line_end
+                    )
+                })
+                .collect();
+            let hint = if distinct_kinds.len() > 1 {
+                "Pass `kind` (e.g. 'function', 'method') to pick one, or `file_path` to scope to a single file."
+            } else if distinct_files.len() > 1 {
+                "Pass `file_path` to pick a single defining file."
+            } else {
+                "Pass `kind` and/or `file_path` to disambiguate."
+            };
+            return Err(format!(
+                "Refusing to rename '{}': multiple definitions found. {hint}\n{}",
+                params.old_name,
+                locations.join("\n"),
+            ));
+        }
+
+        // Restrict the rename to the disambiguated defining-file set. When
+        // fallback (text-only) scanning is the sole signal for a file, we
+        // demand a `file_path` filter so the scan never crosses into code
+        // the caller did not explicitly name.
+        let allowed_def_files: std::collections::BTreeSet<String> =
+            candidates.iter().map(|(_, f)| f.path.clone()).collect();
+
+        // Fetch reference graph limited to the disambiguated symbol slot.
+        let refs = read::get_symbol_references_filtered(
+            &conn,
+            &params.old_name,
+            params.kind.as_deref(),
+            params.file_path.as_deref(),
+        )
+        .map_err(|e| format!("DB error: {e}"))?;
+
+        if refs.is_empty() {
+            return Err(format!(
+                "No symbol found with name '{}' after applying kind / file_path filter.",
+                params.old_name,
+            ));
+        }
+
         // Union every file that could host an occurrence: the def file,
-        // every edge-graph importer (unfiltered — the previous
+        // every edge-graph importer (unfiltered - the previous
         // `specifier.contains(old_name)` filter dropped real callers when
         // the `use` statement imported the parent module, e.g.
         // `use crate::storage::read;` followed by `read::symbol(...)`, or
@@ -53,12 +129,12 @@ impl QartezServer {
         // by the body-FTS fallback (catches external-crate imports and
         // Rust module-form `use` statements whose resolver mis-routes the
         // edge to `mod.rs`). Preview-mode renames ship to the caller as
-        // the ground truth for an apply step — missing a site here means
+        // the ground truth for an apply step - missing a site here means
         // the apply breaks the build.
         let mut file_set: BTreeSet<String> = BTreeSet::new();
         for (_, def_file, importers) in &refs {
             file_set.insert(def_file.path.clone());
-            for (_, importer_file) in importers {
+            for (_, importer_file, _from_symbol_id) in importers {
                 file_set.insert(importer_file.path.clone());
             }
         }
@@ -67,7 +143,58 @@ impl QartezServer {
                 file_set.insert(path);
             }
         }
-        let files_to_scan: Vec<String> = file_set.into_iter().collect();
+        // When the caller pinned to a single file via `file_path`, drop
+        // homonym files from the scan set. Cross-file same-name symbols
+        // (e.g. `is_test_path` defined in both src/a.rs and src/b.rs)
+        // are legitimately distinct, and the body-FTS sweep surfaces
+        // every file that mentions the name - a rewrite there would
+        // corrupt the sibling symbol.
+        let files_to_scan: Vec<String> = if file_hint_set {
+            let mut result: BTreeSet<String> = allowed_def_files.clone();
+            if let Some(fp) = params.file_path.as_deref() {
+                result.insert(crate::index::to_forward_slash(fp.to_string()));
+            }
+            for (_, _, importers) in &refs {
+                for (_, importer_file, _from_symbol_id) in importers {
+                    result.insert(importer_file.path.clone());
+                }
+            }
+            result.into_iter().collect()
+        } else {
+            file_set.into_iter().collect()
+        };
+
+        // Detect collisions with `new_name` before any write. A rename that
+        // silently collides with an existing symbol in a touched file is
+        // indistinguishable in the output from a legitimate merge, and the
+        // resulting source typically won't compile. Require opt-in via
+        // `allow_collision=true`.
+        let allow_collision = params.allow_collision.unwrap_or(false);
+        if !allow_collision {
+            let mut collisions: Vec<String> = Vec::new();
+            for rel_path in &files_to_scan {
+                if let Ok(Some(file_row)) = read::get_file_by_path(&conn, rel_path)
+                    && let Ok(file_syms) = read::get_symbols_for_file(&conn, file_row.id)
+                {
+                    for s in file_syms {
+                        if s.name == params.new_name {
+                            collisions.push(format!(
+                                "  {} ({}) in {} [L{}-L{}]",
+                                s.name, s.kind, rel_path, s.line_start, s.line_end
+                            ));
+                        }
+                    }
+                }
+            }
+            if !collisions.is_empty() {
+                return Err(format!(
+                    "Refusing to rename '{}' -> '{}': new_name already defined in touched file(s). Pass `allow_collision=true` to proceed anyway.\n{}",
+                    params.old_name,
+                    params.new_name,
+                    collisions.join("\n"),
+                ));
+            }
+        }
         drop(conn);
 
         let apply = params.apply.unwrap_or(false);
@@ -145,8 +272,27 @@ impl QartezServer {
                     files_touched.push(rel_path.clone());
                 }
                 None => {
-                    // Language not supported by tree-sitter - use a
-                    // word-boundary text scan as the only available signal.
+                    // Language not supported by tree-sitter - the only
+                    // available signal is a word-boundary text scan. That's
+                    // dangerously coarse: a bare name like `new` hits
+                    // `HashMap::new()`, `Vec::new()`, `Regex::new()` and
+                    // every docstring mention. Refuse to run this branch
+                    // unless the caller pinned the rename to a single file
+                    // AND the current file is one of the defining files or
+                    // the caller's explicit file_path.
+                    let is_defining_file = allowed_def_files.contains(rel_path);
+                    let is_hinted_file = params
+                        .file_path
+                        .as_deref()
+                        .map(|fp| crate::index::to_forward_slash(fp.to_string()) == *rel_path)
+                        .unwrap_or(false);
+                    if !file_hint_set || !(is_defining_file || is_hinted_file) {
+                        // Skip the file silently - FTS hits in a file the
+                        // caller did not disambiguate are not enough to
+                        // justify a text-only rewrite. For AST-unsupported
+                        // languages the caller must pass `file_path`.
+                        continue;
+                    }
                     let source_arc = self.cached_source(rel_path).ok_or_else(|| {
                         let display = self
                             .safe_resolve(rel_path)

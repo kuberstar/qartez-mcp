@@ -170,6 +170,64 @@ fn clones_include_tests_restores_all_members() {
 }
 
 // ---------------------------------------------------------------------------
+// C5 qartez_clones: small `limit` must not return empty when the top
+// raw groups are test code. Loop-fetch oversamples the DB so production
+// clones still surface at limit=1..=4.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clones_small_limit_still_surfaces_production_when_tests_dominate() {
+    let dir = TempDir::new().unwrap();
+    write_clones_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    for limit in 1..=3 {
+        let out = server
+            .call_tool_by_name(
+                "qartez_clones",
+                json!({ "min_lines": 5, "limit": limit, "format": "detailed" }),
+            )
+            .unwrap_or_else(|e| panic!("qartez_clones limit={limit} must succeed: {e}"));
+
+        assert!(
+            !out.contains("No clones in page"),
+            "limit={limit} must not hit empty-page stub when production clones exist: {out}"
+        );
+        assert!(
+            out.contains("process_a") || out.contains("process_b"),
+            "limit={limit} must surface a production clone name: {out}"
+        );
+        assert!(
+            !out.contains("test_fixture_alpha") && !out.contains("test_fixture_beta"),
+            "limit={limit} must not leak cfg(test) fixtures via the oversample loop: {out}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C9 qartez_clones: min_lines=0 is a validation error, not a silent no-op.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clones_min_lines_zero_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    write_clones_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_clones",
+            json!({ "min_lines": 0, "limit": 5, "format": "detailed" }),
+        )
+        .expect_err("min_lines=0 must return a validation error");
+
+    assert!(
+        err.contains("min_lines must be >= 1"),
+        "error must explain why min_lines=0 is rejected, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Part 2. CC ignores `?` and feature-envy skips associated calls
 // ---------------------------------------------------------------------------
 
@@ -508,4 +566,387 @@ CREATE TABLE IF NOT EXISTS baz (
              `const X: &str = \"...different SQL...\"`. output:\n{out}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Part 5. Smells: trait dispatch is not feature envy.
+//
+// A single source-level call through `&dyn Trait` expands in the symbol-ref
+// index into one edge per impl - same method name, different owner types.
+// The naive envy detector interpreted those 6 edges as 6 distinct foreign
+// calls and flagged the caller with a 6:1 ratio. The fix recognizes the
+// fan-out shape (one method name shared across 3+ owner types dominating
+// the external-call set) and suppresses the flag.
+// ---------------------------------------------------------------------------
+
+fn write_trait_dispatch_fixture(dir: &Path) {
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Four impls of a common trait with identical method signatures, then
+    // a caller that walks through them via `&dyn Trait`. The rust_lang
+    // resolver emits one Call edge per impl method with the same target
+    // name, which used to read as envy. After the fix, the shared-method
+    // fan-out is recognized and suppressed.
+    let dispatch = r#"pub trait Extractor {
+    fn run(&self, input: &str) -> String;
+    fn name(&self) -> &str;
+}
+
+pub struct JavaExt;
+pub struct CSharpExt;
+pub struct OCamlExt;
+pub struct KotlinExt;
+
+impl Extractor for JavaExt {
+    fn run(&self, input: &str) -> String { input.to_string() }
+    fn name(&self) -> &str { "java" }
+}
+
+impl Extractor for CSharpExt {
+    fn run(&self, input: &str) -> String { input.to_string() }
+    fn name(&self) -> &str { "csharp" }
+}
+
+impl Extractor for OCamlExt {
+    fn run(&self, input: &str) -> String { input.to_string() }
+    fn name(&self) -> &str { "ocaml" }
+}
+
+impl Extractor for KotlinExt {
+    fn run(&self, input: &str) -> String { input.to_string() }
+    fn name(&self) -> &str { "kotlin" }
+}
+
+pub struct ExtractorPool;
+
+impl ExtractorPool {
+    pub fn process(&self, ext: &dyn Extractor, input: &str) -> (String, String) {
+        let out = ext.run(input);
+        let label = ext.name().to_string();
+        (out, label)
+    }
+}
+"#;
+    fs::write(src.join("dispatch.rs"), dispatch).unwrap();
+}
+
+#[test]
+fn feature_envy_suppresses_trait_dispatch_fan_out() {
+    let dir = TempDir::new().unwrap();
+    write_trait_dispatch_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    let out = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({
+                "kind": "feature_envy",
+                "envy_ratio": 1.0,
+                "limit": 50,
+                "format": "detailed",
+            }),
+        )
+        .expect("qartez_smells feature_envy should succeed");
+
+    // `process` calls `ext.run()` and `ext.name()` once each. The resolver
+    // fans those out across every impl, but since `run` and `name` are
+    // both implemented on >= 3 distinct owner types, the fix attributes
+    // them to trait dispatch and the caller must NOT surface as envy.
+    assert!(
+        !out.contains("process"),
+        "process (via &dyn Extractor) must not be flagged as feature envy: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part 6. Smells: service handler + DTO param is not feature envy.
+//
+// Types whose name matches a service/handler suffix legitimately operate
+// on DTO parameters. Without the fix, a `QartezServer::qartez_foo(step: &Step)`
+// style handler that processes 7+ fields on the `Step` DTO would get
+// envy ratio 7.0 and be flagged for "Move to Step" refactor - which is
+// structurally wrong for an MCP tool router.
+// ---------------------------------------------------------------------------
+
+fn write_service_handler_fixture(dir: &Path) {
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let service = r#"pub struct Payload {
+    value: u32,
+}
+
+impl Payload {
+    pub fn new(value: u32) -> Self { Self { value } }
+    pub fn incr(&self) -> u32 { self.value + 1 }
+    pub fn decr(&self) -> u32 { self.value.saturating_sub(1) }
+    pub fn label(&self) -> String { format!("p{}", self.value) }
+    pub fn debug(&self) -> String { format!("{{value={}}}", self.value) }
+    pub fn double(&self) -> u32 { self.value * 2 }
+}
+
+pub struct ApiServer;
+
+impl ApiServer {
+    pub fn handle(&self, payload: &Payload) -> String {
+        let a = payload.incr();
+        let b = payload.decr();
+        let c = payload.label();
+        let d = payload.debug();
+        let e = payload.double();
+        let f = payload.label();
+        format!("{a}-{b}-{c}-{d}-{e}-{f}")
+    }
+}
+"#;
+    fs::write(src.join("service.rs"), service).unwrap();
+}
+
+#[test]
+fn feature_envy_suppresses_service_handler_on_dto() {
+    let dir = TempDir::new().unwrap();
+    write_service_handler_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    let out = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({
+                "kind": "feature_envy",
+                "envy_ratio": 1.0,
+                "limit": 50,
+                "format": "detailed",
+            }),
+        )
+        .expect("qartez_smells feature_envy should succeed");
+
+    // `ApiServer::handle` calls six Payload methods. Without the fix the
+    // envy ratio is 6:0 = 6.0 and the row surfaces. With the service-
+    // handler suffix exclusion, it must not.
+    assert!(
+        !out.contains("ApiServer"),
+        "ApiServer::handle (service suffix + DTO param) must not be flagged as envy: {out}"
+    );
+    assert!(
+        !out.contains("| handle "),
+        "handle must not be listed as a feature-envy row: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part 7. Smells: flat-match dispatcher gets a distinct kind and advice.
+//
+// A function whose CC budget is dominated by a single flat match (many
+// trivial arms) should still surface as a god function when thresholds
+// are hit - but flagged as `flat_dispatcher` so the recommendation can
+// steer users away from the useless "Extract Method on the largest
+// branch" advice. Nested god functions must still read as plain
+// god_function so the regression doesn't silence real smells.
+// ---------------------------------------------------------------------------
+
+fn write_flat_dispatcher_fixture(dir: &Path) {
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Eight-arm flat match; each arm is one line. CC should track arms,
+    // the body is long enough to cross min_lines at the default 50, so
+    // drop the threshold in the test call.
+    let body = r#"pub enum Kind {
+    A, B, C, D, E, F, G, H, I, J, K, L,
+}
+
+pub fn build_dispatch(k: Kind) -> u32 {
+    match k {
+        Kind::A => 1,
+        Kind::B => 2,
+        Kind::C => 3,
+        Kind::D => 4,
+        Kind::E => 5,
+        Kind::F => 6,
+        Kind::G => 7,
+        Kind::H => 8,
+        Kind::I => 9,
+        Kind::J => 10,
+        Kind::K => 11,
+        Kind::L => 12,
+    }
+}
+
+pub fn deeply_nested_god(x: i32, y: i32) -> i32 {
+    let mut total = 0;
+    if x > 0 {
+        if y > 0 {
+            for i in 0..x {
+                if i % 2 == 0 {
+                    total += i;
+                } else {
+                    total -= i;
+                }
+                if i > 5 {
+                    total *= 2;
+                }
+            }
+        } else {
+            for j in 0..y.abs() {
+                if j % 3 == 0 {
+                    total += 1;
+                } else if j % 3 == 1 {
+                    total += 2;
+                } else {
+                    total += 3;
+                }
+            }
+        }
+    } else if y > 0 {
+        while total < 100 {
+            total += y;
+            if total > 50 {
+                break;
+            }
+        }
+    } else {
+        total = x + y;
+    }
+    total
+}
+"#;
+    fs::write(src.join("dispatch.rs"), body).unwrap();
+}
+
+#[test]
+fn god_function_flags_flat_dispatcher_kind() {
+    let dir = TempDir::new().unwrap();
+    write_flat_dispatcher_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    let out = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({
+                "kind": "god_function",
+                // Lower thresholds so the 12-arm match qualifies despite
+                // being short.
+                "min_complexity": 10,
+                "min_lines": 12,
+                "limit": 50,
+                "format": "detailed",
+            }),
+        )
+        .expect("qartez_smells god_function should succeed");
+
+    // When build_dispatch surfaces, it must be tagged as `flat_dispatcher`.
+    // If thresholds don't pull it into the output at all, that's also an
+    // acceptable outcome per the spec ("(a) Skip god_function reporting
+    // entirely, OR (b) flag as flat_dispatcher"). Assert the disjunction.
+    if out.contains("build_dispatch") {
+        assert!(
+            out.contains("flat_dispatcher"),
+            "build_dispatch surfaced but was not tagged flat_dispatcher: {out}"
+        );
+    }
+}
+
+#[test]
+fn god_function_still_flags_real_god_function() {
+    let dir = TempDir::new().unwrap();
+    write_flat_dispatcher_fixture(dir.path());
+    let server = build_and_index(dir.path());
+
+    let out = server
+        .call_tool_by_name(
+            "qartez_smells",
+            json!({
+                "kind": "god_function",
+                // Thresholds tuned so deeply_nested_god (CC ~= 14, lines ~= 30)
+                // reliably qualifies.
+                "min_complexity": 8,
+                "min_lines": 20,
+                "limit": 50,
+                "format": "detailed",
+            }),
+        )
+        .expect("qartez_smells god_function should succeed");
+
+    assert!(
+        out.contains("deeply_nested_god"),
+        "real god function must still surface under god_function detection: {out}"
+    );
+    // The deeply-nested function has almost no `=>` arrows, so it must
+    // not be mistaken for a flat dispatcher.
+    let deeply_line = out
+        .lines()
+        .find(|l| l.contains("deeply_nested_god"))
+        .unwrap_or("");
+    assert!(
+        !deeply_line.contains("flat_dispatcher"),
+        "deeply_nested_god must not be tagged as flat_dispatcher: {deeply_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part 5. Clone detector labels trait-impl boilerplate groups as a
+// candidate for a default method implementation. Byte-identical method
+// bodies across `impl <Trait> for <Struct>` blocks are mechanical and
+// collapse into `trait { fn m(...) { <body> } }`, so the report should
+// name them differently from generic refactor-opportunity clones.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clones_label_trait_impl_boilerplate_as_default_method_candidate() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    let trait_decl = r#"pub trait Lang {
+    fn name(&self) -> String;
+}
+"#;
+    fs::write(src.join("lang.rs"), trait_decl).unwrap();
+
+    // Three structurally and byte-identical `fn name` bodies, each in
+    // its own `impl Lang for <Struct>` block in its own file. Every
+    // body is long enough to clear the default `min_lines = 8` cutoff.
+    let body = |struct_name: &str| -> String {
+        format!(
+            r#"use crate::lang::Lang;
+
+pub struct {struct_name};
+
+impl Lang for {struct_name} {{
+    fn name(&self) -> String {{
+        let mut buf = String::new();
+        buf.push_str("x");
+        buf.push_str("y");
+        buf.push_str("z");
+        buf.push('!');
+        buf.push('?');
+        buf
+    }}
+}}
+"#
+        )
+    };
+    fs::write(src.join("a.rs"), body("CLang")).unwrap();
+    fs::write(src.join("b.rs"), body("CSharpSupport")).unwrap();
+    fs::write(src.join("c.rs"), body("GoLang")).unwrap();
+
+    let server = build_and_index(dir.path());
+    let out = server
+        .call_tool_by_name(
+            "qartez_clones",
+            json!({ "min_lines": 5, "limit": 50, "format": "detailed" }),
+        )
+        .expect("qartez_clones should succeed");
+
+    assert!(
+        out.contains("trait boilerplate"),
+        "trait-impl clone group must carry the `trait boilerplate` label so \
+         the user knows to promote `fn name` to a default method, got:\n{out}"
+    );
+    assert!(
+        out.contains("candidate for default method"),
+        "trait-boilerplate groups must recommend a default method impl, got:\n{out}"
+    );
+    assert!(
+        out.contains("fn name"),
+        "the recommendation must name the method so the user can find it, got:\n{out}"
+    );
 }

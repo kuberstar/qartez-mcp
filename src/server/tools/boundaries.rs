@@ -1,6 +1,9 @@
+// Rust guideline compliant 2026-04-22
+
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData};
@@ -19,11 +22,38 @@ use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
 use crate::toolchain;
 
+/// Resolve a user-supplied write target for `qartez_boundaries`.
+///
+/// Accepts either a path relative to the project root (delegates to
+/// `safe_resolve`) or an absolute path whose parent directory already
+/// exists. The "absolute + existing parent" contract matches the
+/// policy shared with `qartez_wiki`.
+fn resolve_write_target(server: &QartezServer, user_path: &str) -> Result<PathBuf, String> {
+    let trimmed = user_path.trim();
+    if trimmed.is_empty() {
+        return Err("write_to must not be empty".to_string());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| format!("Path '{trimmed}' has no parent directory"))?;
+        if !parent.exists() {
+            return Err(format!(
+                "Parent directory '{}' does not exist. Create it first or use a path relative to the project root.",
+                parent.display()
+            ));
+        }
+        return Ok(candidate.to_path_buf());
+    }
+    server.safe_resolve(trimmed)
+}
+
 #[tool_router(router = qartez_boundaries_router, vis = "pub(super)")]
 impl QartezServer {
     #[tool(
         name = "qartez_boundaries",
-        description = "Check architecture boundary rules defined in `.qartez/boundaries.toml` against the import graph. Each rule says files matching `from` must not import files matching any `deny` pattern (with optional `allow` overrides). Returns the list of violating edges. Pass `suggest=true` to emit a starter config derived from the current Leiden clustering instead of running the checker.",
+        description = "Check architecture boundary rules defined in `.qartez/boundaries.toml` against the import graph. Each rule says files matching `from` must not import files matching any `deny` pattern (with optional `allow` overrides). Returns the list of violating edges. Pass `suggest=true` to emit a starter config derived from the current Leiden clustering instead of running the checker. When `suggest=true` and the clustering table is empty, `auto_cluster=true` (default) runs the clustering on demand; set `auto_cluster=false` to fail loudly instead. `write_to` is only honored with `suggest=true`.",
         annotations(
             title = "Architecture Boundaries",
             read_only_hint = true,
@@ -39,7 +69,11 @@ impl QartezServer {
         use crate::graph::boundaries::{
             check_boundaries, load_config, render_config_toml, suggest_boundaries,
         };
-        use crate::storage::read::{get_all_edges, get_all_file_clusters, get_all_files};
+        use crate::graph::leiden::{LeidenConfig, compute_clusters};
+        use crate::storage::read::{
+            boundaries_all_files, boundaries_edge_pairs, boundaries_file_cluster_pairs,
+            wiki_cluster_row_count,
+        };
 
         let rel_path = params
             .config_path
@@ -50,17 +84,46 @@ impl QartezServer {
         let abs_path = self.safe_resolve(rel_path)?;
         let concise = is_concise(&params.format);
 
-        if params.suggest.unwrap_or(false) {
+        let suggest = params.suggest.unwrap_or(false);
+        let write_to_trimmed = params.write_to.as_deref().map(str::trim).unwrap_or("");
+
+        if !suggest && !write_to_trimmed.is_empty() {
+            return Err(
+                "`write_to` is only valid when `suggest=true`. Pass `suggest=true` to emit a starter config, or remove `write_to`."
+                    .to_string(),
+            );
+        }
+
+        if suggest {
+            let auto_cluster = params.auto_cluster.unwrap_or(true);
+
+            {
+                let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                let cluster_rows =
+                    wiki_cluster_row_count(&conn).map_err(|e| format!("DB error: {e}"))?;
+                if cluster_rows == 0 {
+                    if !auto_cluster {
+                        return Err(
+                            "No cluster assignment found. Run `qartez_wiki` first, or pass `auto_cluster=true` (default) to run the clustering on demand."
+                                .to_string(),
+                        );
+                    }
+                    let leiden = LeidenConfig::default();
+                    compute_clusters(&conn, &leiden)
+                        .map_err(|e| format!("Auto-cluster failed: {e}"))?;
+                }
+            }
+
             let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-            let files = get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
-            let clusters = get_all_file_clusters(&conn).map_err(|e| format!("DB error: {e}"))?;
-            let edges = get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
+            let files = boundaries_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
+            let clusters =
+                boundaries_file_cluster_pairs(&conn).map_err(|e| format!("DB error: {e}"))?;
+            let edges = boundaries_edge_pairs(&conn).map_err(|e| format!("DB error: {e}"))?;
             drop(conn);
 
             if clusters.is_empty() {
-                return Ok(
-                    "No cluster assignment found. Run `qartez_wiki` first to compute \
-                     clusters, then re-run `qartez_boundaries suggest=true`."
+                return Err(
+                    "Clustering ran but produced no assignments; the import graph is empty. Index the project first (`qartez_workspace refresh=true`) and retry."
                         .to_string(),
                 );
             }
@@ -68,10 +131,8 @@ impl QartezServer {
             let cfg = suggest_boundaries(&files, &clusters, &edges);
             let toml = render_config_toml(&cfg);
 
-            if let Some(write_rel) = params.write_to.as_deref().map(str::trim)
-                && !write_rel.is_empty()
-            {
-                let write_abs = self.safe_resolve(write_rel)?;
+            if !write_to_trimmed.is_empty() {
+                let write_abs = resolve_write_target(self, write_to_trimmed)?;
                 if let Some(parent) = write_abs.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
@@ -81,7 +142,7 @@ impl QartezServer {
                 return Ok(format!(
                     "Wrote {} rule(s) to {} ({} bytes).",
                     cfg.boundary.len(),
-                    write_rel,
+                    write_abs.display(),
                     toml.len(),
                 ));
             }
@@ -105,8 +166,8 @@ impl QartezServer {
         let config = load_config(&abs_path).map_err(|e| format!("Config error: {e}"))?;
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let files = get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
-        let edges = get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
+        let files = boundaries_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
+        let edges = boundaries_edge_pairs(&conn).map_err(|e| format!("DB error: {e}"))?;
         drop(conn);
 
         let violations = check_boundaries(&config, &files, &edges);

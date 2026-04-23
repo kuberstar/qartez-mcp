@@ -531,3 +531,340 @@ emit! {
         "INSERT OR IGNORE + UNIQUE constraint must dedupe self-loops; got {self_loops}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Part 4: qartez_refs per-symbol call-site attribution
+//
+// Regression for the bug where `qartez_refs symbol=run` with multiple
+// `run` definitions across different modules attributed every
+// AST-resolved call site named `run` to EVERY `run` definition at once.
+// The old code unioned the defining file, every edge-resolved importer,
+// AND every FTS-body-match path into one global scan set per iteration,
+// so a call to module-a's `run` inside `a.rs` also showed up as a call
+// site for module-b's `run`. The fix restricts scan_paths per-symbol to
+// (def file + files whose `symbol_refs` edge resolved to THIS sym.id).
+// ---------------------------------------------------------------------------
+
+fn extract_direct_call_sites_per_symbol(out: &str) -> HashMap<String, Vec<String>> {
+    // The detailed qartez_refs output interleaves section headers with
+    // "Defined in: <path> [Lx-Ly]" lines and "Direct call sites (N ...)"
+    // blocks. Each call-site entry is "    <path> [L<n>]" or a
+    // continuation "        L<n>" bound to the previous path. The parser
+    // below rebuilds the mapping from {defining_file_path -> list of
+    // caller paths that produced a call site for that symbol}. Keying
+    // on defining_file_path is what actually distinguishes two symbols
+    // named `run`; the name alone cannot because it is identical across
+    // both sections.
+    let mut per_def: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current_def_path: Option<String> = None;
+    let mut in_call_site_block = false;
+    let mut last_path: Option<String> = None;
+    for line in out.lines() {
+        if line.starts_with("# Symbol: ") {
+            current_def_path = None;
+            in_call_site_block = false;
+            last_path = None;
+            continue;
+        }
+        if let Some(def) = line
+            .trim_start()
+            .strip_prefix("Defined in: ")
+            .and_then(|rest| rest.split(" [L").next())
+        {
+            current_def_path = Some(def.to_string());
+            continue;
+        }
+        if line.trim_start().starts_with("Direct call sites (") {
+            in_call_site_block = true;
+            last_path = None;
+            continue;
+        }
+        if in_call_site_block {
+            if line.is_empty() || line.starts_with("# Symbol:") {
+                in_call_site_block = false;
+                last_path = None;
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('L')
+                && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                if let (Some(def), Some(path)) = (&current_def_path, &last_path) {
+                    per_def.entry(def.clone()).or_default().push(path.clone());
+                }
+                continue;
+            }
+            if let Some(path_and_line) = trimmed.split(" [L").next()
+                && !path_and_line.is_empty()
+                && path_and_line != trimmed
+            {
+                let path = path_and_line.to_string();
+                last_path = Some(path.clone());
+                if let Some(def) = &current_def_path {
+                    per_def.entry(def.clone()).or_default().push(path);
+                }
+                continue;
+            }
+            if trimmed.starts_with("... (truncated by token budget)") {
+                continue;
+            }
+            in_call_site_block = false;
+            last_path = None;
+        }
+    }
+    per_def
+}
+
+#[test]
+fn refs_call_sites_are_scoped_to_defining_symbol_not_global() {
+    // Two distinct `run` functions in separate modules. `a.rs` calls its
+    // own `run` from `a::driver_a`; `b.rs` calls its own `run` from
+    // `b::driver_b`. The bug would attribute BOTH call sites to BOTH
+    // `run` definitions because the old scan_paths union put every
+    // FTS-body-match path into each iteration. After the fix, call
+    // sites for `a::run` must list only `src/a.rs`, and call sites for
+    // `b::run` must list only `src/b.rs`.
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let a_src = "pub fn run() -> u32 { 42 }\n\npub fn driver_a() -> u32 {\n    run()\n}\n";
+    let b_src = "pub fn run() -> u32 { 99 }\n\npub fn driver_b() -> u32 {\n    run()\n}\n";
+    let lib_src = "pub mod a;\npub mod b;\n";
+
+    let (dir, conn) = index_project(&[
+        ("src/lib.rs", lib_src),
+        ("src/a.rs", a_src),
+        ("src/b.rs", b_src),
+    ]);
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let out = server
+        .call_tool_by_name(
+            "qartez_refs",
+            json!({ "symbol": "run", "token_budget": 20000 }),
+        )
+        .expect("qartez_refs dispatch");
+
+    let per_def = extract_direct_call_sites_per_symbol(&out);
+    assert!(
+        !per_def.is_empty(),
+        "expected at least one Direct call sites block, got output:\n{out}",
+    );
+
+    let a_sites = per_def.get("src/a.rs").cloned().unwrap_or_default();
+    let b_sites = per_def.get("src/b.rs").cloned().unwrap_or_default();
+
+    assert!(
+        a_sites.iter().all(|p| p == "src/a.rs"),
+        "a::run must only pick up its own intra-file caller; got {a_sites:?}\n\nfull output:\n{out}",
+    );
+    assert!(
+        !a_sites.iter().any(|p| p == "src/b.rs"),
+        "a::run must not attribute the call to b::run as one of its own; got {a_sites:?}\n\nfull output:\n{out}",
+    );
+    assert!(
+        b_sites.iter().all(|p| p == "src/b.rs"),
+        "b::run must only pick up its own intra-file caller; got {b_sites:?}\n\nfull output:\n{out}",
+    );
+    assert!(
+        !b_sites.iter().any(|p| p == "src/a.rs"),
+        "b::run must not attribute the call to a::run as one of its own; got {b_sites:?}\n\nfull output:\n{out}",
+    );
+}
+
+#[test]
+fn refs_call_sites_preserve_intra_file_caller_on_single_definition() {
+    // Guard against over-correction: a single `run` with one caller in
+    // the same file must still report the intra-file call site even
+    // though there is no importer edge. The defining file itself is
+    // unconditionally part of scan_paths in the fix.
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+
+    let lib = "pub fn run() -> u32 { 1 }\n\npub fn driver() -> u32 {\n    run()\n}\n";
+    let (dir, conn) = index_project(&[("src/lib.rs", lib)]);
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
+    let out = server
+        .call_tool_by_name(
+            "qartez_refs",
+            json!({ "symbol": "run", "token_budget": 20000 }),
+        )
+        .expect("qartez_refs dispatch");
+
+    assert!(
+        out.contains("Direct call sites"),
+        "expected an intra-file call site block for the single `run`; got:\n{out}",
+    );
+    assert!(
+        out.contains("src/lib.rs"),
+        "expected src/lib.rs to appear as the intra-file caller; got:\n{out}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part 5: "assert defense" false-positive regression for SEC005
+//
+// `include_tests=true` previously flagged every test that exercised a
+// path-traversal defense, because the rule regex found `../` in the
+// test body even though the test's role was to verify that the code
+// under test REJECTS that traversal. See
+// `graph::security::is_assert_defense` for the heuristic: the symbol
+// must be a test function AND an error-assertion must sit within a
+// narrow window of the match line. The filter applies unconditionally
+// so inline `#[test]` fns in `src/` (which `is_test_path` does not
+// catch) also benefit.
+// ---------------------------------------------------------------------------
+
+/// Scan with tests INCLUDED. Needed so the assert-defense filter gets a
+/// chance to run on symbols whose path conventionally lives under
+/// `src/` with inline `#[test]` functions.
+fn security_scan_with_tests(conn: &Connection, root: &std::path::Path) -> Vec<security::Finding> {
+    let rules = security::builtin_rules();
+    let opts = ScanOptions {
+        include_tests: true,
+        category_filter: None,
+        min_severity: Severity::Low,
+        file_path_filter: None,
+        project_roots: vec![root.to_path_buf()],
+        root_aliases: HashMap::new(),
+    };
+    security::scan(conn, &rules, &opts)
+}
+
+const ASSERT_DEFENSE_FIXTURE: &str = r#"pub fn validate_path(root: &str, rel: &str) -> Result<String, String> {
+    if rel.contains("..") {
+        return Err("traversal".to_string());
+    }
+    Ok(format!("{root}/{rel}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_sneaky_traversal() {
+        let result = validate_path("/tmp", "../../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_parent_escape() {
+        let result = validate_path("/tmp", "../secret");
+        assert!(result.is_err());
+    }
+}
+"#;
+
+#[test]
+fn sec005_assert_defense_test_not_flagged_when_include_tests_true() {
+    let (dir, conn) = index_project(&[("src/guard.rs", ASSERT_DEFENSE_FIXTURE)]);
+    let findings = security_scan_with_tests(&conn, dir.path());
+
+    let sec005_in_tests: Vec<&security::Finding> = findings
+        .iter()
+        .filter(|f| {
+            f.rule_id == "SEC005"
+                && (f.symbol_name == "rejects_sneaky_traversal"
+                    || f.symbol_name == "rejects_parent_escape")
+        })
+        .collect();
+
+    assert!(
+        sec005_in_tests.is_empty(),
+        "tests that assert validate_path rejects traversal must NOT fire SEC005 \
+         even with include_tests=true; got: {sec005_in_tests:?}",
+    );
+}
+
+/// Real SEC005 positive in a test body that does NOT assert the defense
+/// fires. The helper should leave this as a finding so true positives
+/// are preserved. The function calls a raw reader with the attack path
+/// and never inspects the result.
+const UNGUARDED_TEST_FIXTURE: &str = r#"pub fn read_relative(_rel: &str) -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_attack_path() {
+        let _data = read_relative("../../etc/passwd");
+    }
+}
+"#;
+
+#[test]
+fn sec005_real_traversal_in_test_still_flagged() {
+    let (dir, conn) = index_project(&[("src/io.rs", UNGUARDED_TEST_FIXTURE)]);
+    let findings = security_scan_with_tests(&conn, dir.path());
+
+    let hit = findings
+        .iter()
+        .find(|f| f.rule_id == "SEC005" && f.symbol_name == "read_attack_path");
+    assert!(
+        hit.is_some(),
+        "a test body that passes `../../etc/passwd` to a raw reader with no \
+         error-assertion MUST still fire SEC005 - otherwise the heuristic \
+         hides true positives. got findings: {:?}",
+        findings
+            .iter()
+            .map(|f| (&f.rule_id, &f.symbol_name))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Default scan (`include_tests=false`) already filters test paths; the
+/// new heuristic must not change that behaviour.
+#[test]
+fn sec005_assert_defense_default_scan_unaffected() {
+    let (dir, conn) = index_project(&[("src/guard.rs", ASSERT_DEFENSE_FIXTURE)]);
+    let findings = security_scan(&conn, dir.path());
+
+    let sec005_in_tests: Vec<&security::Finding> = findings
+        .iter()
+        .filter(|f| {
+            f.rule_id == "SEC005"
+                && (f.symbol_name == "rejects_sneaky_traversal"
+                    || f.symbol_name == "rejects_parent_escape")
+        })
+        .collect();
+
+    assert!(
+        sec005_in_tests.is_empty(),
+        "include_tests=false already excludes inline #[cfg(test)] modules; \
+         adding the assert-defense heuristic must not alter this. got: {sec005_in_tests:?}",
+    );
+}
+
+/// Inline `#[test]` in a production file (no wrapping `#[cfg(test)]
+/// mod`) is a shape the path-based `is_test_path` filter does not catch
+/// when `include_tests=false`, but the assert-defense helper must still
+/// recognise and skip it once `include_tests=true`.
+const INLINE_TEST_FIXTURE: &str = r#"pub fn validate_path(rel: &str) -> Result<(), String> {
+    if rel.contains("..") { Err("no".to_string()) } else { Ok(()) }
+}
+
+#[cfg(test)]
+#[test]
+fn rejects_traversal_inline() {
+    let result = validate_path("../../etc/passwd");
+    assert!(result.is_err());
+}
+"#;
+
+#[test]
+fn sec005_assert_defense_handles_inline_test_fn() {
+    let (dir, conn) = index_project(&[("src/inline.rs", INLINE_TEST_FIXTURE)]);
+    let findings = security_scan_with_tests(&conn, dir.path());
+
+    let hit = findings
+        .iter()
+        .find(|f| f.rule_id == "SEC005" && f.symbol_name == "rejects_traversal_inline");
+    assert!(
+        hit.is_none(),
+        "a `#[test] fn rejects_traversal_inline` whose body asserts is_err() \
+         must be skipped even without a wrapping `mod tests {{ }}`; got: {hit:?}",
+    );
+}

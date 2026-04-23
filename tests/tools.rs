@@ -4386,29 +4386,25 @@ fn test_mermaid_format_fallback_on_unsupported_tool() {
 
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
 
-    // qartez_outline does not have a mermaid branch - should fall back to detailed
-    let result = server
+    // qartez_outline rejects format=mermaid with a clear validation error
+    let err = server
         .call_tool_by_name(
             "qartez_outline",
             json!({"file_path": "src/main.rs", "format": "mermaid"}),
         )
-        .expect("mermaid on outline should not error");
+        .expect_err("mermaid on outline must return an error");
     assert!(
-        !result.starts_with("graph "),
-        "outline has no mermaid path, should produce detailed output, got: {result}"
-    );
-    assert!(
-        !result.is_empty(),
-        "outline with mermaid format should still produce output"
+        err.contains("format=mermaid is not supported for qartez_outline"),
+        "unexpected error message: {err}"
     );
 
-    // qartez_grep does not have a mermaid branch
-    let result = server
+    // qartez_grep rejects format=mermaid with a clear validation error
+    let err = server
         .call_tool_by_name("qartez_grep", json!({"query": "main", "format": "mermaid"}))
-        .expect("mermaid on grep should not error");
+        .expect_err("mermaid on grep must return an error");
     assert!(
-        !result.starts_with("graph "),
-        "grep has no mermaid path, should produce detailed output"
+        err.contains("format=mermaid is not supported for qartez_grep"),
+        "unexpected error message: {err}"
     );
 }
 

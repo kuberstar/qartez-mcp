@@ -1,38 +1,17 @@
-//! Path-based detection of test files.
+// Rust guideline compliant 2026-04-22
+
+//! Path- and language-based classification for test reporting.
 //!
-//! Shared by `graph::security::scan` (to exclude test files from the
-//! security report when `include_tests=false`) and `server::helpers`
-//! (test-gaps / refactor-plan / diff-impact summaries). Both callers
-//! classify by file path; keeping one source of truth avoids the drift
-//! that let `quality_tests.rs` leak into the security scan under the
-//! narrower predicate.
+//! Shared by `graph::security::scan` and `server::helpers`. Both classify
+//! by file path; keeping one source of truth avoids drift.
 //!
-//! The rules intentionally err on the side of treating a file as a test:
-//! the downstream cost of a missed test file (noise in a report) is
-//! higher than the cost of excluding a source file that happened to
-//! follow a test naming convention.
+//! `is_testable_source_language` is the companion predicate used by the
+//! test-gaps tool: shell scripts, manifests, CI YAML, and Dockerfiles
+//! are indexed for dependency / security analysis but are not the kind
+//! of file that can meaningfully grow a unit test, so listing them as
+//! "untested source" is always a false positive.
 
 /// True when `path` points at a file that should be treated as test code.
-///
-/// Covers the conventional layouts across the languages Qartez indexes:
-///
-/// * Directory-based: anything under `tests/`, `test/`, `benches/`,
-///   `__tests__/`, or `spec/`.
-/// * Rust: filenames `test.rs`, `tests.rs`, or ending in `_test.rs` /
-///   `_tests.rs`.
-/// * JS / TS: `.test.{js,jsx,ts,tsx}` / `.spec.{js,jsx,ts,tsx}`.
-/// * Go / Dart: `_test.go` / `_test.dart`.
-/// * Python: `_test.py` and `test_*.py`.
-/// * Java / Kotlin: `Test.java` / `Tests.java` / `Test.kt` / `Tests.kt`.
-/// * Ruby: `_spec.rb`.
-/// * C#: `Test.cs` / `Tests.cs`.
-///
-/// The function is purely path-based. It does NOT inspect file contents
-/// or module relationships. Inline `#[cfg(test)] mod { ... }` blocks in
-/// production files are filtered separately via tree-sitter in the
-/// security scanner; external `#[cfg(test)] mod foo;` declarations are
-/// picked up here as long as `foo.rs` follows one of the conventional
-/// naming patterns above.
 pub(crate) fn is_test_path(path: &str) -> bool {
     const TEST_DIR_PREFIXES: &[&str] = &["tests/", "test/", "benches/", "__tests__/", "spec/"];
     const TEST_DIR_SUBSTRINGS: &[&str] =
@@ -77,6 +56,36 @@ pub(crate) fn is_test_path(path: &str) -> bool {
         return true;
     }
     name.starts_with("test_") && name.ends_with(".py")
+}
+
+/// True when `language` (as stored on `FileRow::language`) is a source
+/// language for which writing unit tests is meaningful. The whitelist is
+/// deliberately narrow and matches the exact strings emitted by each
+/// `LanguageSupport` implementation's `language_name` method.
+pub(crate) fn is_testable_source_language(language: &str) -> bool {
+    matches!(
+        language,
+        "rust"
+            | "typescript"
+            | "python"
+            | "go"
+            | "java"
+            | "kotlin"
+            | "swift"
+            | "csharp"
+            | "ruby"
+            | "php"
+            | "cpp"
+            | "c"
+            | "scala"
+            | "dart"
+            | "elixir"
+            | "lua"
+            | "zig"
+            | "haskell"
+            | "ocaml"
+            | "r"
+    )
 }
 
 #[cfg(test)]
@@ -132,9 +141,65 @@ mod tests {
 
     #[test]
     fn narrow_predicate_was_missing_quality_tests_rs() {
-        // Regression guard for the divergent-predicate bug: the older
-        // graph/security.rs variant only matched `_test.` (no `s`) and
-        // let quality_tests.rs leak findings into the main report.
         assert!(is_test_path("qartez-public/src/server/quality_tests.rs"));
+    }
+
+    #[test]
+    fn testable_languages_accept_core_sources() {
+        for lang in [
+            "rust",
+            "typescript",
+            "python",
+            "go",
+            "java",
+            "kotlin",
+            "swift",
+            "csharp",
+            "ruby",
+            "php",
+            "cpp",
+            "c",
+            "scala",
+            "dart",
+            "elixir",
+            "lua",
+            "zig",
+            "haskell",
+            "ocaml",
+            "r",
+        ] {
+            assert!(is_testable_source_language(lang), "{lang} must be testable");
+        }
+    }
+
+    #[test]
+    fn testable_languages_reject_config_and_scripts() {
+        for lang in [
+            "bash",
+            "toml",
+            "yaml",
+            "json",
+            "markdown",
+            "dockerfile",
+            "makefile",
+            "jenkinsfile",
+            "nginx",
+            "helm",
+            "sql",
+            "protobuf",
+            "hcl",
+            "css",
+            "caddyfile",
+            "starlark",
+            "jsonnet",
+            "nix",
+            "systemd",
+            "",
+        ] {
+            assert!(
+                !is_testable_source_language(lang),
+                "{lang} must not be testable"
+            );
+        }
     }
 }

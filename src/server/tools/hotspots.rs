@@ -113,6 +113,13 @@ impl QartezServer {
                 }
 
                 let mut out = String::new();
+                // Compact header when the visible output would be at
+                // most three rows: the verbose banner (title + formula
+                // lines + column header + ruler = 5 lines) otherwise
+                // dwarfs the payload. The concise format always skips
+                // the banner; the detailed format only keeps it when
+                // the result is large enough to justify the explanation.
+                let is_small = scored.len() <= 3 || limit <= 3;
                 if concise {
                     out.push_str("# score health file avg_cc max_cc churn pagerank\n");
                     for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
@@ -130,13 +137,15 @@ impl QartezServer {
                         ));
                     }
                 } else {
-                    out.push_str("# Hotspot Analysis (file level)\n\n");
-                    out.push_str(
-                        "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
-                    );
-                    out.push_str(
-                        "Hotspot score = max_complexity x pagerank x (1 + change_count)\n\n",
-                    );
+                    if !is_small {
+                        out.push_str("# Hotspot Analysis (file level)\n\n");
+                        out.push_str(
+                            "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
+                        );
+                        out.push_str(
+                            "Hotspot score = max_complexity x pagerank x (1 + change_count)\n\n",
+                        );
+                    }
                     out.push_str("  # | Score     | Health | File                               | AvgCC | MaxCC | Churn | PageRank\n");
                     out.push_str("----+-----------+--------+------------------------------------+-------+-------+-------+---------\n");
                     for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
@@ -211,6 +220,10 @@ impl QartezServer {
                 }
 
                 let mut out = String::new();
+                // Compact header mirror of the file-level branch: drop
+                // the explanatory banner when the result set is tiny
+                // so the header block does not outweigh the payload.
+                let is_small = scored.len() <= 3 || limit <= 3;
                 if concise {
                     out.push_str("# score health name kind file cc pagerank churn\n");
                     for (i, (name, kind, path, score, cc, pr, churn, health)) in
@@ -230,11 +243,13 @@ impl QartezServer {
                         ));
                     }
                 } else {
-                    out.push_str("# Hotspot Analysis (symbol level)\n\n");
-                    out.push_str(
-                        "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
-                    );
-                    out.push_str("Hotspot score = complexity x symbol_pagerank x (1 + file_change_count)\n\n");
+                    if !is_small {
+                        out.push_str("# Hotspot Analysis (symbol level)\n\n");
+                        out.push_str(
+                            "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
+                        );
+                        out.push_str("Hotspot score = complexity x symbol_pagerank x (1 + file_change_count)\n\n");
+                    }
                     out.push_str("  # | Score    | Health | Symbol                    | Kind     | File                          | CC | PageRank | Churn\n");
                     out.push_str("----+----------+--------+---------------------------+----------+-------------------------------+----+----------+------\n");
                     for (i, (name, kind, path, score, cc, pr, churn, health)) in

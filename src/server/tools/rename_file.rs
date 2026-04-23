@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_rename_file",
-        description = "Rename/move a file and rewrite all import paths pointing to it in one atomic operation. Preview by default; set apply=true to execute.",
+        description = "Rename/move a file and rewrite all import paths pointing to it in one atomic operation. Also rewrites the `mod <stem>;` declaration in the parent module file so renaming a .rs file keeps the crate compiling. Refuses to rename `mod.rs` (module root) or to create a `mod.rs` over an existing one. Preview by default; set apply=true to execute.",
         annotations(
             title = "Rename File",
             read_only_hint = false,
@@ -36,6 +36,34 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRenameFileParams>,
     ) -> Result<String, String> {
+        // Refuse to rename a Rust `mod.rs` away from its directory-bound
+        // name - doing so breaks the module resolver. Likewise, refuse to
+        // create a NEW `mod.rs` if the target directory already contains
+        // one, which would silently clobber the existing module root.
+        let from_basename = std::path::Path::new(&params.from)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let to_basename = std::path::Path::new(&params.to)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if from_basename == "mod.rs" {
+            return Err(format!(
+                "Refusing to rename '{}': 'mod.rs' is a Rust module root - renaming it breaks module resolution. Restructure the module by moving contents, not by renaming mod.rs.",
+                params.from,
+            ));
+        }
+        if to_basename == "mod.rs" {
+            let to_abs_preflight = self.safe_resolve(&params.to)?;
+            if to_abs_preflight.exists() {
+                return Err(format!(
+                    "Refusing to rename '{}' -> '{}': target 'mod.rs' already exists in that directory.",
+                    params.from, params.to,
+                ));
+            }
+        }
+
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let file = read::get_file_by_path(&conn, &params.from)
             .map_err(|e| format!("DB error: {e}"))?

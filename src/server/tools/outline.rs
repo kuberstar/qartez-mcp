@@ -36,6 +36,7 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulOutlineParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_outline")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
@@ -64,27 +65,28 @@ impl QartezServer {
             symbols.len(),
         );
 
+        // Stable source-order view of non-field symbols. Pagination must be
+        // deterministic: "offset=N skips exactly N" has to hold regardless
+        // of render mode, so we sort by line_start and keep a canonical
+        // index for every non-field symbol.
+        let mut non_fields: Vec<&crate::storage::models::SymbolRow> =
+            symbols.iter().filter(|s| s.kind != "field").collect();
+        non_fields.sort_by_key(|s| (s.line_start, s.id));
+
         if concise {
-            let mut emitted = 0usize;
-            let mut skipped = 0usize;
             let mut next_offset: Option<usize> = None;
-            for sym in &symbols {
-                if sym.kind == "field" {
-                    continue;
-                }
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
+            if offset >= non_fields.len() {
+                return Ok(out);
+            }
+            for (i, sym) in non_fields.iter().skip(offset).enumerate() {
                 let marker = if sym.is_exported { "+" } else { "-" };
                 let line = format!("  {marker} {} [L{}]\n", sym.name, sym.line_start);
                 if estimate_tokens(&out) + estimate_tokens(&line) > budget {
-                    next_offset = Some(offset + emitted);
+                    next_offset = Some(offset + i);
                     out.push_str("  ... (truncated)\n");
                     break;
                 }
                 out.push_str(&line);
-                emitted += 1;
             }
             if let Some(next) = next_offset {
                 out.push_str(&format!("next_offset: {next} (of {total_non_fields})\n",));
@@ -105,28 +107,30 @@ impl QartezServer {
             }
         }
 
+        // Honor the pagination contract up front: skip exactly `offset`
+        // non-field symbols (source order), then render the remainder
+        // grouped by kind in the established presentation order. This
+        // keeps "offset=N skips N" semantics consistent with the concise
+        // branch and with the schema description.
+        if offset >= non_fields.len() {
+            return Ok(out);
+        }
+        let visible: Vec<&crate::storage::models::SymbolRow> =
+            non_fields.iter().copied().skip(offset).collect();
         let mut by_kind: std::collections::BTreeMap<
             String,
             Vec<&crate::storage::models::SymbolRow>,
         > = std::collections::BTreeMap::new();
-        for sym in &symbols {
-            if sym.kind == "field" {
-                continue;
-            }
+        for sym in &visible {
             let display_kind = capitalize_kind(&sym.kind);
-            by_kind.entry(display_kind).or_default().push(sym);
+            by_kind.entry(display_kind).or_default().push(*sym);
         }
 
-        let mut skipped = 0usize;
         let mut emitted = 0usize;
         let mut next_offset: Option<usize> = None;
         'outer: for (kind, syms) in &by_kind {
             let mut header_written = false;
             for sym in syms {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
                 if !header_written {
                     out.push_str(&format!("{kind}:\n"));
                     header_written = true;

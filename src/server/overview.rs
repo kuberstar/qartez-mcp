@@ -77,23 +77,36 @@ impl super::QartezServer {
             out.push_str("---+--------------------------------+------------+------------------------------------+---------\n");
         }
 
-        for (i, (sym, file)) in symbols.iter().enumerate() {
+        // Dedup on (name, kind, file, line_start). Some tree-sitter grammars
+        // emit the same symbol under multiple query captures (e.g. a method
+        // picked up by both `(method_definition)` and `(function_item)`),
+        // which surfaces as identical rows in the ranked output.
+        let mut seen: std::collections::HashSet<(String, String, String, u32)> =
+            std::collections::HashSet::new();
+        let mut row_idx: usize = 0;
+        for (sym, file) in symbols.iter() {
             if sym.pagerank <= 0.0 {
                 break;
             }
+            let key = (
+                sym.name.clone(),
+                sym.kind.clone(),
+                file.path.clone(),
+                sym.line_start,
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            row_idx += 1;
             let line = if concise {
                 format!(
                     "{} {} {} {} {:.4}\n",
-                    i + 1,
-                    sym.name,
-                    sym.kind,
-                    file.path,
-                    sym.pagerank,
+                    row_idx, sym.name, sym.kind, file.path, sym.pagerank,
                 )
             } else {
                 format!(
                     "{:>2} | {:<30} | {:<10} | {:<34} | {:>8.4}\n",
-                    i + 1,
+                    row_idx,
                     truncate_path(&sym.name, 30),
                     truncate_path(&sym.kind, 10),
                     truncate_path(&file.path, 34),
@@ -144,6 +157,32 @@ impl super::QartezServer {
             }
         };
 
+        // Validate caller-supplied boost paths so typos surface as warnings
+        // in the output instead of silently doing nothing. Exact substring
+        // match first, then basename match when the entry has no separator.
+        let boost_warnings: Vec<String> = match boost_files {
+            Some(paths) => {
+                let all_indexed = read::get_all_files(&conn).unwrap_or_default();
+                let mut warnings = Vec::new();
+                let mut basename_set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for f in &all_indexed {
+                    if let Some(base) = f.path.rsplit('/').next() {
+                        basename_set.insert(base.to_string());
+                    }
+                }
+                for bp in paths {
+                    let matched = all_indexed.iter().any(|f| f.path.contains(bp.as_str()))
+                        || (!bp.contains('/') && basename_set.contains(bp.as_str()));
+                    if !matched {
+                        warnings.push(bp.clone());
+                    }
+                }
+                warnings
+            }
+            None => Vec::new(),
+        };
+
         if !all_files && has_boosts {
             let mut boosted_ids: HashSet<i64> = HashSet::new();
 
@@ -192,6 +231,13 @@ impl super::QartezServer {
         let blast_radii = blast::blast_radius_for_files(&conn, &visible_ids).unwrap_or_default();
 
         let mut out = String::new();
+        if !boost_warnings.is_empty() {
+            out.push_str(&format!(
+                "// warning: {} boost_files entry(ies) matched no indexed file: {}\n",
+                boost_warnings.len(),
+                boost_warnings.join(", "),
+            ));
+        }
         if concise {
             out.push_str(&format!(
                 "{file_count} files, {symbol_count} symbols (rank path PR exp \u{2192}blast)\n",
@@ -234,11 +280,37 @@ impl super::QartezServer {
                 )
             };
 
+            // Token budget applies uniformly, including `all_files=true`.
+            // The earlier carve-out that exempted `all_files=true` from
+            // the row-list budget produced oversize responses against an
+            // explicit caller-supplied `token_budget`, violating the
+            // contract. Callers who want every row can raise the budget
+            // or omit it.
             if estimate_tokens(&out) + estimate_tokens(&line) > token_budget {
                 break;
             }
             out.push_str(&line);
             file_symbols.push((file.path.clone(), symbols));
+        }
+
+        if all_files {
+            // A zero-PR tail is common for files that the graph never
+            // touched (isolated modules, tree-shaken helpers). Surface
+            // the count in a footer so the caller knows those files are
+            // intentionally at the bottom of the list.
+            let zero_pr = files.iter().filter(|f| f.pagerank <= 0.0).count();
+            if zero_pr > 0 {
+                out.push_str(&format!(
+                    "// note: {zero_pr} file(s) have PageRank=0.0 (no inbound/outbound edges)\n",
+                ));
+            }
+            let shown = file_symbols.len();
+            let total = files.len();
+            if shown < total {
+                out.push_str(&format!(
+                    "// truncated: {shown}/{total} files shown; raise token_budget= to see more\n",
+                ));
+            }
         }
 
         if !concise {

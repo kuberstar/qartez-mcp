@@ -36,14 +36,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.xz
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.xz
-            musl: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-            archive: tar.xz
-            musl: true
+          # musl targets disabled: libgit2-sys/libssh2-sys pull openssl-sys,
+          # which cannot find OpenSSL on the default musl builder. Users on
+          # Alpine/musl hit install.sh's source-build fallback automatically.
+          # TODO: enable by disabling git2 default features or using vendored
+          # openssl, then add back to the matrix.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip

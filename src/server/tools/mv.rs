@@ -26,7 +26,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_move",
-        description = "Move a symbol to another file and update all import paths automatically. Handles extraction, insertion, and importer rewrites in one step. Preview by default; set apply=true to execute.",
+        description = "Move a symbol to another file and update all import paths automatically. Handles extraction, insertion, and importer rewrites in one step. Importer count is sourced from the full symbol reference graph (same data as `qartez_refs`), not just the file-level `use` edges. Use `kind` / `file_path` to disambiguate when the name is shared. Preview by default; set apply=true to execute.",
         annotations(
             title = "Move Symbol",
             read_only_hint = false,
@@ -44,6 +44,7 @@ impl QartezServer {
             &conn,
             &params.symbol,
             params.kind.as_deref(),
+            params.file_path.as_deref(),
             &params.to_file,
         )?;
 
@@ -56,7 +57,7 @@ impl QartezServer {
         let start_idx = (sym.line_start as usize).saturating_sub(1);
         let end_idx = (sym.line_end as usize).min(lines.len());
 
-        let importer_files = gather_importers(&conn, source_file.id)?;
+        let importer_files = gather_importers(&conn, source_file.id, &sym)?;
 
         let apply = params.apply.unwrap_or(false);
         if !apply {
@@ -167,6 +168,7 @@ fn validate_source(
     conn: &rusqlite::Connection,
     name: &str,
     kind_hint: Option<&str>,
+    file_path_hint: Option<&str>,
     to_file: &str,
 ) -> Result<
     (
@@ -184,7 +186,7 @@ fn validate_source(
 
     // Narrow by kind when the caller supplies one. The SQL layer only
     // matches on name, so free `fn foo()` and `impl Foo { fn foo() }`
-    // arrive together — a `kind` hint lets the caller pick exactly one
+    // arrive together - a `kind` hint lets the caller pick exactly one
     // without touching the DB query path.
     if let Some(k) = kind_hint.filter(|s| !s.is_empty()) {
         let available: Vec<String> = results
@@ -202,6 +204,23 @@ fn validate_source(
         }
     }
 
+    if let Some(fp) = file_path_hint.filter(|s| !s.is_empty()) {
+        let fp_norm = crate::index::to_forward_slash(fp.to_string());
+        let available: Vec<String> = results
+            .iter()
+            .map(|(_, f)| f.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        results.retain(|(_, f)| f.path == fp_norm);
+        if results.is_empty() {
+            return Err(format!(
+                "No symbol '{name}' in file '{fp}'. Available files: {}",
+                available.join(", "),
+            ));
+        }
+    }
+
     if results.len() > 1 {
         let locations: Vec<String> = results
             .iter()
@@ -213,7 +232,7 @@ fn validate_source(
             })
             .collect();
         return Err(format!(
-            "Multiple definitions of '{name}' found. Pass `kind` to disambiguate or specify a unique name:\n{}",
+            "Multiple definitions of '{name}' found. Pass `kind` and/or `file_path` to disambiguate:\n{}",
             locations.join("\n"),
         ));
     }
@@ -270,25 +289,54 @@ fn extract_lines<'a>(
     Ok((extracted_code, lines))
 }
 
-/// Resolve every `from_file → source_file` edge to its (path, specifier)
-/// pair. Includes every edge-graph importer unconditionally - filtering
-/// by specifier text used to silently miss glob imports (`use foo::*;`)
-/// and parent-module imports (`use foo;` then `foo::sym(...)`). The
-/// downstream regex rewrite is a no-op for unrelated importers, whereas
-/// excluding them corrupts the build.
+/// Resolve every file that references this symbol. Unions two signals:
+/// file-level `edges` (which cover `use` imports resolved by the index
+/// resolver) and symbol-level `symbol_refs` rows (which cover cross-file
+/// usages that never showed up as an import edge, e.g. glob imports,
+/// re-exports, or parent-module qualified calls). Using `get_edges_to`
+/// alone under-counted importers - `qartez_refs` for the same symbol
+/// returned 8 hits while `qartez_move` reported 1. Deduplicated by path
+/// because an importer that both `use`s the source file AND references
+/// the symbol directly must only be rewritten once.
 fn gather_importers(
     conn: &rusqlite::Connection,
     source_file_id: i64,
+    sym: &crate::storage::models::SymbolRow,
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    let importers =
+    let mut seen: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+
+    let edge_importers =
         read::get_edges_to(conn, source_file_id).map_err(|e| format!("DB error: {e}"))?;
-    let mut importer_files: Vec<(String, Option<String>)> = Vec::new();
-    for edge in &importers {
+    for edge in &edge_importers {
         if let Ok(Some(f)) = read::get_file_by_id(conn, edge.from_file) {
-            importer_files.push((f.path.clone(), edge.specifier.clone()));
+            seen.entry(f.path.clone()).or_insert(edge.specifier.clone());
         }
     }
-    Ok(importer_files)
+
+    // Hydrate symbol-level references. `get_symbol_references_filtered`
+    // restricts the lookup to the exact symbol we are moving (same
+    // kind + defining-file) so cross-file homonyms do not pollute the
+    // count.
+    if let Ok(Some(def_file)) = read::get_file_by_id(conn, source_file_id) {
+        let sym_refs = read::get_symbol_references_filtered(
+            conn,
+            &sym.name,
+            Some(&sym.kind),
+            Some(&def_file.path),
+        )
+        .map_err(|e| format!("DB error: {e}"))?;
+        for (_, _, importers) in sym_refs {
+            for (_, importer_file, _from_symbol_id) in importers {
+                if importer_file.id == source_file_id {
+                    continue;
+                }
+                seen.entry(importer_file.path.clone()).or_insert(None);
+            }
+        }
+    }
+
+    Ok(seen.into_iter().collect())
 }
 
 /// Format the dry-run report shown when `apply=false`. Includes a 500-byte

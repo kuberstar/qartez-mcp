@@ -36,18 +36,40 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulCochangeParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_cochange")?;
         let concise = is_concise(&params.format);
-        let limit = params.limit.unwrap_or(10) as usize;
+        // `limit=0` means "no cap" project-wide convention across qartez
+        // query tools. `limit=None` keeps the historical default of 10.
+        let limit = match params.limit {
+            None => 10,
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+        };
         let max_commit_size = params.max_commit_size.unwrap_or(30) as usize;
 
-        {
+        let file_indexed = {
             let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-            if read::get_file_by_path(&conn, &params.file_path)
+            read::get_file_by_path(&conn, &params.file_path)
                 .map_err(|e| format!("DB error: {e}"))?
-                .is_none()
-            {
+                .is_some()
+        };
+
+        if !file_indexed {
+            // All branches share the unified `File '<path>' not found in
+            // index` prefix used by `qartez_stats` / `qartez_impact` /
+            // `qartez_outline`. The trailing clause still distinguishes
+            // the two failure modes callers hit in practice:
+            //   (a) path does not exist on disk - typo or wrong working dir
+            //   (b) path exists but was added after the last index run - the
+            //       fix is to reindex, not to re-check the spelling.
+            let resolved = self.project_root.join(&params.file_path);
+            if !resolved.exists() {
                 return Err(format!("File '{}' not found in index", params.file_path));
             }
+            return Err(format!(
+                "File '{}' not found in index (exists on disk, reindex the project)",
+                params.file_path
+            ));
         }
 
         let pairs = compute_cochange_pairs(
@@ -70,8 +92,11 @@ impl QartezServer {
                 let cc = read::get_cochanges(&conn, file.id, limit as i64)
                     .map_err(|e| format!("DB error: {e}"))?;
                 if cc.is_empty() {
+                    // Indexed file with git history but no shared commits with
+                    // peers (e.g. file was introduced alone, or git history is
+                    // truncated below the threshold).
                     return Ok(format!(
-                        "No co-change data found for '{}'. Run with git history available.",
+                        "No co-change data for '{}' (no shared commits).",
                         params.file_path,
                     ));
                 }

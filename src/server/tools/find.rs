@@ -36,14 +36,19 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulFindParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_find")?;
+        if params.name.trim().is_empty() {
+            return Err("query must be non-empty".to_string());
+        }
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let use_regex = params.regex.unwrap_or(false);
         let regex_limit = params.limit.unwrap_or(100) as usize;
         let kind_filter = params.kind.clone();
+        let allowed_kinds: Option<Vec<String>> = kind_filter.as_deref().map(expand_kind_alias);
         let matches_kind = |k: &str| -> bool {
-            kind_filter
-                .as_deref()
-                .is_none_or(|want| k.eq_ignore_ascii_case(want))
+            allowed_kinds
+                .as_ref()
+                .is_none_or(|wanted| wanted.iter().any(|w| k.eq_ignore_ascii_case(w)))
         };
         let results: Vec<(
             crate::storage::models::SymbolRow,
@@ -89,10 +94,10 @@ impl QartezServer {
         let filtered: Vec<_> = if use_regex {
             // Regex branch already filtered by kind during streaming.
             results
-        } else if let Some(ref kind) = params.kind {
+        } else if params.kind.is_some() {
             results
                 .into_iter()
-                .filter(|(sym, _)| sym.kind.eq_ignore_ascii_case(kind))
+                .filter(|(sym, _)| matches_kind(&sym.kind))
                 .collect()
         } else {
             results
@@ -148,4 +153,25 @@ impl QartezServer {
         }
         Ok(out)
     }
+}
+
+/// Expand a caller-supplied kind keyword into the set of indexed kinds
+/// that should match. Callers routinely type the source-language keyword
+/// (`fn`, `class`, `trait`, `var`) while the indexer stores the emitted
+/// kind (`function`, `method`, `struct`, `interface`, `variable`, ...).
+/// This table closes that gap so `kind='fn'` on a method name still
+/// finds the symbol.
+pub(super) fn expand_kind_alias(kind: &str) -> Vec<String> {
+    let k = kind.trim().to_ascii_lowercase();
+    let set: &[&str] = match k.as_str() {
+        "fn" | "function" | "func" => &["function", "method"],
+        "method" => &["method"],
+        "class" => &["class", "struct"],
+        "struct" => &["struct", "class"],
+        "trait" | "interface" => &["trait", "interface"],
+        "var" | "variable" => &["variable", "const", "let"],
+        "const" | "constant" => &["const", "constant"],
+        _ => return vec![k],
+    };
+    set.iter().map(|s| (*s).to_string()).collect()
 }

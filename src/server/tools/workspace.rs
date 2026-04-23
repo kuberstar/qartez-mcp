@@ -80,11 +80,19 @@ impl QartezServer {
         // from in-memory state after restart (TOML iteration order wins).
         {
             let aliases = self.root_aliases.read().map_err(|e| e.to_string())?;
-            if let Some(existing) = aliases.get(&canonical_path)
-                && existing != alias
-            {
-                return Err(format!(
-                    "Path '{}' is already registered as '{existing}'. Remove it first.",
+            if let Some(existing) = aliases.get(&canonical_path) {
+                if existing != alias {
+                    return Err(format!(
+                        "Path '{}' is already registered as '{existing}'. Remove it first.",
+                        canonical_path.display()
+                    ));
+                }
+                // Same alias + same path = idempotent no-op. Surface a
+                // distinct info message so automation can see "already
+                // present" without the silent-success ambiguity the old
+                // path produced.
+                return Ok(format!(
+                    "alias '{alias}' already registered at '{}' - no-op.",
                     canonical_path.display()
                 ));
             }
