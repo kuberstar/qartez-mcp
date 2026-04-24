@@ -17,6 +17,7 @@ use crate::graph::blast;
 use crate::guard;
 use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
+use crate::test_paths::is_testable_source_path;
 use crate::toolchain;
 
 #[tool_router(router = qartez_context_router, vis = "pub(super)")]
@@ -48,9 +49,72 @@ impl QartezServer {
             Some(n) => n as usize,
         };
 
-        if params.files.is_empty() {
-            return Err("Provide at least one file path in 'files' parameter".to_string());
-        }
+        // Task-only seed mode. When `files` is empty but `task` is set,
+        // derive the initial file set via an FTS search of symbol names
+        // against task terms longer than three characters. This mirrors
+        // the wording in the tool description that `task` helps
+        // prioritise context, and lets exploration sessions bootstrap
+        // from a natural-language prompt without first running
+        // `qartez_grep` by hand.
+        let mut files_list: Vec<String> = params.files.clone();
+        let seeded_from_task: Option<Vec<String>> = if files_list.is_empty() {
+            match params.task.as_deref() {
+                Some(task) if !task.trim().is_empty() => {
+                    let mut seeds: Vec<String> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for word in task.split_whitespace().filter(|w| w.len() > 3) {
+                        let fts = if word.contains('*') {
+                            word.to_string()
+                        } else {
+                            format!("{word}*")
+                        };
+                        if let Ok(results) = read::search_symbols_fts(&conn, &fts, 10) {
+                            for (_, file_path) in results {
+                                // Reject non-code seed matches. The
+                                // FTS index covers every indexed
+                                // file's symbol names, so a task
+                                // like "pagerank scoring" was
+                                // matching `.github/workflows/
+                                // scorecard.yml` because
+                                // `tree-sitter-yaml` exposes YAML
+                                // keys as symbols. Workflow files,
+                                // Cargo.toml, README, etc. are never
+                                // useful context seeds - filter them
+                                // with the shared source-path
+                                // classifier used by test_gaps and
+                                // diff_impact.
+                                if !is_testable_source_path(&file_path) {
+                                    continue;
+                                }
+                                if seen.insert(file_path.clone()) {
+                                    seeds.push(file_path);
+                                }
+                            }
+                        }
+                    }
+                    if seeds.is_empty() {
+                        return Err(
+                            "`task` seeded 0 files (no symbols matched the task terms) and `files` is empty. Pass at least one file path in `files`, or refine `task`."
+                                .to_string(),
+                        );
+                    }
+                    // Cap the seed set so scoring stays cheap; FTS ordering
+                    // means the truncated tail is already the least relevant.
+                    const MAX_TASK_SEEDS: usize = 5;
+                    seeds.truncate(MAX_TASK_SEEDS);
+                    files_list = seeds.clone();
+                    Some(seeds)
+                }
+                _ => {
+                    return Err(
+                        "Provide at least one file path in 'files' parameter, or pass a non-empty `task` to seed the search from symbol names."
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         // Verify every input path exists in the index before any scoring.
         // An unindexed path used to fall through to "No related context
@@ -58,7 +122,7 @@ impl QartezServer {
         // like a legitimate but empty answer; callers could not tell the
         // file was simply missing.
         let mut missing: Vec<&String> = Vec::new();
-        for file_path in &params.files {
+        for file_path in &files_list {
             if read::get_file_by_path(&conn, file_path)
                 .map_err(|e| format!("DB error: {e}"))?
                 .is_none()
@@ -91,7 +155,7 @@ impl QartezServer {
         let mut scored: HashMap<String, ScoreBreakdown> = HashMap::new();
         let mut input_file_ids: Vec<i64> = Vec::new();
 
-        for file_path in &params.files {
+        for file_path in &files_list {
             let file = match read::get_file_by_path(&conn, file_path)
                 .map_err(|e| format!("DB error: {e}"))?
             {
@@ -103,7 +167,7 @@ impl QartezServer {
             let outgoing = read::get_edges_from(&conn, file.id).unwrap_or_default();
             for edge in &outgoing {
                 if let Ok(Some(dep)) = read::get_file_by_id(&conn, edge.to_file)
-                    && !params.files.contains(&dep.path)
+                    && !files_list.contains(&dep.path)
                 {
                     scored.entry(dep.path.clone()).or_default().imports +=
                         3.0 + dep.pagerank * 10.0;
@@ -113,7 +177,7 @@ impl QartezServer {
             let incoming = read::get_edges_to(&conn, file.id).unwrap_or_default();
             for edge in &incoming {
                 if let Ok(Some(imp)) = read::get_file_by_id(&conn, edge.from_file)
-                    && !params.files.contains(&imp.path)
+                    && !files_list.contains(&imp.path)
                 {
                     scored.entry(imp.path.clone()).or_default().importer +=
                         2.0 + imp.pagerank * 5.0;
@@ -122,7 +186,7 @@ impl QartezServer {
 
             let cochanges = read::get_cochanges(&conn, file.id, 10).unwrap_or_default();
             for (cc, partner) in &cochanges {
-                if !params.files.contains(&partner.path) {
+                if !files_list.contains(&partner.path) {
                     scored.entry(partner.path.clone()).or_default().cochange +=
                         cc.count as f64 * 1.5;
                 }
@@ -141,7 +205,7 @@ impl QartezServer {
                     continue;
                 }
                 if let Ok(Some(f)) = read::get_file_by_id(&conn, imp_id)
-                    && !params.files.contains(&f.path)
+                    && !files_list.contains(&f.path)
                 {
                     scored.entry(f.path.clone()).or_default().transitive += 0.5;
                 }
@@ -158,7 +222,7 @@ impl QartezServer {
                 };
                 if let Ok(results) = read::search_symbols_fts(&conn, &fts, 10) {
                     for (sym, file_path) in &results {
-                        if !params.files.contains(file_path) {
+                        if !files_list.contains(file_path) {
                             scored.entry(file_path.clone()).or_default().task_match += 1.0;
                         }
                         let _ = sym;
@@ -183,11 +247,30 @@ impl QartezServer {
             );
         }
 
+        let header_subject = if let Some(ref seeds) = seeded_from_task {
+            format!("task seed ({})", seeds.join(", "))
+        } else {
+            files_list.join(", ")
+        };
         let mut out = format!(
-            "# Context for: {}\n{} related file(s) found:\n\n",
-            params.files.join(", "),
+            "# Context for: {header_subject}\n{} related file(s) found:\n",
             ranked.len(),
         );
+        // When `task` is set and `explain=false`, surface the seed
+        // count so callers know how the context list was derived
+        // without flipping on full explain mode. `explain=true`
+        // already decomposes every score, so the extra line would
+        // only duplicate noise there.
+        if params.task.is_some() && !explain {
+            let seed_count = seeded_from_task
+                .as_ref()
+                .map(|s| s.len())
+                .unwrap_or(files_list.len());
+            out.push_str(&format!(
+                "// seeded from {seed_count} task-matching files\n"
+            ));
+        }
+        out.push('\n');
 
         let mut dropped_by_budget: usize = 0;
         for (i, (path, breakdown)) in ranked.iter().enumerate() {

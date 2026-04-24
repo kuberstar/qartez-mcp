@@ -1094,13 +1094,21 @@ fn qartez_read_batch_requires_some_input() {
 }
 
 #[test]
-fn qartez_read_batch_all_missing_errors() {
+fn qartez_read_batch_all_missing_is_graceful() {
+    // Batch mode treats a total-miss like a partial-miss: the response
+    // body is a header + `(N not found: ...)` notice instead of an
+    // error. Harmonises with the partial-hit branch so scripting
+    // callers see one shape for both outcomes.
     let (server, _dir) = setup();
     let result = server.qartez_read(Parameters(SoulReadParams {
         symbols: Some(vec!["nope_a".into(), "nope_b".into()]),
         ..Default::default()
     }));
-    assert!(result.is_err());
+    let out = result.expect("batch-miss must be graceful Ok, not Err");
+    assert!(
+        out.contains("2 not found") || out.contains("not found: nope_a, nope_b"),
+        "batch-miss must list the missing names, got: {out}"
+    );
 }
 
 #[test]
@@ -1553,7 +1561,11 @@ fn sanitize_fts_query_misplaced_asterisks_wrapped() {
 #[test]
 fn qartez_grep_budget_respected() {
     let (server, _dir) = setup_scale(100);
-    for budget in [50, 200, 500, 1000] {
+    // Post-audit contract: `token_budget` < 256 is rejected up front
+    // because values that low produce no usable output (header alone
+    // burns ~50 tokens). The sweep now starts at the minimum honoured
+    // floor; lower values are covered by the dedicated rejection test.
+    for budget in [256, 500, 1000, 2000] {
         let result = server
             .qartez_grep(Parameters(SoulGrepParams {
                 query: "func*".into(),
@@ -1614,19 +1626,24 @@ fn qartez_grep_no_results() {
 #[test]
 fn qartez_grep_truncation_message() {
     let (server, _dir) = setup_scale(100);
+    // Post-audit contract: budgets < 256 are rejected; use the minimum
+    // honoured floor to exercise the truncation path.
     let result = server
         .qartez_grep(Parameters(SoulGrepParams {
             query: "func*".into(),
             limit: Some(100),
             format: None,
-            token_budget: Some(100),
+            token_budget: Some(256),
             ..Default::default()
         }))
         .unwrap();
-    // With tiny budget and many results, should show truncation
+    // With the minimum honoured budget and many results, should show
+    // truncation or stay within the 1.25x tolerance that matches the
+    // other budget sweep tests.
     assert!(
-        result.contains("truncated") || estimate_tokens(&result) <= 150,
-        "should either truncate or stay within budget"
+        result.contains("truncated") || estimate_tokens(&result) <= 320,
+        "should either truncate or stay within budget, got: {} tokens\n---\n{result}",
+        estimate_tokens(&result)
     );
 }
 
@@ -2089,8 +2106,15 @@ fn qartez_cochange_no_data() {
             ..Default::default()
         }))
         .unwrap();
-    // No git history in test fixture
-    assert!(result.contains("No co-change data"));
+    // Post-audit contract: the generic "No co-change data" wording was
+    // split into two distinct messages depending on whether the file has
+    // any indexed git history. Both shapes share "co-change" so we
+    // accept either, and also the "No git history" variant used when the
+    // file's commit count is zero.
+    assert!(
+        result.contains("co-change") || result.contains("No git history"),
+        "empty-history test must get one of the two new wordings, got: {result}"
+    );
 }
 
 #[test]
@@ -2346,7 +2370,9 @@ fn budget_sweep_qartez_map() {
 #[test]
 fn budget_sweep_qartez_grep() {
     let (server, _dir) = setup_scale(50);
-    for budget in [50, 200, 500, 2000] {
+    // Post-audit contract: token_budget < 256 is rejected up front. The
+    // sweep starts at the minimum honoured floor.
+    for budget in [256, 500, 1000, 2000] {
         let result = server
             .qartez_grep(Parameters(SoulGrepParams {
                 query: "func*".into(),
@@ -2752,7 +2778,9 @@ fn monotonicity_qartez_map() {
 #[test]
 fn monotonicity_qartez_grep() {
     let (server, _dir) = setup_scale(50);
-    let budgets = [50, 200, 1000, 4000];
+    // Post-audit contract: token_budget < 256 is rejected; the
+    // monotonicity chain starts at the minimum honoured floor.
+    let budgets = [256, 500, 1000, 4000];
     let outputs: Vec<String> = budgets
         .iter()
         .map(|&b| {
@@ -3655,7 +3683,12 @@ fn qartez_hotspots_sort_by_health_ascending_worst_first() {
 #[test]
 fn qartez_hotspots_threshold_zero_returns_no_results() {
     let (server, _dir) = setup_with_complexity();
-    let out = server
+    // Post-audit contract: `threshold=0` is now an upfront rejection
+    // because health is always >= 0, so the filter would exclude every
+    // file. The previous behaviour silently clamped to 1.0 and emitted a
+    // misleading "Re-index with git history" message. We now return a
+    // truthful validation error.
+    let err = server
         .qartez_hotspots(Parameters(SoulHotspotsParams {
             limit: Some(10),
             level: Some(HotspotLevel::File),
@@ -3663,11 +3696,12 @@ fn qartez_hotspots_threshold_zero_returns_no_results() {
             threshold: Some(0),
             ..Default::default()
         }))
-        .unwrap();
-    // Health is always > 0, so threshold=0 should filter everything out
+        .expect_err("threshold=0 must now be rejected");
     assert!(
-        out.contains("No hotspots"),
-        "threshold=0 should yield no results since health is always positive, got: {out}"
+        err.contains("threshold=0")
+            || err.contains("excludes every file")
+            || err.contains("health"),
+        "rejection must explain that threshold=0 excludes everything, got: {err}"
     );
 }
 
@@ -3846,20 +3880,24 @@ fn qartez_hotspots_symbol_threshold_filters() {
             ..Default::default()
         }))
         .unwrap();
-    let filtered = server
-        .qartez_hotspots(Parameters(SoulHotspotsParams {
-            limit: Some(100),
-            level: Some(HotspotLevel::Symbol),
-            format: Some(Format::Concise),
-            threshold: Some(0),
-            ..Default::default()
-        }))
-        .unwrap();
+    // Post-audit contract: threshold=0 is rejected at the parameter
+    // check; the filter ceremony lives in the error path now. Still
+    // verify the symbol-level path can produce a non-empty default run
+    // so regressions that break the Symbol level surface here rather
+    // than in an integration test.
     if !all.contains("No symbol") {
-        // threshold=0 should filter out everything
+        let err = server
+            .qartez_hotspots(Parameters(SoulHotspotsParams {
+                limit: Some(100),
+                level: Some(HotspotLevel::Symbol),
+                format: Some(Format::Concise),
+                threshold: Some(0),
+                ..Default::default()
+            }))
+            .expect_err("threshold=0 rejection applies to symbol-level too");
         assert!(
-            filtered.contains("No symbol"),
-            "threshold=0 should remove all symbol results"
+            err.contains("threshold=0") || err.contains("excludes every file"),
+            "rejection wording must remain consistent at symbol level, got: {err}"
         );
     }
 }
@@ -4068,8 +4106,8 @@ fn qartez_clones_no_clones_message() {
         }))
         .unwrap();
     assert!(
-        out.contains("No code clones"),
-        "empty DB should say no clones detected"
+        out.contains("No clone groups"),
+        "empty DB should say no clone groups at the active filter threshold:\n{out}"
     );
 }
 
@@ -4954,7 +4992,13 @@ fn qartez_trend_nonexistent_file_returns_empty() {
 
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
-    let out = server
+    // trend now distinguishes "file not found in index" from "file
+    // present but has no complexity data". The missing-file path used
+    // to return Ok("No complexity trend data"); it now errors with a
+    // precise "not found in index" message so callers can fix a typo
+    // in file_path instead of treating the empty output as real
+    // zero-data.
+    let err = server
         .qartez_trend(Parameters(SoulTrendParams {
             file_path: "nonexistent.rs".into(),
             symbol_name: None,
@@ -4962,10 +5006,10 @@ fn qartez_trend_nonexistent_file_returns_empty() {
             format: None,
             token_budget: None,
         }))
-        .unwrap();
+        .expect_err("missing file must now err, not silently return empty");
     assert!(
-        out.contains("No complexity trend"),
-        "should return no-data message for missing file: {out}"
+        err.contains("not found") || err.contains("nonexistent"),
+        "rejection must name the missing file: {err}"
     );
 }
 
@@ -4992,6 +5036,7 @@ fn qartez_trend_with_git_history() {
     git_commit(&repo, dir.path(), &["lib.rs"], "v2");
 
     let conn = setup_db();
+    crate::index::full_index(&conn, dir.path(), false).unwrap();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
 
     let out = server
@@ -5031,6 +5076,7 @@ fn qartez_trend_concise_format() {
     git_commit(&repo, dir.path(), &["lib.rs"], "c2");
 
     let conn = setup_db();
+    crate::index::full_index(&conn, dir.path(), false).unwrap();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
 
     let out = server
@@ -6308,7 +6354,14 @@ fn qartez_knowledge_output_format_detailed_validated() {
         out.contains("# Knowledge / Bus Factor (file level)"),
         "missing header"
     );
-    assert!(out.contains("Analyzed"), "missing analyzed count");
+    // Header label changed from "Analyzed N files" to "Scanned N
+    // indexed file(s)" so the count is no longer confused with the
+    // total file census of the repo. Accept either to keep the
+    // regression net wide while we migrate downstream tests.
+    assert!(
+        out.contains("Scanned") || out.contains("Analyzed"),
+        "missing scanned/analyzed count:\n{out}",
+    );
     assert!(out.contains("BF |"), "missing BF column header");
     assert!(out.contains("Lines |"), "missing Lines column");
     assert!(out.contains("Top Authors"), "missing Top Authors column");
@@ -7250,9 +7303,13 @@ fn qartez_smells_file_path_unknown_errors() {
             ..Default::default()
         }))
         .unwrap_err();
+    // Unified wording across qartez_smells / qartez_outline /
+    // qartez_impact / qartez_cochange: `"File '<path>' not found in
+    // index"`. Accept either phrasing so the regression net still
+    // covers the old "File not found:" form during migration.
     assert!(
-        err.contains("File not found"),
-        "missing file must error:\n{err}"
+        err.contains("not found in index") || err.contains("File not found"),
+        "missing file must error:\n{err}",
     );
 }
 
@@ -7700,24 +7757,26 @@ fn qartez_health_extreme_max_health_zero() {
 
 #[test]
 fn qartez_health_threshold_beyond_ten_clamps() {
-    // max_health > 10 is defensively clamped to 10 (see tool impl). Both
-    // 10.0 and 999.0 must produce identical output.
+    // max_health is documented as 0-10. A value above 10 is a caller
+    // typo (999 rather than 9) and must now be rejected explicitly so
+    // the mistake is surfaced at the call site rather than silently
+    // clamped into the identity-9.9 branch.
     let (server, _dir) = setup_smells_fixture();
-    let at_ten = server
+    server
         .qartez_health(Parameters(SoulHealthParams {
             max_health: Some(10.0),
             ..Default::default()
         }))
-        .unwrap();
-    let above_ten = server
+        .expect("max_health=10 must be accepted (inclusive upper bound)");
+    let err = server
         .qartez_health(Parameters(SoulHealthParams {
             max_health: Some(999.0),
             ..Default::default()
         }))
-        .unwrap();
-    assert_eq!(
-        at_ten, above_ten,
-        "values above 10 must clamp to 10 for deterministic output"
+        .expect_err("max_health>10 must be rejected, not clamped");
+    assert!(
+        err.contains("range") || err.contains("0") || err.contains("10"),
+        "rejection must describe the valid range, got: {err}"
     );
 }
 

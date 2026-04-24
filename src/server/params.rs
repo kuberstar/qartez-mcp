@@ -115,6 +115,11 @@ mod flexible {
 /// Output verbosity for query tools. Encoded as a proper JSON Schema enum so
 /// clients see the allowed values at tool-listing time instead of having to
 /// try-and-fail on a free-form string.
+///
+/// `mermaid` is ONLY honoured by `qartez_deps`, `qartez_calls`, and
+/// `qartez_hierarchy`. Every other tool rejects it explicitly via
+/// `reject_mermaid` - the enum is shared for schema economy, not because
+/// every tool renders graphs.
 #[derive(Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum Format {
@@ -204,7 +209,7 @@ pub(super) fn reject_mermaid(format: &Option<Format>, tool: &str) -> Result<(), 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct QartezParams {
     #[schemars(
-        description = "Number of top-ranked files to include. Default: 20. Use 0 or all_files=true for the full list (every file PageRank-sorted). Watch for token-budget truncation on large repos."
+        description = "Number of top-ranked files to include. Default: 20. `top_n=0` follows the tool-wide no-cap convention (same as qartez_unused / qartez_context `limit=0`) and is equivalent to `all_files=true`. Watch for token-budget truncation on large repos; the response adds a `raise token_budget=` footer when the render is clipped."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub top_n: Option<u32>,
@@ -229,7 +234,8 @@ pub(super) struct QartezParams {
     )]
     pub format: Option<Format>,
     #[schemars(
-        description = "Ranking axis: 'files' (default) shows top files by PageRank; 'symbols' shows top symbols by symbol-level PageRank + their defining file."
+        description = "Ranking axis. Must be one of: 'files' (default) shows top files by PageRank; 'symbols' shows top symbols by symbol-level PageRank + their defining file. Unknown values are rejected with a list of valid options.",
+        extend("enum" = ["files", "symbols"])
     )]
     pub by: Option<String>,
 }
@@ -354,7 +360,8 @@ pub(super) struct SoulCochangeParams {
     )]
     pub format: Option<Format>,
     #[schemars(
-        description = "Skip commits touching more than this many files when recomputing pair counts from git (default: 30). Guards against huge refactor commits inflating counts."
+        description = "Skip commits touching more than this many files when recomputing pair counts from git (default: 30). Guards against huge refactor commits inflating counts. Must be >= 1 (0 would skip every commit and produce no data).",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub max_commit_size: Option<u32>,
@@ -363,7 +370,7 @@ pub(super) struct SoulCochangeParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulGrepParams {
     #[schemars(
-        description = "FTS5 search query (supports prefix* matching) or regex when regex=true. Accepts the alias `pattern` for parity with Grep."
+        description = "FTS5 search query. Prefix matching is anchored to the symbol name column (e.g. `Parser*` only matches symbols whose name starts with `Parser`, not file paths that happen to contain `parser`). Accepts the alias `pattern` for parity with Grep. Interpreted as a regex when regex=true."
     )]
     #[serde(alias = "pattern")]
     pub query: String,
@@ -389,6 +396,10 @@ pub(super) struct SoulGrepParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub search_bodies: Option<bool>,
+    #[schemars(
+        description = "Filter results by symbol kind (e.g., 'function', 'struct', 'method', 'class'). Applied after the FTS/regex match so it narrows name-search results down to one category without changing the query grammar."
+    )]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -402,12 +413,17 @@ pub(super) struct SoulRefsParams {
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub transitive: Option<bool>,
     #[schemars(
-        description = "'concise' = file paths only, 'detailed' (default) = full import chain"
+        description = "'concise' = file paths only (duplicate paths collapsed to `path xN`), 'detailed' (default) = full import chain grouped per importer"
     )]
     pub format: Option<Format>,
     #[schemars(description = "Approximate token budget for output (default: 4000)")]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub token_budget: Option<u32>,
+    #[schemars(
+        description = "Include refs from test files in the listing. Default true for back-compat. Set false when investigating production usages of a hub symbol whose test imports would otherwise dominate the output."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_tests: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -445,7 +461,10 @@ pub(super) struct SoulProjectParams {
     pub action: Option<ProjectAction>,
     #[schemars(description = "Optional filter (e.g., test name pattern, specific package)")]
     pub filter: Option<String>,
-    #[schemars(description = "Timeout in seconds (default: 60)")]
+    #[schemars(
+        description = "Timeout in seconds (default: 60). Must be >= 1. A value of 0 is rejected because it would produce an immediate timeout error before the toolchain command can run; use 1 for a near-instant check.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub timeout: Option<u32>,
 }
@@ -624,12 +643,12 @@ pub(super) struct SoulCallsParams {
     )]
     pub direction: Option<CallDirection>,
     #[schemars(
-        description = "Max depth for call chain traversal (default: 1, max: 10). Values above 10 are clamped. Each extra level can emit many lines on hub functions."
+        description = "Max depth for call chain traversal. Default 1, max 10. Values above 10 are clamped. `depth=0` is the seed-only mode: prints the resolved target symbol header without expanding callers or callees."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub depth: Option<u32>,
     #[schemars(
-        description = "'concise' = names only, 'detailed' (default) = with file paths and lines, 'mermaid' = call graph as a Mermaid diagram (use only when the user asks for a visual)"
+        description = "'concise' = names only, 'detailed' (default) = with file paths and lines, 'mermaid' = call graph as a Mermaid diagram (use only when the user asks for a visual). Mermaid output honours `token_budget`: nodes beyond the budget are replaced with a `truncated` marker."
     )]
     pub format: Option<Format>,
     #[schemars(
@@ -645,14 +664,27 @@ pub(super) struct SoulCallsParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_tests: Option<bool>,
+    #[schemars(
+        description = "Disambiguate by symbol kind when the name resolves to multiple definitions (e.g. 'function' vs 'method'). Required together with or instead of `file_path` when the name has multiple function-like candidates; without it the tool refuses to count callers or list callees because the counts would not be attributable to a single definition."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name is defined in multiple files. Relative path. Required together with or instead of `kind` when the name has multiple function-like candidates."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulContextParams {
-    #[schemars(description = "File paths to analyze context for (files you plan to modify)")]
+    #[schemars(
+        description = "File paths to analyze context for (files you plan to modify). When empty, `task` must be set - the tool then derives the seed files from symbols matching the task terms via FTS search."
+    )]
     #[serde(default, deserialize_with = "flexible::vec_string")]
     pub files: Vec<String>,
-    #[schemars(description = "Optional task description to help prioritize relevant context")]
+    #[schemars(
+        description = "Optional task description to help prioritize relevant context. Also acts as the seed source when `files` is empty: task words longer than 3 characters are FTS-prefix-searched against symbol names and the matching files become the initial set."
+    )]
     pub task: Option<String>,
     #[schemars(description = "Max number of context files to return (default: 15)")]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
@@ -700,7 +732,8 @@ pub(super) struct SoulHotspotsParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulClonesParams {
     #[schemars(
-        description = "Max number of clone groups to return (default: 20). Groups are sorted by size (most duplicates first)."
+        description = "Max number of clone groups to return (default: 20). Groups are sorted by size (most duplicates first). Must be >= 1 (no `no-cap` mode for clone groups).",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,
@@ -710,7 +743,8 @@ pub(super) struct SoulClonesParams {
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub offset: Option<u32>,
     #[schemars(
-        description = "Minimum number of source lines for a symbol to be considered (default: 8). Filters out trivial getters and short dispatch boilerplate. Pass `min_lines=5` for a more aggressive scan that also surfaces small near-duplicates."
+        description = "Minimum number of source lines for a symbol to be considered (default: 8). Filters out trivial getters and short dispatch boilerplate. Pass `min_lines=5` for a more aggressive scan that also surfaces small near-duplicates. Must be >= 1 (0 matches every symbol and produces nothing useful after the duplicate-group filter).",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_lines: Option<u32>,
@@ -728,21 +762,26 @@ pub(super) struct SoulClonesParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulSmellsParams {
     #[schemars(
-        description = "Filter to specific smell kind(s): 'god_function', 'long_params', 'feature_envy', or comma-separated combination. Omit to detect all."
+        description = "Filter to specific smell kind(s). Comma-separated set of: 'god_function', 'long_params', 'feature_envy'. Unknown kinds in a mixed selection are warned and ignored; an all-unknown selection is rejected. Empty segments (e.g. 'god_function,') are trimmed. Omit to detect all."
     )]
     pub kind: Option<String>,
     #[schemars(description = "Scope detection to a single file path (relative to project root).")]
     pub file_path: Option<String>,
     #[schemars(
-        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15). Must be >= 1 (0 matches every function and produces no actionable signal).",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_complexity: Option<u32>,
-    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[schemars(
+        description = "God Function: minimum body line count threshold (default: 50). Must be >= 1.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_lines: Option<u32>,
     #[schemars(
-        description = "Long Parameter List: minimum parameter count threshold (default: 5). self/&self do not count."
+        description = "Long Parameter List: minimum parameter count threshold (default: 5). self/&self do not count. Must be >= 1.",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_params: Option<u32>,
@@ -763,7 +802,8 @@ pub(super) struct SoulSmellsParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulTestGapsParams {
     #[schemars(
-        description = "Analysis mode: 'map' = test-to-source mapping, 'gaps' (default) = untested source files ranked by risk, 'suggest' = test files to run for a git diff range."
+        description = "Analysis mode. Must be one of: 'map' = test-to-source mapping, 'gaps' (default) = untested source files ranked by risk, 'suggest' = test files to run for a git diff range.",
+        extend("enum" = ["map", "gaps", "suggest"])
     )]
     pub mode: Option<String>,
     #[schemars(
@@ -787,7 +827,7 @@ pub(super) struct SoulTestGapsParams {
     #[serde(default, deserialize_with = "flexible::f64_opt")]
     pub min_pagerank: Option<f64>,
     #[schemars(
-        description = "In 'map' mode with a source `file_path`, also list the intersection of symbols defined in the source file AND referenced by its mapped test files. Empty when no indexed symbol edges resolve into the file (e.g. tests reach the source via crate-rooted FTS fallback). Default: false."
+        description = "In 'map' mode, annotate output with symbol info. With a source `file_path`, lists the intersection of symbols defined in the source file AND referenced by its mapped test files (empty when no indexed symbol edges resolve into the file - e.g. tests reach the source via crate-rooted FTS fallback). Without `file_path`, every row of the project-wide listing is annotated with its own indexed symbol count plus a short preview of symbol names in detailed mode. Default: false."
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_symbols: Option<bool>,
@@ -887,7 +927,8 @@ pub(super) struct SoulHierarchyParams {
     #[serde(alias = "name", alias = "type", alias = "trait")]
     pub symbol: String,
     #[schemars(
-        description = "Query direction: 'sub' (default) = what implements/extends this? 'super' = what does this implement/extend?"
+        description = "Query direction. Must be one of: 'sub' (default) = what implements/extends this? 'super' = what does this implement/extend?",
+        extend("enum" = ["sub", "super"])
     )]
     pub direction: Option<String>,
     #[schemars(
@@ -917,11 +958,12 @@ pub(super) struct SoulSecurityParams {
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub offset: Option<u32>,
     #[schemars(
-        description = "Filter by vulnerability category: 'secrets', 'injection', 'crypto', 'unsafe', 'info-leak', 'review'."
+        description = "Filter by vulnerability category: 'secrets', 'injection', 'crypto', 'unsafe', 'info-leak', 'review'. Validated against the active rule set (builtin + custom .qartez/security.toml)."
     )]
     pub category: Option<String>,
     #[schemars(
-        description = "Minimum severity threshold: 'low' (default), 'medium', 'high', 'critical'. Findings below this level are excluded."
+        description = "Minimum severity threshold. Must be one of: 'low' (default), 'medium', 'high', 'critical' (case-insensitive). Findings below this level are excluded.",
+        extend("enum" = ["low", "medium", "high", "critical", "Low", "Medium", "High", "Critical"])
     )]
     pub severity: Option<String>,
     #[schemars(
@@ -1039,14 +1081,21 @@ pub(super) struct SoulHealthParams {
     #[serde(default, deserialize_with = "flexible::f64_opt")]
     pub max_health: Option<f64>,
     #[schemars(
-        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15). Must be >= 1.",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_complexity: Option<u32>,
-    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[schemars(
+        description = "God Function: minimum body line count threshold (default: 50). Must be >= 1.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_lines: Option<u32>,
-    #[schemars(description = "Long Parameter List: minimum parameter count (default: 5).")]
+    #[schemars(
+        description = "Long Parameter List: minimum parameter count (default: 5). Must be >= 1.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_params: Option<u32>,
     #[schemars(
@@ -1060,19 +1109,26 @@ pub(super) struct SoulRefactorPlanParams {
     #[schemars(description = "Target file path (relative to project root). Required.")]
     pub file_path: String,
     #[schemars(
-        description = "Max number of steps to surface (default: 8, min: 1, max: 50). Steps are ordered by estimated impact descending, then by safety. Values outside [1, 50] are clamped server-side."
+        description = "Max number of steps to surface (default: 8, max: 50). `limit=0` follows the tool-wide no-cap convention but is still capped at 50 because larger plans blow the MCP response budget; the response notes the cap only when the pre-cap step count actually exceeded 50. Values above 50 are clamped server-side."
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub limit: Option<u32>,
     #[schemars(
-        description = "God Function: minimum cyclomatic complexity threshold (default: 15)."
+        description = "God Function: minimum cyclomatic complexity threshold (default: 15). Must be >= 1.",
+        range(min = 1)
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_complexity: Option<u32>,
-    #[schemars(description = "God Function: minimum body line count threshold (default: 50).")]
+    #[schemars(
+        description = "God Function: minimum body line count threshold (default: 50). Must be >= 1.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_lines: Option<u32>,
-    #[schemars(description = "Long Parameter List: minimum parameter count (default: 5).")]
+    #[schemars(
+        description = "Long Parameter List: minimum parameter count (default: 5). Must be >= 1.",
+        range(min = 1)
+    )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub min_params: Option<u32>,
     #[schemars(

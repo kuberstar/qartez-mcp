@@ -48,22 +48,80 @@ impl QartezServer {
         let symbols =
             read::get_symbols_for_file(&conn, file.id).map_err(|e| format!("DB error: {e}"))?;
 
+        // Language-aware kind override. The tree-sitter-toml backend
+        // surfaces every `[section]` header as `class`, which reads
+        // as "this Cargo.toml has 7 classes" on the rendered outline
+        // and misleads callers into thinking the indexer is broken.
+        // Relabel those rows as `table` locally so the outline matches
+        // TOML vocabulary without requiring a re-index.
+        let is_toml_file = file.language == "toml";
+
         if symbols.is_empty() {
+            // The file row exists (the `get_file_by_path` above
+            // returned `Some`), so "may not be indexed yet" was
+            // misleading - lib.rs-style modules that hold only
+            // `mod foo;` / `use` declarations legitimately have no
+            // top-level symbols. Describe the real state so the
+            // caller does not chase a phantom index issue.
+            //
+            // For `.rs` files, fall back to a lightweight regex
+            // scan of the raw source for `mod X;` declarations:
+            // the indexer never surfaces module declarations as
+            // symbols, so a `lib.rs` with only `pub mod X;` lines
+            // renders as an empty outline even though `qartez_stats`
+            // ranks it as the top-PageRank node. Emitting the
+            // declarations under a `## Modules` section makes the
+            // real purpose of the file visible.
+            if params.file_path.ends_with(".rs") {
+                let abs = self.project_root.join(&params.file_path);
+                if let Ok(source) = std::fs::read_to_string(&abs) {
+                    let mods = extract_rust_module_decls(&source);
+                    if !mods.is_empty() {
+                        let mut out = format!(
+                            "# Outline: {}\n\n## Modules ({})\n",
+                            params.file_path,
+                            mods.len(),
+                        );
+                        for (prefix, name) in &mods {
+                            out.push_str(&format!("  {prefix} {name}\n"));
+                        }
+                        return Ok(out);
+                    }
+                }
+            }
             return Ok(format!(
-                "No symbols found in '{}'. File may not be indexed yet.",
+                "No top-level symbols in '{}'. The file is indexed but exposes only module/use declarations (no functions, types, or constants).",
                 params.file_path,
             ));
         }
 
-        // Total non-field count drives the "next_offset" hint and the header.
-        // We only page over non-field symbols because fields are rendered
-        // inline underneath their parent struct, not as top-level entries.
+        // Total non-field count drives the "next_offset" hint and the
+        // header. We only page over non-field symbols because fields
+        // are rendered inline underneath their parent struct, not as
+        // top-level entries. Record the field count so the header
+        // reports BOTH counters instead of conflating them.
         let total_non_fields = symbols.iter().filter(|s| s.kind != "field").count();
-        let mut out = format!(
-            "# Outline: {} ({} symbols)\n\n",
+        let field_count = symbols.len() - total_non_fields;
+
+        // Harmonised header: one counter for the TOTAL symbols (fields
+        // included, for parity with raw index dumps) and a second
+        // counter for the pageable non-field symbols (the number
+        // `offset`/`next_offset` operate on). Previously the header
+        // reported `(symbols.len())` while the pagination hint used
+        // `(total_non_fields)`; the two unexplained numbers drifted
+        // apart on any file with struct fields, leaving callers to
+        // reverse-engineer which counter to trust.
+        let pageable_suffix = if field_count > 0 {
+            format!(" ({total_non_fields} pageable, {field_count} field(s) inlined)")
+        } else {
+            String::new()
+        };
+        let out_header = format!(
+            "# Outline: {} ({} symbols{pageable_suffix})\n\n",
             params.file_path,
             symbols.len(),
         );
+        let mut out = out_header.clone();
 
         // Stable source-order view of non-field symbols. Pagination must be
         // deterministic: "offset=N skips exactly N" has to hold regardless
@@ -73,11 +131,21 @@ impl QartezServer {
             symbols.iter().filter(|s| s.kind != "field").collect();
         non_fields.sort_by_key(|s| (s.line_start, s.id));
 
+        // Signal out-of-range offset as a hard error so callers do
+        // not interpret an empty body as "this file has no symbols at
+        // all". Before, offset=99999 silently fell through to an
+        // empty-body success path that rendered as "232 symbols" +
+        // zero rows - a contradiction the header could not explain.
+        if offset >= total_non_fields {
+            return Err(format!(
+                "offset={offset} exceeds the {total_non_fields} pageable symbol(s) in '{}' (total {} including inlined fields). Pass a smaller offset or omit it to start from the top.",
+                params.file_path,
+                symbols.len(),
+            ));
+        }
+
         if concise {
             let mut next_offset: Option<usize> = None;
-            if offset >= non_fields.len() {
-                return Ok(out);
-            }
             for (i, sym) in non_fields.iter().skip(offset).enumerate() {
                 let marker = if sym.is_exported { "+" } else { "-" };
                 let line = format!("  {marker} {} [L{}]\n", sym.name, sym.line_start);
@@ -106,15 +174,6 @@ impl QartezServer {
                 fields_by_parent.entry(pid).or_default().push(sym);
             }
         }
-
-        // Honor the pagination contract up front: skip exactly `offset`
-        // non-field symbols (source order), then render the remainder
-        // grouped by kind in the established presentation order. This
-        // keeps "offset=N skips N" semantics consistent with the concise
-        // branch and with the schema description.
-        if offset >= non_fields.len() {
-            return Ok(out);
-        }
         let visible: Vec<&crate::storage::models::SymbolRow> =
             non_fields.iter().copied().skip(offset).collect();
         let mut by_kind: std::collections::BTreeMap<
@@ -122,7 +181,8 @@ impl QartezServer {
             Vec<&crate::storage::models::SymbolRow>,
         > = std::collections::BTreeMap::new();
         for sym in &visible {
-            let display_kind = capitalize_kind(&sym.kind);
+            let raw_kind = display_kind_for(sym.kind.as_str(), is_toml_file);
+            let display_kind = capitalize_kind(raw_kind);
             by_kind.entry(display_kind).or_default().push(*sym);
         }
 
@@ -183,4 +243,54 @@ impl QartezServer {
 
         Ok(out)
     }
+}
+
+/// Remap a raw indexer kind to the vocabulary appropriate for the
+/// host language. The upstream TOML backend emits `class` for every
+/// `[section]` / `[[array]]` header because tree-sitter-toml has no
+/// dedicated "table" node kind; the outline tool reads that as "seven
+/// classes in Cargo.toml", which is confusing. Relabel to `table`
+/// here so the final outline matches TOML vocabulary without touching
+/// the indexer or the stored symbol rows.
+fn display_kind_for(raw_kind: &str, is_toml_file: bool) -> &str {
+    if is_toml_file && raw_kind == "class" {
+        return "table";
+    }
+    raw_kind
+}
+
+/// Scan Rust source for top-level `mod X;` declarations. Returns the
+/// full leading display prefix (`pub mod`, `pub(crate) mod`,
+/// `pub(super) mod`, or bare `mod`) paired with the module name, in
+/// source order so the caller can render `{prefix} {name}` without
+/// re-joining the keyword. The regex is intentionally narrow (anchored
+/// to start-of-line after whitespace, requires a trailing `;`) so
+/// inline `mod foo { ... }` blocks - which the indexer already
+/// surfaces as symbols - stay out, and a stray `mod foo;` inside a
+/// docstring is a tolerable false positive.
+fn extract_rust_module_decls(source: &str) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for raw in source.lines() {
+        let line = raw.trim_start();
+        let (prefix, rest): (&'static str, &str) = if let Some(r) = line.strip_prefix("pub mod ") {
+            ("pub mod", r)
+        } else if let Some(r) = line.strip_prefix("pub(crate) mod ") {
+            ("pub(crate) mod", r)
+        } else if let Some(r) = line.strip_prefix("pub(super) mod ") {
+            ("pub(super) mod", r)
+        } else if let Some(r) = line.strip_prefix("mod ") {
+            ("mod", r)
+        } else {
+            continue;
+        };
+        let Some(semi_idx) = rest.find(';') else {
+            continue;
+        };
+        let name = rest[..semi_idx].trim();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            continue;
+        }
+        out.push((prefix, name.to_string()));
+    }
+    out
 }

@@ -42,6 +42,12 @@ impl QartezServer {
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
         let transitive = params.transitive.unwrap_or(false);
+        // Default true preserves back-compat for callers that do not
+        // know about the filter. Hub symbols whose test-only usage
+        // dominates production call sites (e.g. `new` in server/mod.rs
+        // with 200+ refs from tests/tools.rs) can flip the flag off to
+        // focus on production usages.
+        let include_tests = params.include_tests.unwrap_or(true);
 
         // All DB queries under one lock acquisition; the lock is dropped
         // before the tree-sitter / FS phase (cached_calls) so the watcher
@@ -75,7 +81,20 @@ impl QartezServer {
 
         let mut out = String::new();
 
-        for (sym, file, importers) in &refs {
+        // Track candidate count once so we can render a header and a
+        // "N candidate(s) truncated" footer. Without this, `qartez_refs
+        // new` (7 function candidates in the index) silently burned the
+        // whole token budget inside the second candidate and the caller
+        // saw no indication that 5 more existed.
+        let total_candidates = refs.len();
+        if !concise && total_candidates > 1 {
+            out.push_str(&format!(
+                "# {} matches name '{}'. Pass `kind` / `file_path` (on refactor tools) to narrow. Reporting each candidate in order.\n\n",
+                total_candidates, params.symbol,
+            ));
+        }
+
+        for (candidates_emitted, (sym, file, importers)) in refs.iter().enumerate() {
             // Drop self-references only (a symbol whose `from_symbol_id`
             // equals the defining `sym.id`, i.e. `fn f() { f() }`) so the
             // `Direct references` list is not padded with the symbol
@@ -84,6 +103,11 @@ impl QartezServer {
             // through `.map(helper)`) are kept - they are legitimate
             // usages and previously disappeared behind a blanket
             // `importer.file == def.file` filter.
+            //
+            // When `include_tests=false`, also drop importers whose
+            // file path is classified as a test path. This is the same
+            // predicate `qartez_calls` uses so both tools report a
+            // consistent production-only view of a hub symbol.
             let external_importers: Vec<&(
                 crate::storage::models::EdgeRow,
                 crate::storage::models::FileRow,
@@ -91,23 +115,54 @@ impl QartezServer {
             )> = importers
                 .iter()
                 .filter(|(_, _, from_sym)| *from_sym != sym.id)
+                .filter(|(_, f, _)| include_tests || !helpers::is_test_path(&f.path))
                 .collect();
 
+            // Over-budget: stop before emitting the next candidate block
+            // so `qartez_refs new` (7 fn candidates) signals how many
+            // were held back instead of silently truncating mid-symbol.
+            if !concise && estimate_tokens(&out) > budget {
+                let remaining = total_candidates - candidates_emitted;
+                out.push_str(&format!(
+                    "\n... {remaining} candidate(s) truncated by token_budget. Pass `kind` / `file_path` to narrow, or raise `token_budget=`.\n",
+                ));
+                break;
+            }
+
             if concise {
-                let paths: Vec<&str> = external_importers
+                // Collapse duplicate file paths: a single importer file
+                // often supplies multiple edges (separate test fns, N
+                // call sites sharing one `use` import). Before this
+                // fix, concise mode printed the same path once per
+                // edge (e.g. 6x the defining file of LanguageSupport),
+                // wasting the caller's token budget on noise. Each
+                // path is now emitted once with a trailing `xN` count
+                // when N > 1, matching the detailed-mode convention.
+                let mut counts: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for (_, f, _) in &external_importers {
+                    *counts.entry(f.path.as_str()).or_insert(0) += 1;
+                }
+                let rendered: Vec<String> = counts
                     .iter()
-                    .map(|(_, f, _)| f.path.as_str())
+                    .map(|(path, count)| {
+                        if *count > 1 {
+                            format!("{path} x{count}")
+                        } else {
+                            (*path).to_string()
+                        }
+                    })
                     .collect();
                 out.push_str(&format!(
                     "{} ({}) in {} - {} ref(s): {}\n",
                     sym.name,
                     sym.kind,
                     file.path,
-                    paths.len(),
-                    if paths.is_empty() {
+                    external_importers.len(),
+                    if rendered.is_empty() {
                         "none".to_string()
                     } else {
-                        paths.join(", ")
+                        rendered.join(", ")
                     },
                 ));
                 continue;
@@ -121,24 +176,57 @@ impl QartezServer {
             if external_importers.is_empty() {
                 out.push_str("  No direct references found.\n\n");
             } else {
-                out.push_str(&format!(
-                    "  Direct references ({}):\n",
-                    external_importers.len()
-                ));
+                // Dedup by file path so detailed mode does not print
+                // the same importer ~50x when N distinct specifiers or
+                // N call sites resolve to the same file. Before this
+                // collapse, a hub symbol referenced in a test module
+                // through many named imports emitted one line per
+                // import; callers wasted their token budget reading
+                // the same path over and over. Group by path, keep
+                // the set of distinct specifiers and kinds, and emit
+                // one line per file with `xN` when N > 1.
+                let mut by_path: std::collections::BTreeMap<
+                    String,
+                    (
+                        std::collections::BTreeSet<String>,
+                        std::collections::BTreeSet<String>,
+                        usize,
+                    ),
+                > = std::collections::BTreeMap::new();
                 for (edge, importer_file, _from_sym) in &external_importers {
-                    // Suppress the `imports via '...'` clause when the
-                    // edge has no specifier: for symbol-level refs the
-                    // specifier is routinely absent and the placeholder
-                    // `(unspecified)` added one noise line per importer
-                    // that carried no real information. When a real
-                    // specifier is present (e.g. `use foo::Bar as Baz;`)
-                    // it is kept so callers can still see the rename.
-                    let line = match edge.specifier.as_deref() {
-                        Some(spec) if !spec.is_empty() => format!(
-                            "    {} - imports via '{}' ({})\n",
-                            importer_file.path, spec, edge.kind,
-                        ),
-                        _ => format!("    {} ({})\n", importer_file.path, edge.kind),
+                    let entry = by_path.entry(importer_file.path.clone()).or_insert((
+                        std::collections::BTreeSet::new(),
+                        std::collections::BTreeSet::new(),
+                        0,
+                    ));
+                    if let Some(s) = edge.specifier.as_deref()
+                        && !s.is_empty()
+                    {
+                        entry.0.insert(s.to_string());
+                    }
+                    entry.1.insert(edge.kind.clone());
+                    entry.2 += 1;
+                }
+
+                out.push_str(&format!(
+                    "  Direct references ({} importer(s), {} total ref(s)):\n",
+                    by_path.len(),
+                    external_importers.len(),
+                ));
+                for (path, (specs, kinds, count)) in &by_path {
+                    let count_tag = if *count > 1 {
+                        format!(" x{count}")
+                    } else {
+                        String::new()
+                    };
+                    let kind_label = kinds.iter().cloned().collect::<Vec<_>>().join(",");
+                    let line = if specs.is_empty() {
+                        format!("    {path} ({kind_label}){count_tag}\n")
+                    } else {
+                        let specs_joined = specs.iter().cloned().collect::<Vec<_>>().join(", ");
+                        format!(
+                            "    {path} - imports via '{specs_joined}' ({kind_label}){count_tag}\n",
+                        )
                     };
                     if estimate_tokens(&out) + estimate_tokens(&line) > budget {
                         out.push_str("    ... (truncated by token budget)\n");
@@ -147,6 +235,54 @@ impl QartezServer {
                     out.push_str(&line);
                 }
                 out.push('\n');
+            }
+
+            // For trait / interface / class symbols, also surface rows
+            // from `type_hierarchy`: an `impl LanguageSupport for Foo`
+            // block does NOT emit a `symbol_refs` edge to the trait
+            // definition, so the naive ref list would miss 37 of 37
+            // implementing files. The per-symbol refactor tools
+            // (qartez_rename, qartez_safe_delete) still run off
+            // `symbol_refs`, so this report section is a visibility
+            // boost for the caller - rewrite/delete must still scan
+            // the impl sites manually.
+            if matches!(sym.kind.as_str(), "trait" | "interface" | "class") {
+                let impl_files: Vec<String> = {
+                    let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+                    let mut stmt = match conn.prepare_cached(
+                        "SELECT DISTINCT f.path
+                         FROM type_hierarchy h
+                         JOIN files f ON f.id = h.file_id
+                         WHERE h.super_name = ?1
+                         ORDER BY f.path",
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            out.push('\n');
+                            continue;
+                        }
+                    };
+                    let rows = stmt
+                        .query_map([&sym.name], |row| row.get::<_, String>(0))
+                        .map_err(|e| format!("DB error: {e}"))?;
+                    rows.flatten().collect()
+                };
+
+                if !impl_files.is_empty() {
+                    out.push_str(&format!(
+                        "  Trait implementations ({} file(s)):\n",
+                        impl_files.len(),
+                    ));
+                    for p in &impl_files {
+                        let line = format!("    {p}\n");
+                        if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+                            out.push_str("    ... (truncated by token budget)\n");
+                            break;
+                        }
+                        out.push_str(&line);
+                    }
+                    out.push('\n');
+                }
             }
 
             // Per-symbol scan set: the defining file plus every file whose
@@ -158,9 +294,18 @@ impl QartezServer {
             // symbol. Files that textually mention the name but have no
             // resolved edge to this sym are assumed to target a different
             // same-named sym and are left to that sym's iteration.
+            //
+            // `include_tests=false` drops test-path importers from this
+            // scan set as well so the AST-resolved call sites section
+            // stays consistent with the Direct-references list above.
             let mut scan_paths: BTreeSet<String> = BTreeSet::new();
-            scan_paths.insert(file.path.clone());
+            if include_tests || !helpers::is_test_path(&file.path) {
+                scan_paths.insert(file.path.clone());
+            }
             for (_, importer_file, _from_sym) in importers {
+                if !include_tests && helpers::is_test_path(&importer_file.path) {
+                    continue;
+                }
                 scan_paths.insert(importer_file.path.clone());
             }
             let mut call_sites: Vec<(String, usize)> = Vec::new();
@@ -212,6 +357,7 @@ impl QartezServer {
                 let seeds: Vec<i64> = importers
                     .iter()
                     .filter(|(_, f, _)| f.id != file.id)
+                    .filter(|(_, f, _)| include_tests || !helpers::is_test_path(&f.path))
                     .map(|(_, f, _)| f.id)
                     .collect();
                 for seed in &seeds {

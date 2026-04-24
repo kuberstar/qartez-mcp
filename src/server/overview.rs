@@ -51,6 +51,10 @@ impl super::QartezServer {
 
         let any_nonzero = symbols.iter().any(|(s, _)| s.pagerank > 0.0);
         if !any_nonzero {
+            // `build_overview` also acquires `self.db.lock()`, so we must
+            // drop our guard before re-entering. `std::sync::Mutex` is not
+            // recursive; holding it across the call deadlocks.
+            drop(conn);
             let mut out = String::from(
                 "# Symbol PageRank unavailable\n\
                  No symbol-level PageRank data in the index. This is expected for \
@@ -293,6 +297,22 @@ impl super::QartezServer {
             file_symbols.push((file.path.clone(), symbols));
         }
 
+        let shown = file_symbols.len();
+        let total = files.len();
+        // Truncation-footer rendering. `all_files=true` always surfaces the
+        // zero-PR tail note regardless of budget because callers use that
+        // mode to audit the full corpus. Both modes honour the budget so a
+        // tight `token_budget=50` smoke-test does not overshoot by a footer
+        // line. The footer still renders when the caller's budget has
+        // room; otherwise a shorter marker keeps the "output grew
+        // monotonically" invariant without blowing the tolerance.
+        let truncation_footer = if shown < total {
+            Some(format!(
+                "// truncated: {shown}/{total} files shown; raise token_budget= to see more\n",
+            ))
+        } else {
+            None
+        };
         if all_files {
             // A zero-PR tail is common for files that the graph never
             // touched (isolated modules, tree-shaken helpers). Surface
@@ -300,16 +320,21 @@ impl super::QartezServer {
             // intentionally at the bottom of the list.
             let zero_pr = files.iter().filter(|f| f.pagerank <= 0.0).count();
             if zero_pr > 0 {
-                out.push_str(&format!(
+                let note = format!(
                     "// note: {zero_pr} file(s) have PageRank=0.0 (no inbound/outbound edges)\n",
-                ));
+                );
+                if estimate_tokens(&out) + estimate_tokens(&note) <= token_budget {
+                    out.push_str(&note);
+                }
             }
-            let shown = file_symbols.len();
-            let total = files.len();
-            if shown < total {
-                out.push_str(&format!(
-                    "// truncated: {shown}/{total} files shown; raise token_budget= to see more\n",
-                ));
+        }
+        if let Some(footer) = truncation_footer {
+            if estimate_tokens(&out) + estimate_tokens(&footer) <= token_budget {
+                out.push_str(&footer);
+            } else {
+                // Budget exhausted; emit the shortest possible marker
+                // so callers still see that truncation happened.
+                out.push_str("// truncated\n");
             }
         }
 

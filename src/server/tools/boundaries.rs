@@ -81,7 +81,12 @@ impl QartezServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(".qartez/boundaries.toml");
-        let abs_path = self.safe_resolve(rel_path)?;
+        // Match the `write_to` policy: accept either a path relative to
+        // the project root OR an absolute path whose parent directory
+        // already exists. The two parameters now share a single
+        // resolver so callers cannot pass an absolute path to one and
+        // relative to the other.
+        let abs_path = resolve_write_target(self, rel_path)?;
         let concise = is_concise(&params.format);
 
         let suggest = params.suggest.unwrap_or(false);
@@ -89,13 +94,19 @@ impl QartezServer {
 
         if !suggest && !write_to_trimmed.is_empty() {
             return Err(
-                "`write_to` is only valid when `suggest=true`. Pass `suggest=true` to emit a starter config, or remove `write_to`."
+                "write_to is ignored unless suggest=true. To see what would be written without mutating disk, pass suggest=true and omit write_to."
                     .to_string(),
             );
         }
 
         if suggest {
-            let auto_cluster = params.auto_cluster.unwrap_or(true);
+            // auto_cluster is a tri-state: Some(true) = recompute / run
+            // on demand, Some(false) = refuse to run clustering even
+            // when stored clusters exist, None = default (run on
+            // demand when the clustering table is empty, reuse
+            // otherwise).
+            let auto_cluster_explicit = params.auto_cluster;
+            let auto_cluster = auto_cluster_explicit.unwrap_or(true);
 
             {
                 let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
@@ -111,6 +122,15 @@ impl QartezServer {
                     let leiden = LeidenConfig::default();
                     compute_clusters(&conn, &leiden)
                         .map_err(|e| format!("Auto-cluster failed: {e}"))?;
+                } else if auto_cluster_explicit == Some(false) {
+                    // Explicit `auto_cluster=false` with existing
+                    // clustering used to silently re-use the stored
+                    // assignment, which contradicted the flag name.
+                    // Fail loudly so callers see the ambiguity.
+                    return Err(
+                        "auto_cluster=false but clusters already exist; pass auto_cluster=true or delete `.qartez/boundaries.toml` (and rerun `qartez_wiki recompute=true`) to recompute."
+                            .to_string(),
+                    );
                 }
             }
 

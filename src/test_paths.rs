@@ -88,6 +88,98 @@ pub(crate) fn is_testable_source_language(language: &str) -> bool {
     )
 }
 
+/// Path-only variant of `is_testable_source_language`. Used when the
+/// file is not yet indexed, so no `FileRow::language` is available, but
+/// we still need to decide whether the file could meaningfully grow a
+/// unit test. Covers the extensions `qartez_test_gaps mode=suggest`
+/// mis-flagged after CHANGELOG / Cargo.lock / README / PS1 / SKILL.md
+/// commits.
+pub(crate) fn is_testable_source_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let name_lower = name.to_ascii_lowercase();
+
+    const NON_SOURCE_BASENAMES: &[&str] = &[
+        "cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "poetry.lock",
+        "uv.lock",
+        "gemfile.lock",
+        "go.sum",
+        "readme.md",
+        "changelog.md",
+        "license",
+        "license.md",
+        "contributing.md",
+        "code_of_conduct.md",
+        "security.md",
+        "dockerfile",
+    ];
+    if NON_SOURCE_BASENAMES.contains(&name_lower.as_str()) {
+        return false;
+    }
+
+    const NON_SOURCE_EXTENSIONS: &[&str] = &[
+        ".md",
+        ".markdown",
+        ".txt",
+        ".rst",
+        ".adoc",
+        ".lock",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".json5",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".env",
+        ".gitignore",
+        ".editorconfig",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".bat",
+        ".cmd",
+        ".ps1",
+        ".psm1",
+        ".psd1",
+        ".csv",
+        ".tsv",
+        ".xml",
+        ".html",
+        ".htm",
+        ".css",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".pdf",
+        ".proto",
+        ".graphql",
+        ".sql",
+        ".dockerfile",
+        ".nix",
+        ".hcl",
+        ".tf",
+        ".mod",
+        ".sum",
+    ];
+    if NON_SOURCE_EXTENSIONS
+        .iter()
+        .any(|e| name_lower.ends_with(e))
+    {
+        return false;
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

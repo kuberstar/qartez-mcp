@@ -49,8 +49,13 @@ impl QartezServer {
                 .unwrap_or_default()
                 .len();
             let importers = read::get_edges_to(&conn, file.id).unwrap_or_default().len();
+            // Blank line after the `# <path>` heading so markdown
+            // renderers recognise the H1 section boundary. Without
+            // the separator, the heading ran straight into the first
+            // stat line and every markdown viewer rendered it as one
+            // long inline sentence instead of a header plus body.
             return Ok(format!(
-                "# {path}\nLOC: {loc} | Symbols: {syms} ({exp} exported) | Imports: {imp} | Importers: {importers}\nLanguage: {lang} | PageRank: {pr:.4}\n",
+                "# {path}\n\nLOC: {loc} | Symbols: {syms} ({exp} exported) | Imports: {imp} | Importers: {importers}\nLanguage: {lang} | PageRank: {pr:.4}\n",
                 path = file.path,
                 loc = file.line_count,
                 syms = symbols.len(),

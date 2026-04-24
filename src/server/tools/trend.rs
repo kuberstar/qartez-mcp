@@ -43,12 +43,48 @@ impl QartezServer {
             );
         }
 
+        // Distinguish "file absent from the index" from "file present
+        // but without per-symbol complexity data". Previously both
+        // cases collapsed onto the same "No complexity trend data"
+        // message, so callers chasing a typo in `file_path` could not
+        // tell whether to fix the path or widen the filter. Scope the
+        // lookup to its own DB lock so the rest of the analysis does
+        // not hold onto the handle while walking git history.
+        let file_row = {
+            let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
+            read::get_file_by_path(&conn, &params.file_path)
+                .map_err(|e| format!("DB error: {e}"))?
+        };
+        let Some(file_row) = file_row else {
+            return Err(format!(
+                "File '{}' not found in index. Check the path (must be project-relative) or re-index with `qartez index`.",
+                params.file_path,
+            ));
+        };
+        // Cache the index-time commit count so the empty-result path
+        // can distinguish "fewer than 2 commits touched this file"
+        // from "symbol not found" / "complexity unmeasurable" without
+        // a second DB round-trip.
+        let file_commit_count = file_row.change_count;
+
         // Strict server-side clamp. The tool description promises a 50-commit
         // cap; clamping here keeps the documented contract visible in the
         // tool layer instead of relying on a sibling crate's private
         // constant.
         const MAX_COMMIT_LIMIT: u32 = 50;
-        let limit = params.limit.unwrap_or(10).clamp(1, MAX_COMMIT_LIMIT);
+        // `limit=0` previously flowed through `clamp(1, 50)` and
+        // silently became `1`, which emitted the same "No data"
+        // message the real no-history path produces and hid the
+        // caller's bad input. Reject explicitly so the distinction
+        // between "no trend data" and "invalid limit" is visible.
+        if let Some(0) = params.limit {
+            return Err(
+                "limit must be > 0 (use a positive integer; there is no 'no-cap' mode).".into(),
+            );
+        }
+        let requested_limit = params.limit.unwrap_or(10);
+        let limit = requested_limit.clamp(1, MAX_COMMIT_LIMIT);
+        let limit_was_clamped = requested_limit != limit;
         let concise = matches!(params.format, Some(Format::Concise));
 
         // Token-budget truncation caps the rendered report so a big file
@@ -105,10 +141,38 @@ impl QartezServer {
         }
 
         if trends.is_empty() {
-            return Ok(format!(
-                "No complexity trend data for `{}`. Possible reasons: file has fewer than 2 commits, no functions with measurable complexity, or symbol not found.",
-                params.file_path
-            ));
+            // Disambiguate the three reasons a trend can come back
+            // empty. Emit exactly one cause so the caller doesn't
+            // need to reverse-engineer which of the three to fix.
+            //   1) explicit symbol_name that doesn't resolve to any
+            //      trend point - the caller picked the wrong name.
+            //   2) fewer than 2 commits touched the file - git
+            //      history is too shallow to measure a delta.
+            //   3) file is indexed with commits but no function had
+            //      measurable complexity (non-code, generated, or
+            //      the parser skipped every body).
+            // The clamp notice still runs on every path so callers
+            // always see that their requested limit was rewritten,
+            // regardless of which cause fired.
+            let mut msg = if let Some(sym) = symbol_filter {
+                format!("Symbol '{sym}' not found in file '{}'.", params.file_path,)
+            } else if file_commit_count < 2 {
+                format!(
+                    "Only {file_commit_count} commit(s) touched '{}'. Need at least 2 to measure a trend.",
+                    params.file_path,
+                )
+            } else {
+                format!(
+                    "Complexity not computable for '{}'. The file may have been non-code.",
+                    params.file_path,
+                )
+            };
+            if limit_was_clamped {
+                msg.push_str(&format!(
+                    "\nnote: limit={requested_limit} was clamped to {MAX_COMMIT_LIMIT} (server-side commit cap).",
+                ));
+            }
+            return Ok(msg);
         }
 
         // Approximate char-to-token ratio; the MCP server elsewhere uses
@@ -142,6 +206,16 @@ impl QartezServer {
         } else {
             out.push_str(&format!("# Complexity Trend: {}\n\n", params.file_path));
 
+            // When the caller did not pin a symbol, skip the per-commit
+            // table for STABLE trends (|delta| <= 10%). Those rows
+            // carried no signal and, on a 20+ symbol file, consumed the
+            // full token budget before the GROWING/SHRINKING rows
+            // rendered. Callers who want the per-commit view for a
+            // stable symbol pass `symbol_name=` explicitly, and the
+            // table is rendered as usual.
+            let summarise_stable = symbol_filter.is_none();
+            let mut stable_summarised = 0usize;
+
             for t in &trends {
                 let first_cc = t.points.first().map(|p| p.complexity).unwrap_or(0);
                 let last_cc = t.points.last().map(|p| p.complexity).unwrap_or(0);
@@ -159,8 +233,11 @@ impl QartezServer {
                     "STABLE"
                 };
 
+                // `(commits=N)` replaces the bare `(N)` suffix so the
+                // number is self-describing - previously the count
+                // visually collided with CC values on either side.
                 out.push_str(&format!(
-                    "## {} ({}) CC {} -> {} ({:+.0}% {})\n\n",
+                    "## {} (commits={}) CC {} -> {} ({:+.0}% {})\n\n",
                     t.symbol_name,
                     t.points.len(),
                     first_cc,
@@ -168,6 +245,11 @@ impl QartezServer {
                     delta,
                     direction,
                 ));
+
+                if summarise_stable && direction == "STABLE" {
+                    stable_summarised += 1;
+                    continue;
+                }
 
                 out.push_str("  Commit  | CC | Lines | Summary\n");
                 out.push_str("  --------+----+-------+--------\n");
@@ -193,6 +275,12 @@ impl QartezServer {
                 }
                 out.push('\n');
             }
+
+            if stable_summarised > 0 {
+                out.push_str(&format!(
+                    "// {stable_summarised} STABLE symbol(s) shown as header only (no CC change). Pass `symbol_name=` to see the per-commit table.\n",
+                ));
+            }
         }
 
         // Token-budget enforcement: if the rendered report exceeds the
@@ -208,6 +296,12 @@ impl QartezServer {
             out.truncate(cut);
             out.push_str(&format!(
                 "\n... output truncated at ~{token_budget} tokens. Narrow with `symbol_name=` or lower `limit=`.\n",
+            ));
+        }
+
+        if limit_was_clamped {
+            out.push_str(&format!(
+                "\nnote: limit={requested_limit} was clamped to {MAX_COMMIT_LIMIT} (server-side commit cap). Per-symbol series may still be shorter when the underlying file has fewer indexed commits.\n",
             ));
         }
 

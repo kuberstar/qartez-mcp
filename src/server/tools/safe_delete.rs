@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-04-21
+// Rust guideline compliant 2026-04-23
 
 #![allow(unused_imports)]
 
@@ -40,25 +40,14 @@ impl QartezServer {
             params.file_path.as_deref(),
         )?;
 
-        // Unify two reference signals so the blast-radius count matches
-        // what `qartez_refs` would show:
-        //   - `edges` table: file-level `use` imports of the defining file,
-        //   - `symbol_refs` table: symbol-level usage edges, which pick up
-        //     glob imports, re-exports, and parent-module qualified calls
-        //     that never became `use` edges.
-        // A naive `get_edges_to` alone showed "1 file(s) import" when
-        // `qartez_refs` returned 8.
-        let edges =
-            read::get_edges_to(&conn, source_file.id).map_err(|e| format!("DB error: {e}"))?;
-        let mut edge_importers: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for edge in &edges {
-            if let Ok(Some(f)) = read::get_file_by_id(&conn, edge.from_file)
-                && f.path != source_file.path
-            {
-                edge_importers.insert(f.path);
-            }
-        }
+        // Use the per-symbol reference table only. File-level `use`
+        // edges (`get_edges_to`) count every module that imports
+        // *anything* from the defining file, so a zero-caller private
+        // helper living in `mod.rs` still got flagged "7 files
+        // reference mod.rs" - the guard fired on a perfectly safe
+        // delete. `get_symbol_references_filtered` is scoped to the
+        // exact symbol being deleted and is the signal `qartez_refs`
+        // already surfaces.
         let sym_refs = read::get_symbol_references_filtered(
             &conn,
             &sym.name,
@@ -66,26 +55,105 @@ impl QartezServer {
             Some(&source_file.path),
         )
         .map_err(|e| format!("DB error: {e}"))?;
+        // Split importers by whether they live in the source file
+        // (same-file refs, i.e. sibling symbols in the same module)
+        // or elsewhere. Before, both categories collapsed into one
+        // flat path list and the refusal message could not distinguish
+        // "callers will fail to compile" from "sibling symbol will be
+        // orphaned inside the defining file", leaving the user to
+        // read the paths and pick out the source file by eye. Pure
+        // self-references (recursion) are dropped - deletion removes
+        // both sides of that edge at once.
         let mut ref_importers: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        // Track intra-file references (from a DIFFERENT symbol in the same
-        // file) separately so the tool still refuses to delete a helper
-        // that is reached only through a sibling in the same module. Pure
-        // self-references (recursion) are dropped - deletion removes both
-        // sides of that edge at once.
+        let mut external_importers: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut same_file_from_ids: std::collections::BTreeSet<i64> =
+            std::collections::BTreeSet::new();
         for (_, _, importers) in &sym_refs {
             for (_, importer_file, from_symbol_id) in importers {
                 if *from_symbol_id == sym.id {
                     continue;
                 }
                 ref_importers.insert(importer_file.path.clone());
+                if importer_file.path == source_file.path {
+                    same_file_from_ids.insert(*from_symbol_id);
+                } else {
+                    external_importers.insert(importer_file.path.clone());
+                }
             }
         }
-        let mut combined: std::collections::BTreeSet<String> = edge_importers.clone();
-        combined.extend(ref_importers.iter().cloned());
-        let importer_paths: Vec<String> = combined.into_iter().collect();
-        let edge_count = edge_importers.len();
-        let ref_count = ref_importers.len();
+        // Resolve same-file refs to line numbers by scanning the
+        // source file's symbol table once. This is cheap - a single
+        // indexed SELECT - and avoids a per-reference DB round trip.
+        let mut same_file_lines: Vec<u32> = Vec::new();
+        if !same_file_from_ids.is_empty()
+            && let Ok(file_syms) = read::get_symbols_for_file(&conn, source_file.id)
+        {
+            for s in &file_syms {
+                if same_file_from_ids.contains(&s.id) {
+                    same_file_lines.push(s.line_start);
+                }
+            }
+        }
+        same_file_lines.sort_unstable();
+        same_file_lines.dedup();
+
+        // Belt-and-suspenders: augment the `symbol_refs` importer set with
+        // a tree-sitter call-site scan, mirroring the hybrid resolver in
+        // `qartez_calls`. The `symbol_refs` table relies on the indexer
+        // binding each call target by name, which fails for method calls
+        // through a typed receiver (e.g. `pool.parse_file(...)` where the
+        // resolver cannot pick `ParserPool::parse_file` over any other
+        // `parse_file` definition). Without this scan a private helper
+        // with live callers would be reported as "safe to delete".
+        if matches!(sym.kind.as_str(), "function" | "method" | "constructor") {
+            let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
+            for file in &all_files {
+                if ref_importers.contains(&file.path) {
+                    continue;
+                }
+                let Some(source) = self.cached_source(&file.path) else {
+                    continue;
+                };
+                if !source.contains(sym.name.as_str()) {
+                    continue;
+                }
+                let calls = self.cached_calls(&file.path);
+                let has_call_here = calls.iter().any(|(n, line)| {
+                    n == sym.name.as_str()
+                        && !(file.path == source_file.path
+                            && (*line as u32) >= sym.line_start
+                            && (*line as u32) <= sym.line_end)
+                });
+                if has_call_here {
+                    ref_importers.insert(file.path.clone());
+                }
+            }
+        }
+
+        // Trait-impl guard: when deleting a trait, enumerate every `impl
+        // TraitName for ...` site via the `type_hierarchy` table so the
+        // caller sees every concrete implementation that would stop
+        // compiling. `symbol_refs` only records name-resolved usages and
+        // does not capture trait-impl relationships.
+        let mut trait_impl_sites: Vec<(String, String, u32)> = Vec::new();
+        if sym.kind.eq_ignore_ascii_case("trait") || sym.kind.eq_ignore_ascii_case("interface") {
+            let subtypes =
+                read::get_subtypes(&conn, &sym.name).map_err(|e| format!("DB error: {e}"))?;
+            for (rel, file) in subtypes {
+                if file.path == source_file.path
+                    && rel.line >= sym.line_start
+                    && rel.line <= sym.line_end
+                {
+                    continue;
+                }
+                ref_importers.insert(file.path.clone());
+                trait_impl_sites.push((rel.sub_name, file.path, rel.line));
+            }
+        }
+
+        let importer_paths: Vec<String> = ref_importers.iter().cloned().collect();
         drop(conn);
 
         let apply = params.apply.unwrap_or(false);
@@ -114,34 +182,97 @@ impl QartezServer {
                 out.push_str("No files import this symbol. Safe to delete.\n");
             } else {
                 out.push_str(&format!(
-                    "WARNING: {} file(s) reference '{}' (use-edges: {}, symbol-refs: {}) and may break after delete:\n",
+                    "WARNING: {} file(s) reference symbol '{}' ({}) and may break after delete:\n",
                     importer_paths.len(),
-                    source_file.path,
-                    edge_count,
-                    ref_count,
+                    sym.name,
+                    sym.kind,
                 ));
                 for p in &importer_paths {
                     out.push_str(&format!("  {p}\n"));
                 }
-                out.push_str(
-                    "\nPass `force=true` with `apply=true` to delete anyway. The caller must then fix the dangling imports.\n",
-                );
+                if !trait_impl_sites.is_empty() {
+                    out.push_str(&format!(
+                        "\n{} trait impl block(s) target '{}' and would fail to compile:\n",
+                        trait_impl_sites.len(),
+                        sym.name,
+                    ));
+                    for (sub_name, path, line) in &trait_impl_sites {
+                        out.push_str(&format!(
+                            "  impl {} for {sub_name} @ {path}:L{line}\n",
+                            sym.name
+                        ));
+                    }
+                }
+                // Context-aware trigger: when the caller already set
+                // `force=true` the hint to "pass `force=true` with
+                // `apply=true`" reads like the tool lost their flag,
+                // so collapse the guidance to "call again with
+                // `apply=true`" whenever `force` is already on. The
+                // default preview path keeps the original wording
+                // since both flags are still absent.
+                if force {
+                    out.push_str(&format!(
+                        "\nTo delete a symbol with {} live reference(s), call again with `apply=true` (force=true already set). The caller must then fix the dangling imports.\n",
+                        importer_paths.len(),
+                    ));
+                } else {
+                    out.push_str(
+                        "\nPass `force=true` with `apply=true` to delete anyway. The caller must then fix the dangling imports.\n",
+                    );
+                }
             }
             return Ok(out);
         }
 
         if !importer_paths.is_empty() && !force {
+            // Refusal message separates external importers from
+            // same-file sibling references. External importers would
+            // stop compiling if the delete proceeded; same-file refs
+            // are only orphaned inside the defining module. Splitting
+            // the two lists lets the caller see exactly which use
+            // sites they still need to fix before re-running with
+            // `force=true`.
             let mut out = format!(
-                "Refusing to delete '{}' ({}): {} importer(s) still reference {}:\n",
+                "Refusing to delete '{}' ({}): {} importer(s) would break.\n",
                 sym.name,
                 sym.kind,
                 importer_paths.len(),
-                source_file.path,
             );
-            for p in &importer_paths {
-                out.push_str(&format!("  {p}\n"));
+            if !external_importers.is_empty() {
+                out.push_str(&format!(
+                    "\nExternal importers ({}):\n",
+                    external_importers.len(),
+                ));
+                for p in &external_importers {
+                    out.push_str(&format!("  - {p}\n"));
+                }
             }
-            out.push_str("Pass `force=true` to proceed anyway.\n");
+            if !same_file_lines.is_empty() {
+                let lines_str: Vec<String> =
+                    same_file_lines.iter().map(|l| format!("L{l}")).collect();
+                out.push_str(&format!(
+                    "\nSame-file references ({}):\n  - {} (lines: {})\n",
+                    same_file_lines.len(),
+                    source_file.path,
+                    lines_str.join(", "),
+                ));
+            }
+            if !trait_impl_sites.is_empty() {
+                out.push_str(&format!(
+                    "\n{} trait impl block(s) target '{}':\n",
+                    trait_impl_sites.len(),
+                    sym.name,
+                ));
+                for (sub_name, path, line) in &trait_impl_sites {
+                    out.push_str(&format!(
+                        "  impl {} for {sub_name} @ {path}:L{line}\n",
+                        sym.name
+                    ));
+                }
+            }
+            out.push_str(
+                "\nPass force=true to delete anyway. External importers will be left with dangling references.\n",
+            );
             return Err(out);
         }
 
@@ -178,9 +309,10 @@ impl QartezServer {
         );
         if !importer_paths.is_empty() {
             out.push_str(&format!(
-                "\nWARNING: {} file(s) still reference {} - dangling imports:\n",
+                "\nWARNING: {} file(s) still reference '{}' ({}) - dangling imports:\n",
                 importer_paths.len(),
-                source_file.path,
+                sym.name,
+                sym.kind,
             ));
             for p in &importer_paths {
                 out.push_str(&format!("  {p}\n"));

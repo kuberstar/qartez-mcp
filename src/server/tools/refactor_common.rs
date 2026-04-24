@@ -76,8 +76,15 @@ pub(super) fn resolve_unique_symbol(
                 )
             })
             .collect();
+        // Canonical phrasing shared with every refactor/query tool that
+        // routes through this helper. The three historical variants
+        // ("Pass `kind` or `file_path`", "Pass `kind` and/or `file_path`",
+        // and "Refusing to rename '<name>': multiple definitions found")
+        // drifted apart enough that regression tests had to OR-check
+        // for any of them. The wording below keeps the action-first
+        // framing because either hint, or both, can disambiguate.
         return Err(format!(
-            "Multiple definitions of '{name}' found. Pass `kind` or `file_path` to disambiguate:\n{}",
+            "Multiple definitions of '{name}' found. Pass `kind` and/or `file_path` to disambiguate:\n{}",
             locations.join("\n"),
         ));
     }

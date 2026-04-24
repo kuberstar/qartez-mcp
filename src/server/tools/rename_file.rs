@@ -36,6 +36,15 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRenameFileParams>,
     ) -> Result<String, String> {
+        // Canonicalize caller inputs before any disk-touching work so a
+        // malformed `to` (absolute path, trailing slash, `..` traversal,
+        // nonexistent parent) fails with a precise message instead of
+        // tripping a later rename/write with a confusing OS error. The
+        // same checks apply symmetrically to `from` so callers cannot
+        // smuggle `..` traversals through the source argument either.
+        validate_rename_path_arg(&params.from, "from")?;
+        validate_rename_path_arg(&params.to, "to")?;
+
         // Refuse to rename a Rust `mod.rs` away from its directory-bound
         // name - doing so breaks the module resolver. Likewise, refuse to
         // create a NEW `mod.rs` if the target directory already contains
@@ -63,7 +72,50 @@ impl QartezServer {
                 ));
             }
         }
+        // Crate roots are registered in Cargo.toml by name, not module
+        // resolution. Renaming `lib.rs` / `main.rs` at the crate root
+        // quietly detaches the crate from its manifest and the build
+        // fails with a cryptic `[[bin]]` error rather than the precise
+        // refusal the caller would get for `mod.rs`. Symmetry demands
+        // the same guard here.
+        if is_crate_root_file(&params.from) {
+            return Err(format!(
+                "Refusing to rename '{}': Rust crate roots ('lib.rs' / 'main.rs' directly under a crate source dir) are registered in Cargo.toml by name. Renaming breaks the build. Restructure the crate by moving contents, not the entry point.",
+                params.from,
+            ));
+        }
 
+        let from_norm = crate::index::to_forward_slash(params.from.clone());
+        let to_norm = crate::index::to_forward_slash(params.to.clone());
+        if from_norm == to_norm {
+            return Err(format!(
+                "Refusing to rename '{}' -> '{}': source and target are the same path. Pass a distinct `to` to rename.",
+                params.from, params.to,
+            ));
+        }
+
+        let to_abs_precheck = self.safe_resolve(&params.to)?;
+        if to_abs_precheck.exists() {
+            return Err(format!(
+                "Refusing to rename '{}' -> '{}': target file already exists. Delete it first or pick a different destination - a rename would overwrite unrelated contents.",
+                params.from, params.to,
+            ));
+        }
+
+        // Absolute `from` paths are rejected up front so callers get a
+        // precise diagnostic instead of the generic "not found in
+        // index" message, which previously masked the real failure
+        // mode. The indexer always stores project-relative paths, so
+        // `get_file_by_path` with an absolute key would return `None`
+        // for every valid file and the caller had no way to tell the
+        // mistake from a genuine missing-file case. `is_absolute`
+        // handles POSIX `/abs` and Windows `C:\abs` uniformly.
+        if std::path::Path::new(&params.from).is_absolute() {
+            return Err(format!(
+                "absolute paths not supported; pass a relative path under the project root (got '{}')",
+                params.from,
+            ));
+        }
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let file = read::get_file_by_path(&conn, &params.from)
             .map_err(|e| format!("DB error: {e}"))?
@@ -95,6 +147,43 @@ impl QartezServer {
 
         let old_rel_stem = relative_import_stem(&params.from);
         let new_rel_stem = relative_import_stem(&params.to);
+
+        // Parent mod.rs / lib.rs / main.rs that declares `mod <stem>;`.
+        // The edges table only records `use` imports, so a sibling-parent
+        // `pub mod parser;` line never shows up as an importer - without
+        // this step `rename_file` would report "0 importers" for a file
+        // whose sole entry point is the parent module declaration, and
+        // the apply would still rewrite the decl but leave the caller
+        // blind during preview.
+        let parent_mod_importer: Option<String> = if old_rel_stem != new_rel_stem {
+            find_parent_mod_file(&self.project_root, &params.from).and_then(|p| {
+                let rel = p.to_string_lossy().to_string();
+                let abs = self.project_root.join(&p);
+                match std::fs::read_to_string(&abs) {
+                    Ok(content) => {
+                        // Confirm a matching `mod <old>;` line actually
+                        // exists in the parent before advertising it as
+                        // an importer. `rewrite_mod_decl` is a no-op
+                        // when nothing matches, but the preview should
+                        // not mention a file that won't be touched.
+                        let rewritten = rewrite_mod_decl(&content, &old_rel_stem, &new_rel_stem);
+                        if rewritten != content {
+                            Some(rel)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(p) = parent_mod_importer.as_deref()
+            && !importer_paths.iter().any(|ip| ip == p)
+        {
+            importer_paths.push(p.to_string());
+        }
 
         let apply = params.apply.unwrap_or(false);
 
@@ -171,6 +260,20 @@ impl QartezServer {
             }
         }
 
+        // Auto-create any missing parent directories so rename_file can
+        // move a file into a new subdirectory in one step. `validate_rename_path_arg`
+        // already rejected `..` traversal and malformed paths above, so
+        // everything reaching this line is a legitimate project-relative
+        // target. The previous "parent must pre-exist" guard broke
+        // refactor flows that create the destination directory as part
+        // of the rename.
+        if let Some(parent) = to_abs.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create parent directory {}: {e}", parent.display()))?;
+        }
         // Rename happens LAST so a mid-way write failure above leaves the
         // source file at its original path and the user can re-run the
         // tool to finish the partial operation - apply_rename_pairs is
@@ -203,5 +306,110 @@ impl QartezServer {
             importer_paths.len(),
             mod_rewrite_note,
         ))
+    }
+}
+
+/// Validate a caller-supplied relative path argument (`from` / `to`) for
+/// `qartez_rename_file`. Rejects empty strings, absolute paths, `..`
+/// parent traversals, and trailing slashes (which hint at a directory
+/// target and never at a file rename). The `arg_name` is included in
+/// every error so callers can tell which side tripped the guard.
+fn validate_rename_path_arg(raw: &str, arg_name: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("`{arg_name}` must be non-empty"));
+    }
+    let norm = crate::index::to_forward_slash(trimmed.to_string());
+    if std::path::Path::new(&norm).is_absolute() || norm.starts_with('/') {
+        return Err(format!(
+            "`{arg_name}` absolute path not supported; pass a relative path under the project root. Got: '{raw}'",
+        ));
+    }
+    if norm.ends_with('/') {
+        return Err(format!(
+            "`{arg_name}` trailing slash not supported; pass a file path, not a directory. Got: '{raw}'",
+        ));
+    }
+    for seg in norm.split('/') {
+        if seg == ".." {
+            return Err(format!(
+                "`{arg_name}` `..` parent-directory components are not supported; pass a path under the project root. Got: '{raw}'",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return true when `rel_path` points to a Rust crate root entry point
+/// (`lib.rs` / `main.rs`) directly under a crate's `src/` directory.
+/// Matches `src/lib.rs`, `src/main.rs`, `crates/foo/src/lib.rs`, and
+/// workspace-nested variants. Single-segment paths like `lib.rs` in a
+/// flat crate root also match.
+fn is_crate_root_file(rel_path: &str) -> bool {
+    let norm = rel_path.replace('\\', "/");
+    let basename = match norm.rsplit('/').next() {
+        Some(b) => b,
+        None => return false,
+    };
+    if basename != "lib.rs" && basename != "main.rs" {
+        return false;
+    }
+    // A bare `lib.rs` / `main.rs` in a flat layout is always a crate root.
+    let parent: &str = match norm.rfind('/') {
+        Some(i) => &norm[..i],
+        None => return true,
+    };
+    if parent.is_empty() {
+        return true;
+    }
+    // Match the conventional Cargo layout: files that sit directly under
+    // a directory named `src` (or `src/bin`, which registers named
+    // binaries) are crate entry points. Comparing segments instead of
+    // doing a substring match handles bare `src/bin/main.rs` (no leading
+    // path prefix) and workspace-nested `foo/src/bin/main.rs` uniformly.
+    let segments: Vec<&str> = parent.split('/').filter(|s| !s.is_empty()).collect();
+    let last = segments.last().copied().unwrap_or("");
+    let second_last = if segments.len() >= 2 {
+        segments[segments.len() - 2]
+    } else {
+        ""
+    };
+    last == "src" || (last == "bin" && second_last == "src")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_crate_root_file, validate_rename_path_arg};
+
+    #[test]
+    fn validate_path_arg_rejects_absolute_and_traversal() {
+        assert!(validate_rename_path_arg("/etc/passwd", "to").is_err());
+        assert!(validate_rename_path_arg("../escape.rs", "to").is_err());
+        assert!(validate_rename_path_arg("src/../a.rs", "to").is_err());
+        assert!(validate_rename_path_arg("src/a/", "to").is_err());
+        assert!(validate_rename_path_arg("", "to").is_err());
+        assert!(validate_rename_path_arg("   ", "to").is_err());
+        assert!(validate_rename_path_arg("src/a.rs", "to").is_ok());
+        assert!(validate_rename_path_arg("a.rs", "to").is_ok());
+    }
+
+    #[test]
+    fn crate_root_detection_matches_canonical_layouts() {
+        assert!(is_crate_root_file("qartez-public/src/lib.rs"));
+        assert!(is_crate_root_file("qartez-public/src/main.rs"));
+        assert!(is_crate_root_file("src/lib.rs"));
+        assert!(is_crate_root_file("lib.rs"));
+        assert!(is_crate_root_file("crates/foo/src/main.rs"));
+        assert!(is_crate_root_file(
+            "src/bin/tool.rs".replace("tool.rs", "main.rs").as_str()
+        ));
+    }
+
+    #[test]
+    fn crate_root_detection_rejects_module_files() {
+        assert!(!is_crate_root_file("qartez-public/src/index/mod.rs"));
+        assert!(!is_crate_root_file("qartez-public/src/index/parser.rs"));
+        assert!(!is_crate_root_file("qartez-public/tests/main.rs"));
+        assert!(!is_crate_root_file("qartez-public/examples/lib.rs"));
     }
 }

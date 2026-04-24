@@ -46,31 +46,74 @@ impl QartezServer {
         let offset = params.offset.unwrap_or(0) as usize;
         let include_tests = params.include_tests.unwrap_or(false);
 
-        let min_severity = match params.severity.as_deref() {
-            Some("critical") => Severity::Critical,
-            Some("high") => Severity::High,
-            Some("medium") => Severity::Medium,
-            Some("low") | None => Severity::Low,
-            Some(other) => {
+        // Case-insensitive severity comparison. Previously `CRITICAL`
+        // (the natural shout form for importance) was rejected as
+        // "Unknown severity" because the table was lowercase-only;
+        // accept both forms and only reject values that are neither.
+        let min_severity = match params.severity.as_deref().map(str::to_ascii_lowercase) {
+            Some(ref s) if s == "critical" => Severity::Critical,
+            Some(ref s) if s == "high" => Severity::High,
+            Some(ref s) if s == "medium" => Severity::Medium,
+            Some(ref s) if s == "low" => Severity::Low,
+            None => Severity::Low,
+            Some(ref other) => {
                 return Err(format!(
-                    "Unknown severity '{other}'. Use: low, medium, high, critical"
+                    "Unknown severity '{other}'. Use: low, medium, high, critical (case-insensitive)"
                 ));
             }
         };
 
         let mut rules = builtin_rules();
 
-        // Load custom config if available.
-        let config_rel = params
+        // Load custom config if the caller set `config_path` explicitly,
+        // or if the default `.qartez/security.toml` file exists. An
+        // explicit `config_path` that does not resolve to a real file is
+        // a hard error - silently falling back to the builtin rules hid
+        // configuration typos behind a "N rule(s) loaded" success
+        // message.
+        let explicit_config = params
             .config_path
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(".qartez/security.toml");
+            .filter(|s| !s.is_empty());
+        let config_rel = explicit_config.unwrap_or(".qartez/security.toml");
         let config_abs = self.safe_resolve(config_rel)?;
         if config_abs.exists() {
             let config = load_custom_config(&config_abs)?;
             apply_config(&mut rules, &config)?;
+        } else if explicit_config.is_some() {
+            return Err(format!(
+                "config_path '{config_rel}' does not exist. Create the file or omit `config_path` to use the builtin rule set."
+            ));
+        }
+
+        // Validate the caller-supplied category against the ACTIVE rule
+        // set (builtin + custom). Previously `category=nonexistent` was
+        // silently accepted and produced a deceptive "0 findings"
+        // success response, while `severity=bogus` already returned a
+        // list of valid values. Mirror the severity contract so
+        // category typos surface the same way - with a list of valid
+        // options derived from whatever rules the caller actually has
+        // loaded.
+        if let Some(ref cat) = params.category {
+            let requested = cat.trim();
+            if !requested.is_empty() {
+                let matched = rules
+                    .iter()
+                    .any(|r| r.category.eq_ignore_ascii_case(requested));
+                if !matched {
+                    let available: Vec<String> = rules
+                        .iter()
+                        .map(|r| r.category.clone())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    return Err(format!(
+                        "Unknown category '{requested}'. Valid categories for the active rule set: {}",
+                        available.join(", "),
+                    ));
+                }
+            }
         }
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
@@ -96,9 +139,37 @@ impl QartezServer {
         drop(conn);
 
         if findings.is_empty() {
-            return Ok(
-                "No security findings. All scanned symbols passed the active rule set.".to_string(),
-            );
+            // Surface the counters the caller needs to judge whether
+            // this is a clean bill of health or a misconfigured scan.
+            // Previously an empty `rules` list (broken custom config)
+            // and "no actual findings" produced the same message.
+            let mut filters: Vec<String> = Vec::new();
+            if params.severity.is_some() {
+                filters.push(format!("severity>={}", min_severity.label()));
+            }
+            if let Some(ref cat) = params.category {
+                filters.push(format!("category={cat}"));
+            }
+            if let Some(ref fp) = params.file_path {
+                filters.push(format!("file_path={fp}"));
+            }
+            if !include_tests {
+                filters.push("include_tests=false".into());
+            }
+            let filter_tag = if filters.is_empty() {
+                String::new()
+            } else {
+                format!(" (filters: {})", filters.join(", "))
+            };
+            let hint = if rules.is_empty() {
+                "Check your `.qartez/security.toml` - the active rule set is empty."
+            } else {
+                "All scanned symbols passed the active rule set."
+            };
+            return Ok(format!(
+                "No security findings with {} rule(s) loaded{filter_tag}. {hint}",
+                rules.len(),
+            ));
         }
 
         let total = findings.len();

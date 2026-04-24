@@ -37,7 +37,17 @@ impl QartezServer {
         Parameters(params): Parameters<SoulClonesParams>,
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let limit = params.limit.unwrap_or(20).max(1) as i64;
+        // `limit=0` previously coerced to 1 via `.max(1)`, which
+        // silently shaped the caller's `limit=0` intent into a
+        // one-row response. Reject explicitly so `qartez_clones`
+        // speaks the same contract as `qartez_cochange` and the
+        // newly-aligned `qartez_unused`.
+        if let Some(0) = params.limit {
+            return Err(
+                "limit must be > 0 (use a positive integer; there is no 'no-cap' mode).".into(),
+            );
+        }
+        let limit = params.limit.unwrap_or(20) as i64;
         let offset = params.offset.unwrap_or(0) as i64;
         // `min_lines=0` is meaningless: every symbol has `line_end >=
         // line_start` so the SQL predicate `(line_end - line_start + 1)
@@ -65,9 +75,14 @@ impl QartezServer {
         let total =
             read::count_clone_groups(&conn, min_lines).map_err(|e| format!("DB error: {e}"))?;
         if total == 0 {
-            return Ok(
-                "No code clones detected. All symbols have unique structural shapes.".to_string(),
-            );
+            // Name the filter instead of claiming the project has no
+            // clones: `min_lines=8` (default) and `min_lines=100000`
+            // produce the same "no clones detected" string otherwise,
+            // which hides 293 real groups behind an unrelated assertion
+            // about structural uniqueness.
+            return Ok(format!(
+                "No clone groups at min_lines={min_lines}. Lower the threshold (e.g. min_lines=5) to widen the search, or pass include_tests=true if the expected clones live in test files."
+            ));
         }
 
         // Default behaviour mirrors `qartez_security`: drop symbols whose
@@ -91,8 +106,7 @@ impl QartezServer {
         const FETCH_PAGE_SIZE: i64 = 64;
         let mut groups: Vec<read::CloneGroup> = Vec::new();
         let mut fetch_offset = offset;
-        let mut raw_consumed: i64 = 0;
-        loop {
+        'batches: loop {
             let batch = read::get_clone_groups(&conn, min_lines, FETCH_PAGE_SIZE, fetch_offset)
                 .map_err(|e| format!("DB error: {e}"))?;
             if batch.is_empty() {
@@ -100,29 +114,36 @@ impl QartezServer {
             }
             let batch_len = batch.len() as i64;
             fetch_offset += batch_len;
-            raw_consumed += batch_len;
-            let filtered: Vec<read::CloneGroup> = if include_tests {
-                batch
-                    .into_iter()
-                    .filter(|g| !is_entry_point_boilerplate(&self.project_root, g))
-                    .collect()
-            } else {
-                batch
-                    .into_iter()
-                    .filter_map(|g| filter_test_members(g, &cfg_test_cache))
-                    .filter(|g| !is_entry_point_boilerplate(&self.project_root, g))
-                    .collect()
-            };
-            groups.extend(filtered);
-            if groups.len() as i64 >= limit {
-                groups.truncate(limit as usize);
-                break;
+            // Iterate per-row so we can stop exactly at the row that
+            // fills `limit`. Before, the loop truncated groups AFTER
+            // extending them with the full batch, which silently
+            // skipped the remaining candidates on the follow-up page.
+            for g in batch {
+                let kept = if include_tests {
+                    (!is_entry_point_boilerplate(&self.project_root, &g)).then_some(g)
+                } else {
+                    filter_test_members(g, &cfg_test_cache)
+                        .filter(|g| !is_entry_point_boilerplate(&self.project_root, g))
+                };
+                if let Some(kept) = kept {
+                    groups.push(kept);
+                    if groups.len() as i64 >= limit {
+                        break 'batches;
+                    }
+                }
             }
             if batch_len < FETCH_PAGE_SIZE {
                 break;
             }
         }
-        let next_raw_offset = offset + raw_consumed;
+        // Pagination contract: `next_offset = offset + limit` mirrors
+        // the rest of the tool surface (qartez_unused, qartez_health,
+        // qartez_refs). The previous scheme reported `offset +
+        // raw_consumed_to_last_kept` which jumped ahead by 64 even
+        // when only 2 post-filter groups were kept, hiding the
+        // remaining candidates behind a "next: offset=8" instead of
+        // "next: offset=4".
+        let next_raw_offset = offset + limit;
 
         if groups.is_empty() {
             return Ok(format!(
@@ -182,10 +203,24 @@ impl QartezServer {
                     out.push_str(&format!(
                         "[trait boilerplate{trait_hint} - candidate for default method]\n"
                     ));
-                    out.push_str(&format!(
-                        "  Consider promoting `fn {method_name}` to a default \
-                         method on the trait so impls opt out only when needed.\n"
-                    ));
+                    if label.default_method_viable {
+                        out.push_str(&format!(
+                            "  Consider promoting `fn {method_name}` to a default \
+                             method on the trait so impls opt out only when needed.\n"
+                        ));
+                    } else {
+                        // Bodies diverge on per-impl literals (e.g. each
+                        // impl returns a different string constant), so a
+                        // single default-method body cannot replace them.
+                        // Point callers at the remaining refactor lever
+                        // instead of the incorrect default-method advice.
+                        out.push_str(&format!(
+                            "  Per-impl literals differ across members, so `fn {method_name}` \
+                             cannot collapse into a single default method. Consider lifting the \
+                             varying value into an associated constant or a trait-method return \
+                             that each impl overrides.\n"
+                        ));
+                    }
                 }
                 for (sym, file) in &group.symbols {
                     let kind_char = sym.kind.chars().next().unwrap_or(' ');
@@ -208,8 +243,18 @@ impl QartezServer {
 /// enclosing trait cannot be resolved cheaply the proxy heuristic
 /// (same method name, distinct owner types, distinct files, method
 /// kind on every member) still fires with `trait_name = None`.
+///
+/// `default_method_viable` is `false` when the bodies diverge on
+/// per-impl literals that cannot be captured by a single default
+/// method body. For example, `fn language_name() -> &str { "bash" }`
+/// and `fn language_name() -> &str { "rust" }` share an AST skeleton
+/// but each returns a distinct string literal; promoting to a default
+/// on the trait would require picking one literal for all impls, which
+/// collapses semantics. The report suppresses the "promote to default
+/// method" suggestion in that case.
 struct TraitBoilerplate {
     trait_name: Option<String>,
+    default_method_viable: bool,
 }
 
 /// Detect clone groups that are trait-impl boilerplate and recommend a
@@ -257,7 +302,85 @@ fn detect_trait_boilerplate(
     // every member sits inside `impl <Trait> for <Struct>` with the
     // same trait; anything else falls back to the proxy label.
     let trait_name = intersect_trait_names(conn, &group.symbols).ok().flatten();
-    Some(TraitBoilerplate { trait_name })
+    let default_method_viable = bodies_agree_on_literals(conn, group);
+    Some(TraitBoilerplate {
+        trait_name,
+        default_method_viable,
+    })
+}
+
+/// Returns `true` when every member of `group` has a body whose
+/// literal tokens (strings, numbers) match across impls, i.e. a
+/// single default method body could replace every override without
+/// losing information. Returns `false` when at least one literal
+/// differs between members: the classic `LanguageSupport` case where
+/// `language_name` returns `"bash"` in one impl and `"rust"` in
+/// another. In that case the bodies share an AST skeleton but the
+/// constants they carry are load-bearing, so suggesting "promote to
+/// default method" is incorrect advice.
+///
+/// When the body text cannot be fetched for any member (missing
+/// `symbols_body_fts` row on a legacy index) we conservatively return
+/// `true` - falling back to the historical behaviour - because the
+/// comparison cannot be performed.
+fn bodies_agree_on_literals(conn: &rusqlite::Connection, group: &read::CloneGroup) -> bool {
+    let mut first: Option<Vec<String>> = None;
+    for (sym, _) in &group.symbols {
+        let Some(body) = super::smells::fetch_symbol_body(conn, sym.id) else {
+            return true;
+        };
+        let lits = extract_body_literals(&body);
+        match &first {
+            None => first = Some(lits),
+            Some(prev) if prev == &lits => {}
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+/// Extract the ordered list of literal tokens (quoted strings, byte
+/// strings, numeric literals) from a body string. We match lexically
+/// rather than via tree-sitter because the clone detector already
+/// guarantees AST shape equality - any remaining difference must
+/// live in the lexical stream.
+fn extract_body_literals(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            // String literal: capture contents (including the closing
+            // quote) up to the matching unescaped double quote.
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
+                i += 1;
+            }
+            out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Intersect `type_hierarchy.super_name` rows across every group member.

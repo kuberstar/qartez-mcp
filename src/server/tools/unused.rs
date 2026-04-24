@@ -77,7 +77,7 @@ fn is_plugin_entry_point_path(path: &str) -> bool {
 impl QartezServer {
     #[tool(
         name = "qartez_unused",
-        description = "Find dead code: exported symbols with zero importers in the codebase. Safe candidates for removal or inlining. Pre-materialized at index time, so the whole-repo scan is a single indexed SELECT. Pass `limit` / `offset` to page through large result sets.",
+        description = "Find dead code: exported symbols with zero importers in the codebase. Safe candidates for removal or inlining. Pre-materialized at index time, so the whole-repo scan is a single indexed SELECT. Pass `limit` / `offset` to page through large result sets. `limit` must be > 0; omit `limit` to accept the 50-row default.",
         annotations(
             title = "Find Unused Exports",
             read_only_hint = true,
@@ -92,14 +92,19 @@ impl QartezServer {
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
-        // `limit=0` means "no cap" project-wide convention; `None` keeps the
-        // historical default of 50. The previous `.max(1)` on Option<u32>
-        // silently turned `limit=0` into `limit=1`, producing an off-by-one
-        // that read like correct paging behaviour. Route `0` to the DB
-        // paging layer as `i64::MAX` to return every remaining row.
+        // `limit=0` is rejected rather than silently treated as a
+        // "no cap" sentinel, matching `qartez_clones` / `qartez_cochange`
+        // which already reject `limit=0` explicitly. Keeping the
+        // semantics aligned across the tool surface removes the
+        // silent divergence where `qartez_unused` alone returned
+        // every remaining row for the zero value.
+        if let Some(0) = params.limit {
+            return Err(
+                "limit must be > 0 (use a positive integer; there is no 'no-cap' mode).".into(),
+            );
+        }
         let limit = match params.limit {
             None => 50_i64,
-            Some(0) => i64::MAX,
             Some(n) => n as i64,
         };
         let offset = params.offset.unwrap_or(0) as i64;
@@ -109,39 +114,83 @@ impl QartezServer {
             return Ok("No unused exported symbols detected.".to_string());
         }
 
-        let raw_page = read::get_unused_exports_page(&conn, limit, offset)
-            .map_err(|e| format!("DB error: {e}"))?;
-
-        if raw_page.is_empty() {
-            return Ok(format!(
-                "No unused exports in page (total={total}, offset={offset})."
-            ));
-        }
-
         // Plugin / extension entry-point files are loaded by external
         // runtimes via string lookup (e.g. OpenCode `Plugin` exports,
         // VS Code `activate` handlers, CLI script hooks). The static
         // reference graph cannot observe those callers, so the row
         // survives `NOT EXISTS (... symbol_refs ...)` and gets reported
-        // as unused even when it is a live entry point. Drop those rows
-        // before rendering so the tool does not emit noise the caller
-        // will always have to ignore.
-        let page: Vec<_> = raw_page
-            .into_iter()
-            .filter(|(_, file)| !is_plugin_entry_point_path(&file.path))
-            .collect();
+        // as unused even when it is a live entry point. Over-sample
+        // from the DB and drop those rows here so the caller-visible
+        // page is always `limit` post-filter rows (unless the DB is
+        // exhausted). Before oversampling, a page that happened to
+        // contain a plugin entry produced off-by-one counters like
+        // "10 unused; showing 9" or "limit=5 returns 4" that looked
+        // like a pagination bug.
+        const FETCH_PAGE_SIZE: i64 = 64;
+        let mut page: Vec<(
+            crate::storage::models::SymbolRow,
+            crate::storage::models::FileRow,
+        )> = Vec::new();
+        let mut fetch_offset = offset;
+        let mut plugin_filtered = 0i64;
+        loop {
+            let remaining_room = (limit - page.len() as i64).max(0);
+            if remaining_room == 0 {
+                break;
+            }
+            let batch_size = remaining_room.max(FETCH_PAGE_SIZE);
+            let batch = read::get_unused_exports_page(&conn, batch_size, fetch_offset)
+                .map_err(|e| format!("DB error: {e}"))?;
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len() as i64;
+            fetch_offset += batch_len;
+            for row in batch {
+                if is_plugin_entry_point_path(&row.1.path) {
+                    plugin_filtered += 1;
+                    continue;
+                }
+                if page.len() as i64 >= limit {
+                    break;
+                }
+                page.push(row);
+            }
+            if batch_len < batch_size {
+                break;
+            }
+        }
+        let next_offset = fetch_offset;
 
         if page.is_empty() {
             return Ok(format!(
-                "No unused exports in page (total={total}, offset={offset})."
+                "No unused exports in page (total={total}, offset={offset}; {plugin_filtered} plugin-manifest entries hidden - they're intentional)."
             ));
         }
 
         let shown = page.len() as i64;
-        let mut out = if shown < total {
+        // `N plugin-manifest entries hidden - they're intentional`
+        // replaces the bare `plugin_entries_skipped=N` counter used
+        // before. The old key/value pair looked like a pagination
+        // bug to callers ("why is this counter non-zero? what did I
+        // do wrong?") because the tool never documented that the
+        // filter always runs. The new phrasing names the filter,
+        // explains why entries are hidden, and places the counter
+        // inside a parenthetical so it reads as a note instead of
+        // a flag to investigate.
+        let mut out = if next_offset < total {
+            if plugin_filtered > 0 {
+                format!(
+                    "{total} unused export(s); showing {shown} from offset {offset} (next: offset={next_offset}; {plugin_filtered} plugin-manifest entries hidden - they're intentional).\n",
+                )
+            } else {
+                format!(
+                    "{total} unused export(s); showing {shown} from offset {offset} (next: offset={next_offset}).\n",
+                )
+            }
+        } else if plugin_filtered > 0 {
             format!(
-                "{total} unused export(s); showing {shown} from offset {offset} (next: offset={}).\n",
-                offset + shown
+                "{total} unused export(s); showing {shown} of {total} ({plugin_filtered} plugin-manifest entries hidden - they're intentional).\n",
             )
         } else {
             format!("{total} unused export(s).\n")

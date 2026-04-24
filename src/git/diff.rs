@@ -25,6 +25,25 @@ pub fn changed_files_in_range(root: &Path, revspec: &str) -> Result<Vec<String>>
         .to()
         .ok_or_else(|| anyhow!("revspec '{effective}' resolved without a 'to' endpoint"))?;
 
+    // WHY: `diff_tree_to_tree` reports the symmetric set of path deltas
+    // regardless of direction, so `HEAD..HEAD~1` silently returned the
+    // same file list as `HEAD~1..HEAD` and masked a real user mistake.
+    // Reject reversed ranges (from is a descendant of to) with a hint
+    // that names the forward form. We do not autocorrect - that would
+    // hide the bug in the caller's tooling or typed revspec.
+    if let (Ok(from_commit), Ok(to_commit)) = (from_obj.peel_to_commit(), to_obj.peel_to_commit())
+        && from_commit.id() != to_commit.id()
+        && repo.graph_descendant_of(from_commit.id(), to_commit.id())?
+    {
+        let (forward_from, forward_to) = match effective.split_once("..") {
+            Some((a, b)) => (b.to_string(), a.to_string()),
+            None => (to_commit.id().to_string(), from_commit.id().to_string()),
+        };
+        return Err(anyhow!(
+            "range reversed: '{effective}' goes from descendant to ancestor. Did you mean '{forward_from}..{forward_to}' instead?"
+        ));
+    }
+
     let from_tree = from_obj.peel_to_tree()?;
     let to_tree = to_obj.peel_to_tree()?;
 

@@ -419,9 +419,13 @@ fn safe_delete_preview_reports_edge_and_symbol_ref_counts() {
             json!({ "symbol": "hello", "file_path": "src/defs.rs" }),
         )
         .expect("safe_delete preview must succeed");
+    // The preview now cites per-symbol references only. File-level
+    // use-edges were the signal that falsely flagged zero-caller
+    // helpers in mod.rs as "7 files reference mod.rs"; dropping the
+    // dual-signal breakdown was the intended fix.
     assert!(
-        out.contains("use-edges") && out.contains("symbol-refs"),
-        "preview must break down both signals, got: {out}"
+        out.contains("reference symbol 'hello'"),
+        "preview must cite the symbol being deleted, got: {out}"
     );
     assert!(
         out.contains("src/caller.rs"),

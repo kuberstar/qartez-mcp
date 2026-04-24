@@ -124,87 +124,102 @@ impl QartezServer {
             return Ok(out);
         }
 
-        let tc = all_toolchains.into_iter().next().ok_or_else(|| {
-            "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string()
-        })?;
+        if all_toolchains.is_empty() {
+            return Err(
+                "No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string()
+            );
+        }
+
+        // Per-action toolchain pick: route to the first detected
+        // toolchain that actually defines the requested command,
+        // rather than always picking `[0]`. A monorepo root with a
+        // bare `Makefile` plus a `qartez-public/Cargo.toml` subdir
+        // otherwise reported "No test command configured for make
+        // toolchain" because the pruned `make` entry sorted first
+        // and its `test_cmd` was emptied by the Makefile-target
+        // prune. The subdir Cargo toolchain (which DOES define
+        // `cargo test`) was never consulted. `action=info` still
+        // lists every detected toolchain unchanged.
+        let pick_by = |needs: fn(&toolchain::DetectedToolchain) -> bool,
+                       label: &str|
+         -> Result<&toolchain::DetectedToolchain, String> {
+            all_toolchains
+                    .iter()
+                    .find(|tc| needs(tc))
+                    .ok_or_else(|| {
+                        let head = all_toolchains
+                            .first()
+                            .map(|t| t.name.as_str())
+                            .unwrap_or("<none>");
+                        format!(
+                            "No {label} command configured across the detected toolchains (primary: {head}, total: {}). Run `qartez_project action=info` to see what each toolchain supports.",
+                            all_toolchains.len(),
+                        )
+                    })
+        };
 
         if action == ProjectAction::Run {
-            let subcommand = params.filter.as_deref().unwrap_or("test");
-            let resolved: &Vec<String> = match subcommand {
-                "test" => {
-                    if tc.test_cmd.is_empty() {
-                        return Err(format!(
-                            "No test command configured for {} toolchain",
-                            tc.name
-                        ));
-                    }
-                    &tc.test_cmd
-                }
-                "build" => {
-                    if tc.build_cmd.is_empty() {
-                        return Err(format!(
-                            "No build command configured for {} toolchain",
-                            tc.name
-                        ));
-                    }
-                    &tc.build_cmd
-                }
-                "lint" => tc.lint_cmd.as_ref().ok_or_else(|| {
-                    format!("No lint command configured for {} toolchain", tc.name)
-                })?,
-                "typecheck" => tc.typecheck_cmd.as_ref().ok_or_else(|| {
-                    format!("No typecheck command configured for {} toolchain", tc.name)
-                })?,
+            // `run` without a filter defaults to `build`. The previous
+            // default of `test` surprised callers expecting the bare
+            // "compile everything" verb; `qartez_project action=test`
+            // remains the explicit verb for running tests.
+            let subcommand = params.filter.as_deref().unwrap_or("build");
+            let tc = match subcommand {
+                "test" => pick_by(|tc| !tc.test_cmd.is_empty(), "test")?,
+                "build" => pick_by(|tc| !tc.build_cmd.is_empty(), "build")?,
+                "lint" => pick_by(|tc| tc.lint_cmd.is_some(), "lint")?,
+                "typecheck" => pick_by(|tc| tc.typecheck_cmd.is_some(), "typecheck")?,
                 other => {
                     return Err(format!(
                         "Unknown run subcommand '{other}'. Supported: test, build, lint, typecheck",
                     ));
                 }
             };
+            let resolved: &Vec<String> = match subcommand {
+                "test" => &tc.test_cmd,
+                "build" => &tc.build_cmd,
+                "lint" => tc.lint_cmd.as_ref().expect("pick guaranteed presence"),
+                "typecheck" => tc.typecheck_cmd.as_ref().expect("pick guaranteed presence"),
+                _ => unreachable!(),
+            };
+            let subdir_tag = tc
+                .subdir
+                .as_deref()
+                .map(|s| format!(" (subdir: {s}/)"))
+                .unwrap_or_default();
             return Ok(format!(
-                "# {toolchain} {sub} (dry-run - command not executed)\n$ {cmd}\n",
+                "# {toolchain}{subdir_tag} {sub} (dry-run - command not executed)\n$ {cmd}\n",
                 toolchain = tc.name,
                 sub = subcommand,
                 cmd = resolved.join(" "),
             ));
         }
 
-        let (cmd, action_label): (&Vec<String>, &'static str) = match action {
-            ProjectAction::Test => {
-                if tc.test_cmd.is_empty() {
-                    return Err(format!(
-                        "No test command configured for {} toolchain",
-                        tc.name
-                    ));
+        let (tc, cmd, action_label): (&toolchain::DetectedToolchain, &Vec<String>, &'static str) =
+            match action {
+                ProjectAction::Test => {
+                    let tc = pick_by(|tc| !tc.test_cmd.is_empty(), "test")?;
+                    (tc, &tc.test_cmd, "TEST")
                 }
-                (&tc.test_cmd, "TEST")
-            }
-            ProjectAction::Build => {
-                if tc.build_cmd.is_empty() {
-                    return Err(format!(
-                        "No build command configured for {} toolchain",
-                        tc.name
-                    ));
+                ProjectAction::Build => {
+                    let tc = pick_by(|tc| !tc.build_cmd.is_empty(), "build")?;
+                    (tc, &tc.build_cmd, "BUILD")
                 }
-                (&tc.build_cmd, "BUILD")
-            }
-            ProjectAction::Lint => (
-                tc.lint_cmd.as_ref().ok_or_else(|| {
-                    format!("No lint command configured for {} toolchain", tc.name)
-                })?,
-                "LINT",
-            ),
-            ProjectAction::Typecheck => (
-                tc.typecheck_cmd.as_ref().ok_or_else(|| {
-                    format!("No typecheck command configured for {} toolchain", tc.name)
-                })?,
-                "TYPECHECK",
-            ),
-            ProjectAction::Info | ProjectAction::Run => {
-                // Handled by the early-return branches above.
-                unreachable!()
-            }
-        };
+                ProjectAction::Lint => {
+                    let tc = pick_by(|tc| tc.lint_cmd.is_some(), "lint")?;
+                    let cmd = tc.lint_cmd.as_ref().expect("pick guaranteed presence");
+                    (tc, cmd, "LINT")
+                }
+                ProjectAction::Typecheck => {
+                    let tc = pick_by(|tc| tc.typecheck_cmd.is_some(), "typecheck")?;
+                    let cmd = tc.typecheck_cmd.as_ref().expect("pick guaranteed presence");
+                    (tc, cmd, "TYPECHECK")
+                }
+                ProjectAction::Info | ProjectAction::Run => {
+                    // Handled by the early-return branches above.
+                    unreachable!()
+                }
+            };
 
         let timeout = params.timeout.unwrap_or(60).min(600);
         let filter = params.filter.as_deref();
@@ -212,6 +227,22 @@ impl QartezServer {
             && f.starts_with('-')
         {
             return Err(format!("Filter must not start with '-': {f}"));
+        }
+        // Reject shell-injection metacharacters even though the filter
+        // is passed through `std::process::Command::arg` (which avoids
+        // a shell). Downstream build tools may still re-shell-parse
+        // their arguments (e.g. Make recipes, `cargo test -- <arg>`
+        // into a runner that splits on whitespace), and a lone quote
+        // or subshell char in the filter leaks straight through. Keep
+        // the allowed set to identifiers, path-like tokens, and a few
+        // structured separators.
+        if let Some(f) = filter {
+            const FORBIDDEN: &[char] = &['\'', '"', '`', ';', '|', '&', '$', '<', '>', '\\', '\n'];
+            if let Some(bad) = FORBIDDEN.iter().find(|c| f.contains(**c)) {
+                return Err(format!(
+                    "Filter contains unsupported character '{bad}': filter may contain only alphanumerics, '-', '_', '.', '/', ':', '=', '@', '+', and whitespace. Got: {f}",
+                ));
+            }
         }
 
         // Run inside the toolchain's subdirectory when it came from the

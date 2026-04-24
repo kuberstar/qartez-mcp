@@ -88,6 +88,19 @@ pub fn full_index_multi(
         .map(|r| (r, root_prefix(r, aliases.get(r).map(|s| s.as_str()))))
         .collect();
 
+    // Purge orphan root-prefixed files before indexing. A workspace
+    // entry that was removed from `.qartez/workspace.toml` or whose
+    // directory was deleted on disk leaves its files behind under the
+    // old prefix - `qartez_unused`, `qartez_clones`, and `qartez_smells`
+    // would then surface phantom paths like `relative_alias/src/lib.rs`.
+    // Each root's own `remove_stale_files` pass only touches its own
+    // prefix, so it cannot catch prefixes that no longer have a root.
+    let live_prefixes: HashSet<String> = roots_with_prefixes
+        .iter()
+        .map(|(_, prefix)| prefix.clone())
+        .collect();
+    purge_orphan_prefixes(conn, &live_prefixes)?;
+
     let mut all_known: HashSet<String> = HashSet::new();
     for (root, prefix) in &roots_with_prefixes {
         for file_path in walker::walk_source_files(root) {
@@ -102,6 +115,36 @@ pub fn full_index_multi(
     for (root, prefix) in &roots_with_prefixes {
         tracing::info!("Indexing root: {} (prefix: {prefix})", root.display());
         full_index_root(conn, root, force, prefix, &all_known)?;
+    }
+    Ok(())
+}
+
+/// Delete files belonging to DB root prefixes that are no longer listed
+/// in the live workspace roots.
+///
+/// A DB path is considered prefixed when its first path segment matches
+/// a root prefix (e.g. `qartez-public/src/lib.rs` has prefix
+/// `qartez-public`). Paths without a slash are always kept (top-level
+/// files of the single-root case), as are paths whose prefix is listed
+/// in `live_prefixes`. Every other path is removed via
+/// `delete_files_by_prefix`, which also clears the associated symbols
+/// and FTS rows.
+fn purge_orphan_prefixes(conn: &Connection, live_prefixes: &HashSet<String>) -> Result<()> {
+    let db_files = read::get_all_files(conn)?;
+    let mut orphan_prefixes: HashSet<String> = HashSet::new();
+    for f in &db_files {
+        if let Some(slash_idx) = f.path.find('/') {
+            let prefix = &f.path[..slash_idx];
+            if !live_prefixes.contains(prefix) {
+                orphan_prefixes.insert(prefix.to_string());
+            }
+        }
+    }
+    for prefix in &orphan_prefixes {
+        let removed = crate::storage::write::delete_files_by_prefix(conn, prefix)?;
+        tracing::info!(
+            "purged {removed} file(s) from orphan workspace prefix '{prefix}' (no longer in workspace.toml)"
+        );
     }
     Ok(())
 }

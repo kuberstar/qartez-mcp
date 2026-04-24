@@ -58,30 +58,70 @@ impl QartezServer {
         let min_params = params.min_params.unwrap_or(5) as usize;
         let envy_ratio = params.envy_ratio.unwrap_or(2.0);
 
+        // Parse the comma-separated kind selection leniently: empty
+        // segments (from `"god_function,"` or `",,feature_envy"`) are
+        // trimmed, and duplicate entries collapse to one. Before,
+        // `"god_function,"` errored on the empty segment while
+        // `"god_function,god_function"` silently deduped, which was
+        // an inconsistent validation surface. Now both shapes parse
+        // to the same intent.
         let requested: Vec<&str> = match &params.kind {
-            Some(k) => k.split(',').map(|s| s.trim()).collect(),
+            Some(k) => {
+                let mut seen: Vec<&str> = Vec::new();
+                for token in k.split(',').map(str::trim) {
+                    if token.is_empty() {
+                        continue;
+                    }
+                    if !seen.contains(&token) {
+                        seen.push(token);
+                    }
+                }
+                seen
+            }
             None => vec!["god_function", "long_params", "feature_envy"],
         };
-        // Validate categorical kind param up-front so an unknown value
-        // errors with the valid set instead of silently returning
-        // "no smells detected", which reads like a successful empty result.
-        for k in &requested {
-            if k.is_empty() {
-                return Err(format!(
-                    "kind must not contain empty segments. valid: [{}]",
-                    VALID_SMELL_KINDS.join(", "),
-                ));
-            }
-            if !VALID_SMELL_KINDS.contains(k) {
-                return Err(format!(
-                    "unknown smell kind '{k}'. valid: [{}]",
-                    VALID_SMELL_KINDS.join(", "),
-                ));
-            }
+        if requested.is_empty() {
+            // After trimming empty segments the selection collapsed
+            // to nothing (e.g. `kind=",,"`). Reject explicitly so the
+            // caller does not fall through to an empty "no smells"
+            // result that reads like success.
+            return Err(format!(
+                "kind must name at least one smell after trimming empty segments. valid: [{}]",
+                VALID_SMELL_KINDS.join(", "),
+            ));
         }
-        let detect_god = requested.contains(&"god_function");
-        let detect_params = requested.contains(&"long_params");
-        let detect_envy = requested.contains(&"feature_envy");
+        // Partition the request into known and unknown kinds. An
+        // all-unknown selection is still a hard reject (the caller
+        // asked for nothing we can produce), but a mixed selection
+        // such as `kind="god_function,unknown_smell"` now runs the
+        // known kind(s) and surfaces the unknown ones as a warning
+        // banner instead of refusing the whole call. This matches
+        // the lenient parsing already applied to empty segments:
+        // one typo should not destroy the valid request.
+        let (known_kinds, unknown_kinds): (Vec<&str>, Vec<&str>) = requested
+            .iter()
+            .copied()
+            .partition(|k| VALID_SMELL_KINDS.contains(k));
+        if known_kinds.is_empty() {
+            return Err(format!(
+                "no known smell kinds in selection: [{}]. valid: [{}]",
+                unknown_kinds.join(", "),
+                VALID_SMELL_KINDS.join(", "),
+            ));
+        }
+        let unknown_warning = if unknown_kinds.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "// warning: {} unknown smell kind(s) ignored: [{}]. valid: [{}]\n\n",
+                unknown_kinds.len(),
+                unknown_kinds.join(", "),
+                VALID_SMELL_KINDS.join(", "),
+            )
+        };
+        let detect_god = known_kinds.contains(&"god_function");
+        let detect_params = known_kinds.contains(&"long_params");
+        let detect_envy = known_kinds.contains(&"feature_envy");
 
         let all_symbols = if let Some(ref fp) = params.file_path {
             let resolved = self.safe_resolve(fp).map_err(|e| e.to_string())?;
@@ -94,7 +134,7 @@ impl QartezServer {
             );
             let file = read::get_file_by_path(&conn, &rel)
                 .map_err(|e| format!("DB error: {e}"))?
-                .ok_or_else(|| format!("File not found: {fp}"))?;
+                .ok_or_else(|| format!("File '{fp}' not found in index"))?;
             let syms =
                 read::get_symbols_for_file(&conn, file.id).map_err(|e| format!("DB error: {e}"))?;
             syms.into_iter()
@@ -125,10 +165,9 @@ impl QartezServer {
         let envy_count = feature_envy.len();
         let total = god_count + params_count + envy_count;
         if total == 0 {
-            return Ok(
-                "No code smells detected with current thresholds. Adjust min_complexity, min_lines, min_params, or envy_ratio to widen the search."
-                    .to_string(),
-            );
+            return Ok(format!(
+                "{unknown_warning}No code smells detected with current thresholds. Adjust min_complexity, min_lines, min_params, or envy_ratio to widen the search.",
+            ));
         }
 
         // Budget per-kind proportionally. When `limit == usize::MAX` (the
@@ -153,8 +192,24 @@ impl QartezServer {
         }
 
         let shown = god_functions.len() + long_params.len() + feature_envy.len();
+        // Include only the categories the caller actually asked
+        // about. Before this, `kind=god_function` still rendered
+        // "god_functions: N, long_params: 0, feature_envy: 0" and
+        // the zeros read as "searched, found none" instead of
+        // "filtered out by kind".
+        let mut counts: Vec<String> = Vec::new();
+        if detect_god {
+            counts.push(format!("{god_count} god functions"));
+        }
+        if detect_params {
+            counts.push(format!("{params_count} long param lists"));
+        }
+        if detect_envy {
+            counts.push(format!("{envy_count} feature envy"));
+        }
         let mut out = format!(
-            "# Code Smells ({total} found: {god_count} god functions, {params_count} long param lists, {envy_count} feature envy)\n\n",
+            "{unknown_warning}# Code Smells ({total} found: {})\n\n",
+            counts.join(", "),
         );
         if shown < total {
             out.push_str(&format!(
@@ -163,8 +218,24 @@ impl QartezServer {
         }
 
         format_god_functions(&mut out, &god_functions, concise, min_cc, min_lines);
+        if detect_god && god_functions.is_empty() {
+            out.push_str("## God Functions: 0 found at current thresholds.\n\n");
+        }
         format_long_params(&mut out, &long_params, concise, min_params);
+        if detect_params && long_params.is_empty() {
+            out.push_str("## Long Parameter Lists: 0 found at current thresholds.\n\n");
+        }
         format_feature_envy(&mut out, &feature_envy, concise, envy_ratio);
+        if detect_envy && feature_envy.is_empty() {
+            // Zero-count markers make the asymmetric output
+            // observable. Before, a scan that returned
+            // `god=283, long_params=266, feature_envy=0` rendered the
+            // first two as detailed tables and silently dropped the
+            // feature_envy section, giving callers no explicit signal
+            // that the detector ran. A terse "0 found" line keeps the
+            // structural symmetry without bloating the output.
+            out.push_str("## Feature Envy: 0 found at current thresholds.\n\n");
+        }
 
         Ok(out)
     }
@@ -309,7 +380,7 @@ fn classify_function_shape(
 /// Pull a symbol's body from the FTS content table. `symbols_body_fts.rowid`
 /// matches `symbols.id` by construction (see `rebuild_symbol_bodies_multi`),
 /// so a direct rowid lookup is O(1).
-fn fetch_symbol_body(conn: &rusqlite::Connection, symbol_id: i64) -> Option<String> {
+pub(super) fn fetch_symbol_body(conn: &rusqlite::Connection, symbol_id: i64) -> Option<String> {
     conn.prepare_cached("SELECT body FROM symbols_body_fts WHERE rowid = ?1")
         .ok()?
         .query_row([symbol_id], |row| row.get::<_, String>(0))

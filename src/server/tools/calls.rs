@@ -30,6 +30,94 @@ const DEFAULT_LIMIT: usize = 50;
 /// Default output token budget when the caller does not pass `token_budget`.
 const DEFAULT_TOKEN_BUDGET: usize = 4000;
 
+/// Identifier denylist used by the callee renderer. These names are dominated
+/// by stdlib / language-builtin methods (`Option::map`, `Result::unwrap`,
+/// iterator adapters, common `new` constructors, etc.). When a call resolves
+/// to one of them without a concrete owner_type the candidate pool is almost
+/// always a noise swarm of same-named user symbols that the resolver cannot
+/// disambiguate. Suppressing them keeps the callee listing focused on the
+/// user code the caller is actually wiring together. Rows that DO resolve
+/// through the owner_type branch still pass because those name a concrete
+/// user symbol the caller depends on (e.g. `QartezServer::new` is kept).
+const STDLIB_STUBS: &[&str] = &[
+    "parse",
+    "init",
+    "Ok",
+    "Err",
+    "Some",
+    "None",
+    "clone",
+    "new",
+    "into",
+    "from",
+    "as_ref",
+    "as_mut",
+    "unwrap",
+    "expect",
+    "map",
+    "map_err",
+    "and_then",
+    "or_else",
+    "ok_or",
+    "iter",
+    "collect",
+    "to_string",
+    "to_owned",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "len",
+    "is_empty",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "get",
+    "contains",
+    "starts_with",
+    "ends_with",
+];
+
+/// Language names (matching `FileRow::language`) that carry call graphs the
+/// `qartez_calls` tool can analyse. Shell, config, and markup files frequently
+/// contain identifiers that collide with real function names (`main` in a
+/// benchmark `.sh`, `handle` in a Dockerfile, etc.); letting them into the
+/// candidate pool pollutes the tool output with results that cannot be
+/// reached from the user's Rust / JS / Python call graph. Any language not
+/// listed here is dropped from the seed-symbol candidate set in
+/// `qartez_calls` before the multi-candidate refusal, so the refusal itself
+/// never fires on "one real function plus five shell-script noise rows".
+const CALLABLE_SOURCE_LANGUAGES: &[&str] = &[
+    "rust",
+    "typescript",
+    "javascript",
+    "python",
+    "go",
+    "java",
+    "kotlin",
+    "scala",
+    "swift",
+    "csharp",
+    "cpp",
+    "c",
+    "ruby",
+    "php",
+    "lua",
+    "dart",
+    "elixir",
+    "haskell",
+    "ocaml",
+    "zig",
+    "r",
+];
+
+fn is_callable_source_language(language: &str) -> bool {
+    CALLABLE_SOURCE_LANGUAGES
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(language))
+}
+
 /// One call site extracted from a caller body with its full prefix path
 /// (e.g. `Foo::new`, `self.method`, `obj.method`). The prefix is used to
 /// disambiguate same-named callees that belong to different types.
@@ -70,14 +158,34 @@ impl QartezServer {
         let direction = params.direction.unwrap_or_default();
         let want_callers = matches!(direction, CallDirection::Callers | CallDirection::Both);
         let want_callees = matches!(direction, CallDirection::Callees | CallDirection::Both);
-        // Depth=1 is the default after the 2026-04 compaction: depth=2 can
-        // explode on hub functions, so callers opt in explicitly. Clamp to
-        // MAX_CALL_DEPTH so pathological requests do not recurse forever.
+        // Depth semantics after the 2026-04-23 fix:
+        //   depth=0         -> seed-only mode (resolved header, no graph walk)
+        //                      mirrors qartez_hierarchy max_depth=0
+        //   depth=1 default -> direct callers + direct callees
+        //   depth>=2        -> multi-level BFS, clamped to MAX_CALL_DEPTH
+        // Before the fix, depth=0 was silently treated as 1. Now both
+        // tools honour the seed-only contract.
         let requested_depth = params.depth.unwrap_or(1) as usize;
-        let max_depth = requested_depth.clamp(1, MAX_CALL_DEPTH);
+        let seed_only = requested_depth == 0;
+        let max_depth = if seed_only {
+            0
+        } else {
+            requested_depth.clamp(1, MAX_CALL_DEPTH)
+        };
+        let depth_was_clamped = requested_depth > MAX_CALL_DEPTH;
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT as u32) as usize;
         let token_budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;
         let include_tests = params.include_tests.unwrap_or(false);
+        let kind_filter = params
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let file_filter = params
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         // Lock 1: resolve the target symbol and fetch the file list.
         let (symbols, all_files) = {
@@ -93,19 +201,124 @@ impl QartezServer {
         };
 
         if symbols.is_empty() {
-            return Err(format!("No symbol '{}' found in index", params.name));
+            // Unified wording with qartez_refs / qartez_find / qartez_read
+            // so callers can grep the same string across tools.
+            return Err(format!("No symbol found with name '{}'", params.name));
         }
 
         let func_symbols: Vec<_> = symbols
             .iter()
             .filter(|(s, _)| matches!(s.kind.as_str(), "function" | "method" | "constructor"))
+            // Drop candidates whose defining file is not a callable source
+            // language. Shell scripts, Makefiles, dockerfiles, YAML, etc.
+            // can index function-like rows (e.g. `main` in a benchmark
+            // `.sh`) that collide with real Rust/JS/Python names. Without
+            // this filter the multi-candidate refusal below fires on
+            // "one real function plus N shell-noise rows" and the caller
+            // is asked to disambiguate against names that were never
+            // reachable from their code in the first place.
+            .filter(|(_, f)| is_callable_source_language(&f.language))
+            // Honour `include_tests=false` on the seed lookup too. The
+            // caller's intent is "analyse production code"; resolving
+            // `index_project` to a `tests/fp_regression_security_refs.rs`
+            // test-only helper violated that contract because the
+            // include_tests filter was only applied inside
+            // `append_callers`. Dropping test-path definitions here
+            // keeps the two axes consistent.
+            .filter(|(_, f)| include_tests || !helpers::is_test_path(&f.path))
+            // User-supplied disambiguation. Applied before the
+            // multi-candidate guard so callers can pick one overload
+            // of a shared name (e.g. `new`) without tripping the
+            // ambiguity refusal.
+            .filter(|(s, _)| match kind_filter {
+                Some(k) => s.kind.eq_ignore_ascii_case(k),
+                None => true,
+            })
+            .filter(|(_, f)| match file_filter {
+                Some(p) => f.path == p,
+                None => true,
+            })
             .collect();
 
         if func_symbols.is_empty() {
+            // Give distinct signals for "not a function", "only test
+            // definitions exist", "only non-callable language definitions
+            // exist (shell `main`, Makefile targets, ...)" and "no
+            // candidate matches the user's kind/file_path filter".
+            // Without the branches, every empty-set case collapsed into
+            // the same message and the caller could not tell which knob
+            // to adjust.
+            //
+            // NOTE: we branch on `symbols` (pre-filter) on purpose. When
+            // `name="handle"` resolves only to structs/macros, the outer
+            // `if symbols.is_empty()` guard above never fires because
+            // SymbolRow rows DO exist - the filter chain just removes
+            // all of them. That is the case this block translates into
+            // a caller-visible "exists but is not a function" message.
+            if kind_filter.is_some() || file_filter.is_some() {
+                return Err(format!(
+                    "'{}' has no function/method candidate matching kind={:?} file_path={:?}. Drop the filter to see the full candidate list.",
+                    params.name, kind_filter, file_filter,
+                ));
+            }
+            if !include_tests
+                && symbols.iter().any(|(s, f)| {
+                    matches!(s.kind.as_str(), "function" | "method" | "constructor")
+                        && helpers::is_test_path(&f.path)
+                })
+            {
+                return Err(format!(
+                    "'{}' is only defined in test files. Pass `include_tests=true` to analyse them, or narrow by `file_path`.",
+                    params.name,
+                ));
+            }
+            if symbols.iter().any(|(s, f)| {
+                matches!(s.kind.as_str(), "function" | "method" | "constructor")
+                    && !is_callable_source_language(&f.language)
+            }) {
+                return Err(format!(
+                    "'{}' is only defined in non-callable languages (shell/makefile/config). qartez_calls analyses Rust/JS/Python/Go/Java/... call graphs only.",
+                    params.name,
+                ));
+            }
+            // `symbols` is non-empty (outer guard passed) but none are
+            // function-like after filtering. This is the "handle exists
+            // as struct/macro but not as fn" path the auditor flagged.
             return Err(format!(
                 "'{}' exists but is not a function/method",
                 params.name
             ));
+        }
+
+        // Multi-candidate disambiguation guard. Before this branch
+        // landed, `append_callers` counted every textual occurrence of
+        // the bare name across the repo (e.g. `callers: 1357` for every
+        // `new`), and `render_callee_row` emitted the
+        // `ambiguous (N candidates)` block INSIDE the callees listing
+        // when the target body re-invoked its own name through a
+        // different owner type (HashMap::new in QartezServer::new).
+        // Both were incorrect per-candidate: a single identifier-scan
+        // cannot attribute call sites to one overload. We now refuse
+        // up front and ask the caller to narrow via `file_path` or
+        // `kind`.
+        if func_symbols.len() > 1 {
+            let mut banner = format!(
+                "'{}' resolves to {} function-like candidate(s). Pass `file_path` or `kind` to pick one - per-candidate callers/callees counts are not attributable without disambiguation.\n\ncandidates:\n",
+                params.name,
+                func_symbols.len(),
+            );
+            for (sym, def_file) in &func_symbols {
+                let owner = sym
+                    .owner_type
+                    .as_deref()
+                    .map(|t| format!("{t}::"))
+                    .unwrap_or_default();
+                banner.push_str(&format!(
+                    "  - {owner}{} ({}) @ {}:L{}-{}\n",
+                    sym.name, sym.kind, def_file.path, sym.line_start, sym.line_end,
+                ));
+            }
+            return Ok(banner);
         }
 
         if is_mermaid(&params.format) {
@@ -115,10 +328,20 @@ impl QartezServer {
                 &all_files,
                 want_callers,
                 want_callees,
+                token_budget,
             );
         }
 
         let mut out = String::new();
+        // Surface the depth clamp up front as a `!warning:` line so a
+        // caller skimming the top of the output immediately sees that
+        // the graph was capped. The old trailing `note:` was easy to
+        // miss when output ran into the limit truncation footer.
+        if depth_was_clamped {
+            out.push_str(&format!(
+                "!warning: depth={requested_depth} was clamped to {MAX_CALL_DEPTH} (server-side hard cap to prevent hub-function blow-up).\n\n",
+            ));
+        }
         // Per-invocation caches. Both sets overlap heavily inside a single
         // tool call, so memoizing avoids re-running SQL.
         let mut resolve_cache: HashMap<
@@ -137,9 +360,27 @@ impl QartezServer {
                 sym.name, sym.kind, def_file.path, sym.line_start, sym.line_end,
             ));
 
+            // Seed-only mode: depth=0 prints the resolved symbol and
+            // stops before any graph walk. Matches qartez_hierarchy
+            // max_depth=0 behavior so both tools speak the same
+            // "cheap existence probe" vocabulary.
+            if seed_only {
+                out.push_str(
+                    "  (depth=0 seed-only: no callers/callees expanded. Raise depth to walk the graph.)\n",
+                );
+                continue;
+            }
+
             if want_callers {
+                // Hand the resolved symbol's owner_type (e.g.
+                // "QartezServer") to the caller scanner so a name like
+                // `new` does not sweep up every unrelated `X::new` call
+                // across the repo. Without this filter `QartezServer::new`
+                // over-counted ~6x (1387 vs ~223) because the text scan
+                // matched any `new` token regardless of receiver type.
                 self.append_callers(
                     &params.name,
+                    sym.owner_type.as_deref(),
                     &all_files,
                     &mut file_syms_cache,
                     &mut out,
@@ -171,9 +412,14 @@ impl QartezServer {
                     max_depth,
                     limit,
                     token_budget,
+                    concise,
                 )?;
             }
         }
+
+        // Depth-clamp warning is now emitted at the head of `out` above,
+        // not here - a trailing note was easy to miss when output hit
+        // the token-budget truncation footer.
 
         Ok(out)
     }
@@ -184,6 +430,7 @@ impl QartezServer {
     fn append_callers(
         &self,
         name: &str,
+        owner_filter: Option<&str>,
         all_files: &[crate::storage::models::FileRow],
         file_syms_cache: &mut HashMap<i64, Vec<crate::storage::models::SymbolRow>>,
         out: &mut String,
@@ -194,7 +441,21 @@ impl QartezServer {
     ) -> Result<(), String> {
         // Scan phase (no lock): FS reads + tree-sitter parsing for every
         // file. This is the heaviest phase and must not hold the db mutex.
+        //
+        // When `owner_filter` is set, switch from the bare `cached_calls`
+        // (name, line) pool to the qualifier-aware walker so a call to
+        // `HashMap::new()` inside a file that also invokes
+        // `QartezServer::new()` is not counted as a caller of the latter.
+        // Sites whose indexed qualifier is `None` (the AST failed to
+        // record a receiver type, e.g. trait-object dynamic dispatch) are
+        // kept but counted toward `unqualified_count` so the header can
+        // warn the caller that the number is a best-effort upper bound.
+        // This is a best-effort heuristic - without a full type-resolver
+        // we cannot prove `self.new()` binds to the target's owner_type,
+        // so `self`/`Self` qualifiers are also routed through the
+        // unqualified bucket rather than silently dropped.
         let mut raw_sites: Vec<(i64, String, Vec<usize>)> = Vec::new();
+        let mut unqualified_count: usize = 0;
         for file in all_files {
             if !include_tests && helpers::is_test_path(&file.path) {
                 continue;
@@ -206,12 +467,51 @@ impl QartezServer {
             if !source.contains(name) {
                 continue;
             }
-            let calls = self.cached_calls(&file.path);
-            let matching: Vec<usize> = calls
-                .iter()
-                .filter(|(n, _)| n == name)
-                .map(|(_, l)| *l)
-                .collect();
+            let matching: Vec<usize> = if let Some(owner) = owner_filter {
+                // Qualifier-aware pass: walk the whole file and keep
+                // only call sites whose receiver qualifier matches the
+                // target's owner_type, plus unqualified/`self` sites
+                // that we cannot prove one way or the other.
+                let line_count = source.lines().count().max(1);
+                let sites = self.collect_call_sites_with_qualifiers(&file.path, 1, line_count);
+                let mut lines = Vec::new();
+                for site in &sites {
+                    if site.name != name {
+                        continue;
+                    }
+                    match site.qualifier.as_deref() {
+                        Some(q) if q == owner => lines.push(site.line),
+                        Some("self") | Some("Self") => {
+                            // `self.new()` / `Self::new()` carry the
+                            // caller impl-block's receiver type, which
+                            // we cannot resolve without a type checker.
+                            // Keep the site but count it as unqualified.
+                            unqualified_count += 1;
+                            lines.push(site.line);
+                        }
+                        Some(_) => {
+                            // Qualifier that belongs to a different
+                            // type (`HashMap::new`, `Vec::new`, ...).
+                            // Drop - this is the over-count fix.
+                        }
+                        None => {
+                            // Free-standing `name(...)`: could be a
+                            // re-export or a same-named free function.
+                            // Preserve the site but flag it.
+                            unqualified_count += 1;
+                            lines.push(site.line);
+                        }
+                    }
+                }
+                lines
+            } else {
+                let calls = self.cached_calls(&file.path);
+                calls
+                    .iter()
+                    .filter(|(n, _)| n == name)
+                    .map(|(_, l)| *l)
+                    .collect()
+            };
             if !matching.is_empty() {
                 raw_sites.push((file.id, file.path.clone(), matching));
             }
@@ -285,6 +585,16 @@ impl QartezServer {
             out.push_str("callers: none\n");
         } else {
             out.push_str(&format!("callers: {}\n", sites.len()));
+            // Owner-filtering is a best-effort heuristic: the tree-sitter
+            // walker cannot always recover the receiver type (trait
+            // objects, `self.new()` without file-scoped impl resolution,
+            // re-exports). Surface the residual when it is non-zero so
+            // the caller knows the headline number is an upper bound.
+            if owner_filter.is_some() && unqualified_count > 0 {
+                out.push_str(&format!(
+                    "  (note: {unqualified_count} unqualified site(s) could not be attributed to a concrete owner_type; count may be over-inclusive)\n",
+                ));
+            }
             if !concise {
                 let shown = sites.len().min(limit);
                 for (idx, (path, line, encl)) in sites.iter().take(shown).enumerate() {
@@ -327,6 +637,13 @@ impl QartezServer {
     ) -> Result<(), String> {
         let start = sym.line_start as usize;
         let end = sym.line_end as usize;
+        // Caller's owner_type lets `self.<method>()` / `Self::<method>()`
+        // calls disambiguate against the caller's own impl block. Before
+        // this, `QartezServer::new()` calling `self.X()` could not bind
+        // to `QartezServer::X` because the qualifier was the literal
+        // `self` string, which the filter below deliberately skips to
+        // avoid false matches on siblings in other impl blocks.
+        let caller_owner_type: Option<&str> = sym.owner_type.as_deref();
         let sites = self.collect_call_sites_with_qualifiers(&def_file.path, start, end);
         // Dedup by (name, qualifier, via_method_syntax); keep the first-seen
         // line per pair so `Foo::new` and `Bar::new` stay distinct. Tracking
@@ -365,7 +682,15 @@ impl QartezServer {
             }
         }
 
+        // Render rows lazily so the denylist inside `render_callee_row`
+        // can suppress noise rows (stdlib stubs like `clone`, `map`,
+        // `unwrap` that could not be resolved to a concrete owner_type)
+        // without burning a `limit` slot on an empty row. `suppressed`
+        // surfaces the residual in the output footer so the reader
+        // knows the header count included a few builtins the listing
+        // below deliberately elides.
         let shown = seen_order.len().min(limit);
+        let mut suppressed: usize = 0;
         for (idx, (callee_name, qualifier, via_method)) in seen_order.iter().take(shown).enumerate()
         {
             let resolved = resolve_cache.get(callee_name).unwrap();
@@ -375,7 +700,12 @@ impl QartezServer {
                 resolved,
                 *via_method,
                 &def_file.path,
+                caller_owner_type,
             );
+            if row.is_empty() {
+                suppressed += 1;
+                continue;
+            }
             if estimate_tokens(out) + estimate_tokens(&row) > token_budget {
                 let remaining = seen_order.len() - idx;
                 out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n"));
@@ -386,6 +716,11 @@ impl QartezServer {
         if seen_order.len() > shown {
             let remaining = seen_order.len() - shown;
             out.push_str(&format!("  ... +{remaining} more, raise limit=\n"));
+        }
+        if suppressed > 0 {
+            out.push_str(&format!(
+                "  (suppressed {suppressed} stdlib-stub callee(s): parse/init/Ok/clone/map/unwrap/...)\n",
+            ));
         }
         Ok(())
     }
@@ -409,6 +744,7 @@ impl QartezServer {
         max_depth: usize,
         limit: usize,
         token_budget: usize,
+        concise: bool,
     ) -> Result<(), String> {
         let start = sym.line_start as usize;
         let end = sym.line_end as usize;
@@ -463,6 +799,17 @@ impl QartezServer {
                     if !matches!(s2.kind.as_str(), "function" | "method") {
                         continue;
                     }
+                    // Drop candidates that live in a different language
+                    // than the seed. Without this the deep walker happily
+                    // resolved a Rust `fmt`/`ok` identifier through a
+                    // JavaScript file (e.g. qartez-website/app.js) and
+                    // emitted spurious `... -> fmt ambiguous` rows
+                    // because `find_symbol_by_name` is language-agnostic.
+                    // The call graph is strictly intra-language, so the
+                    // cross-language hit is always a false positive.
+                    if !f2.language.eq_ignore_ascii_case(&def_file.language) {
+                        continue;
+                    }
                     let s2start = s2.line_start as usize;
                     let s2end = s2.line_end as usize;
                     let child_sites =
@@ -487,9 +834,62 @@ impl QartezServer {
             return Ok(());
         }
 
-        out.push_str("deeper:\n");
         let mut depths: Vec<usize> = by_depth.keys().copied().collect();
         depths.sort();
+
+        // Concise-mode roll-up: when `format=concise` and a given
+        // depth carries more than `ROLLUP_THRESHOLD` chain rows, emit
+        // a single "depth N: K callees" summary line instead of
+        // dumping every chain. This keeps the output scannable on
+        // hub functions (e.g. `qartez_calls name=QartezServer::new
+        // depth=2 format=concise` that previously produced 500+
+        // chain lines) while preserving the full-tree rendering for
+        // the default verbose mode. Depth-buckets that stay under
+        // the threshold still render inline so small graphs look
+        // the same as before.
+        const ROLLUP_THRESHOLD: usize = 20;
+        if concise {
+            out.push_str("deeper:\n");
+            let total_available: usize = by_depth.values().map(|v| v.len()).sum();
+            let mut total_emitted = 0usize;
+            for depth in &depths {
+                let Some(entries) = by_depth.get(depth) else {
+                    continue;
+                };
+                if entries.len() > ROLLUP_THRESHOLD {
+                    let summary = format!("  depth {depth}: {} callees\n", entries.len());
+                    if estimate_tokens(out) + estimate_tokens(&summary) > token_budget {
+                        let remaining = total_available - total_emitted;
+                        out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n",));
+                        return Ok(());
+                    }
+                    out.push_str(&summary);
+                    total_emitted += entries.len();
+                    continue;
+                }
+                for (_, chain) in entries {
+                    if total_emitted >= limit {
+                        let remaining = total_available - total_emitted;
+                        out.push_str(&format!("  ... +{remaining} more, raise limit=\n"));
+                        return Ok(());
+                    }
+                    let row = format!("  [depth {depth}] {chain}\n");
+                    if estimate_tokens(out) + estimate_tokens(&row) > token_budget {
+                        let remaining = total_available - total_emitted;
+                        out.push_str(&format!("  ... +{remaining} more, raise token_budget=\n",));
+                        return Ok(());
+                    }
+                    out.push_str(&row);
+                    total_emitted += 1;
+                }
+            }
+            out.push_str(
+                "// note: concise mode rolls up depth buckets > 20 callees into a summary line; drop `format=concise` to see the full chains.\n",
+            );
+            return Ok(());
+        }
+
+        out.push_str("deeper:\n");
         let total_available: usize = by_depth.values().map(|v| v.len()).sum();
         let mut total_emitted = 0usize;
         'outer: for depth in depths {
@@ -570,6 +970,7 @@ fn render_callee_row(
     )],
     via_method_syntax: bool,
     caller_file_path: &str,
+    caller_owner_type: Option<&str>,
 ) -> String {
     let func_like: Vec<&(
         crate::storage::models::SymbolRow,
@@ -578,6 +979,36 @@ fn render_callee_row(
         .iter()
         .filter(|(s, _)| matches!(s.kind.as_str(), "function" | "method" | "constructor"))
         .collect();
+    // Stdlib-stub denylist: identifiers like `clone`, `unwrap`, `map`,
+    // `new`, etc. are dominated by language builtins whose real
+    // implementation lives outside the index. Suppressing them unless
+    // the call site ties to a concrete user-owned type keeps the
+    // callee listing honest: a row like `clone (extern)` every ten
+    // lines taught the reader nothing, and an `ambiguous (N candidates)`
+    // row listing unrelated user structs was actively misleading. The
+    // gate only skips rows we CANNOT resolve uniquely - rows that DO
+    // resolve through the owner_type branch below pass through because
+    // those name a concrete user symbol the caller actually depends on.
+    if STDLIB_STUBS.contains(&callee_name) {
+        let effective_qual: Option<&str> = match qualifier {
+            Some(q) if q == "self" || q == "Self" => caller_owner_type,
+            Some(q) => Some(q),
+            None => None,
+        };
+        let resolves_uniquely = match effective_qual {
+            Some(qual) => {
+                func_like
+                    .iter()
+                    .filter(|(s, _)| s.owner_type.as_deref() == Some(qual))
+                    .count()
+                    == 1
+            }
+            None => false,
+        };
+        if !resolves_uniquely {
+            return String::new();
+        }
+    }
     if func_like.is_empty() {
         // A method-syntax call (`.filter(...)`) whose only same-named
         // candidates are fields, variables, or constants in an unrelated
@@ -605,10 +1036,18 @@ fn render_callee_row(
         }
         return format!("  {callee_name} @ {}\n", f.path);
     }
-    if let Some(qual) = qualifier
-        && qual != "self"
-        && qual != "Self"
-    {
+    // `self.X(...)` / `Self::X(...)` calls carry the caller's impl-
+    // block receiver type semantically, not the literal `self` token.
+    // Fall through to the caller's owner_type when that context is
+    // available so `QartezServer::new` calling `self.safe_resolve`
+    // binds to `QartezServer::safe_resolve` instead of reporting
+    // "ambiguous (7 candidates)".
+    let effective_qual: Option<&str> = match qualifier {
+        Some(q) if q == "self" || q == "Self" => caller_owner_type,
+        Some(q) => Some(q),
+        None => None,
+    };
+    if let Some(qual) = effective_qual {
         let matching: Vec<&(
             crate::storage::models::SymbolRow,
             crate::storage::models::FileRow,
@@ -754,6 +1193,13 @@ fn split_callee(node: tree_sitter::Node, source: &[u8]) -> (String, Option<Strin
 
 impl QartezServer {
     /// Render call hierarchy as a Mermaid flowchart.
+    ///
+    /// Honours `token_budget`: nodes beyond the budget are dropped and
+    /// the graph is terminated with a dashed `truncated` marker edge.
+    /// Before the 2026-04-23 fix, mermaid rendering bypassed the budget
+    /// entirely and could emit 10x the requested volume on hub
+    /// functions - the guard now mirrors the textual renderer's
+    /// truncation contract.
     fn qartez_calls_mermaid(
         &self,
         target_name: &str,
@@ -764,20 +1210,38 @@ impl QartezServer {
         all_files: &[crate::storage::models::FileRow],
         want_callers: bool,
         want_callees: bool,
+        token_budget: usize,
     ) -> Result<String, String> {
         let max_nodes = 50;
         let mut out = String::from("graph TD\n");
         let target_id = helpers::mermaid_node_id(target_name);
         let target_label = helpers::mermaid_label(target_name);
         out.push_str(&format!("  {target_id}[\"{target_label}\"]\n"));
+        // Shared predicate: a new edge row fits into the budget only if
+        // its estimated tokens plus the current buffer stay under the
+        // cap. Declared here so both caller and callee loops consult
+        // the same rule without code duplication.
+        let fits_budget =
+            |buf: &str, row: &str| estimate_tokens(buf) + estimate_tokens(row) <= token_budget;
+        let mut budget_exhausted = false;
 
+        // Track nodes whose label has already been declared so each
+        // id's bracketed label only appears once. Strict Mermaid
+        // renderers (e.g. `@mermaid-js/mermaid-cli` >= 10) error on
+        // duplicate id-with-label declarations like
+        //   run["run"]
+        //   run["run"]
+        // even when the labels are identical. Emitting the subsequent
+        // occurrences as bare `run` keeps the graph well-formed.
+        let mut declared_nodes: HashSet<String> = HashSet::new();
+        declared_nodes.insert(target_id.clone());
         let mut count = 0usize;
         let mut seen_edges = HashSet::new();
 
-        for (sym, def_file) in func_symbols {
+        'outer: for (sym, def_file) in func_symbols {
             if want_callers {
                 for file in all_files {
-                    if count >= max_nodes {
+                    if count >= max_nodes || budget_exhausted {
                         break;
                     }
                     let source = match self.cached_source(&file.path) {
@@ -801,7 +1265,7 @@ impl QartezServer {
                         .map(|(_, l)| *l)
                         .collect();
                     for line in &matching_lines {
-                        if count >= max_nodes {
+                        if count >= max_nodes || budget_exhausted {
                             break;
                         }
                         let enclosing = file_syms
@@ -823,10 +1287,25 @@ impl QartezServer {
                             continue;
                         }
                         let clabel = helpers::mermaid_label(caller);
-                        out.push_str(&format!("  {cid}[\"{clabel}\"] --> {target_id}\n"));
+                        let already_declared = declared_nodes.contains(&cid);
+                        let row = if !already_declared {
+                            format!("  {cid}[\"{clabel}\"] --> {target_id}\n")
+                        } else {
+                            format!("  {cid} --> {target_id}\n")
+                        };
+                        if !fits_budget(&out, &row) {
+                            budget_exhausted = true;
+                            break;
+                        }
+                        declared_nodes.insert(cid);
+                        out.push_str(&row);
                         count += 1;
                     }
                 }
+            }
+
+            if budget_exhausted {
+                break 'outer;
             }
 
             if want_callees {
@@ -835,7 +1314,7 @@ impl QartezServer {
                 let end = sym.line_end as usize;
                 let mut seen = HashSet::new();
                 for (name, line) in all_calls.iter() {
-                    if count >= max_nodes {
+                    if count >= max_nodes || budget_exhausted {
                         break;
                     }
                     if *line < start || *line > end {
@@ -865,20 +1344,44 @@ impl QartezServer {
                         .count();
                     let cid = helpers::mermaid_node_id(name);
                     let clabel = helpers::mermaid_label(name);
-                    if func_like >= 2 {
-                        out.push_str(&format!(
-                            "  {target_id} -.->|?{func_like}| {cid}[\"{clabel}\"]\n",
-                        ));
+                    let first_time = !declared_nodes.contains(&cid);
+                    let row = if func_like >= 2 {
+                        if first_time {
+                            format!("  {target_id} -.->|?{func_like}| {cid}[\"{clabel}\"]\n")
+                        } else {
+                            format!("  {target_id} -.->|?{func_like}| {cid}\n")
+                        }
+                    } else if first_time {
+                        format!("  {target_id} --> {cid}[\"{clabel}\"]\n")
                     } else {
-                        out.push_str(&format!("  {target_id} --> {cid}[\"{clabel}\"]\n"));
+                        format!("  {target_id} --> {cid}\n")
+                    };
+                    if !fits_budget(&out, &row) {
+                        budget_exhausted = true;
+                        break;
                     }
+                    declared_nodes.insert(cid);
+                    out.push_str(&row);
                     count += 1;
                 }
             }
+
+            if budget_exhausted {
+                break 'outer;
+            }
         }
 
-        if count >= max_nodes {
-            out.push_str("  truncated[\"... truncated\"]\n");
+        if count >= max_nodes || budget_exhausted {
+            // Connect the truncation marker to the target so it is not
+            // a dangling node. Strict Mermaid renderers otherwise warn
+            // on orphan declarations. Using a fixed id keeps the
+            // output deterministic across max-nodes and token-budget
+            // truncation paths.
+            let marker = format!("  {target_id} -.-> truncated[\"... truncated\"]\n");
+            // Append the marker even if it slightly overshoots budget:
+            // the caller must SEE that the output was cut rather than
+            // silently reading a subset.
+            out.push_str(&marker);
         }
         Ok(out)
     }

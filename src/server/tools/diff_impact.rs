@@ -47,9 +47,20 @@ impl QartezServer {
         let ack_enabled = params.ack.unwrap_or(false);
 
         let changed = crate::git::diff::changed_files_in_range(&self.project_root, &params.base)
-            .map_err(|e| format!("Git error: {e}"))?;
+            .map_err(|e| friendly_git_error(&params.base, &e))?;
 
         if changed.is_empty() {
+            // `base="HEAD"` (no `..`) expands to `HEAD..HEAD` inside
+            // the git layer, which is always empty. Callers land here
+            // expecting the working-tree diff against HEAD; point
+            // them at the right tool instead of the "fresh worktree"
+            // hint which does not apply.
+            if !params.base.contains("..") && is_head_self_compare(&params.base) {
+                return Ok(format!(
+                    "No files changed in range '{}'. The tool compares two indexed trees; `base=HEAD` expands to `HEAD..HEAD` (empty by definition). For working-tree changes, run `qartez_impact` on each edited file, or pass `base=origin/main` / `base=HEAD~1` for committed changes.",
+                    params.base,
+                ));
+            }
             // Worktree-vs-remote hint: `main..HEAD` is the canonical
             // range, but in a fresh worktree `main` typically points at
             // the same commit as `HEAD`, so the range resolves to zero
@@ -65,18 +76,48 @@ impl QartezServer {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let changed_set: HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
 
+        // Idempotency marker for `ack=true`: before writing any
+        // per-file ack rows, check whether a deterministic marker for
+        // this exact diff already exists. The marker name is derived
+        // from (base revspec, sorted changed-files list), so calling
+        // `qartez_diff_impact ack=true` twice on the same diff hits
+        // the same marker file and skips touching the per-file ack
+        // rows on the second call. Without this, consumers that
+        // periodically re-run diff_impact on a stable PR branch saw
+        // the ack directory appear to "grow" because every call
+        // advanced mtimes on every changed file.
+        let ack_marker: Option<std::path::PathBuf> = if ack_enabled {
+            Some(diff_ack_marker_path(
+                &self.project_root,
+                &params.base,
+                &changed,
+            ))
+        } else {
+            None
+        };
+        let ack_marker_fresh: bool = ack_marker.as_ref().map(|p| p.exists()).unwrap_or(false);
+
         let mut indexed = Vec::new();
         let mut not_indexed = Vec::new();
         for path in &changed {
             match read::get_file_by_path(&conn, path) {
                 Ok(Some(file)) => {
-                    if ack_enabled {
+                    if ack_enabled && !ack_marker_fresh {
                         guard::touch_ack(&self.project_root, &file.path);
                     }
                     indexed.push(file);
                 }
                 _ => not_indexed.push(path.as_str()),
             }
+        }
+        if ack_enabled
+            && !ack_marker_fresh
+            && let Some(marker) = ack_marker.as_ref()
+        {
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(marker, "");
         }
 
         let file_ids: Vec<i64> = indexed.iter().map(|f| f.id).collect();
@@ -193,6 +234,11 @@ impl QartezServer {
 
         out.push_str("## Changed files\n");
         if risk_data.is_some() {
+            // WHY: Risk and Health share a 0-10 scale but invert each
+            // other's polarity (high Risk is bad, high Health is good).
+            // Without this legend, callers conflated the two and read
+            // a risk=8.5 row as "healthy" because 8.5 is high.
+            out.push_str("legend: Risk=higher-is-worse (0-10), Health=higher-is-better (0-10)\n");
             out.push_str(
                 " # | File                                | PageRank | Blast | Risk | Health\n",
             );
@@ -311,6 +357,46 @@ impl QartezServer {
 /// upstream and `main..HEAD` therefore resolves to no commits. Returns
 /// `None` for ranges that legitimately produced no changes (same tree
 /// content across a real commit range).
+/// True when `base` is a single-rev spec equivalent to HEAD (the git
+/// layer expands `HEAD` to `HEAD..HEAD`, which is always empty). Used
+/// by `qartez_diff_impact` to distinguish the "you picked an empty-
+/// by-design range" case from a genuinely clean branch.
+fn is_head_self_compare(base: &str) -> bool {
+    let b = base.trim();
+    matches!(b, "HEAD" | "@" | "HEAD^0" | "HEAD~0")
+}
+
+/// Replace a raw libgit2 error with a caller-friendly summary. Before
+/// this, passing an out-of-range revspec like `HEAD~999` leaked the
+/// bare `"Git error: parent 0 does not exist; class=Invalid (3);
+/// code=NotFound (-3)"` string straight through. Keep the underlying
+/// message as a trailing "(git:…)" suffix so operators who grep for
+/// the raw libgit2 codes still have them.
+fn friendly_git_error(base: &str, err: &impl std::fmt::Display) -> String {
+    let raw = err.to_string();
+    let lower = raw.to_ascii_lowercase();
+    // WHY: `changed_files_in_range` rejects descendant-to-ancestor
+    // revspecs to prevent the silent "reversed range returns identical
+    // output" bug. Surface that hint unchanged instead of wrapping it
+    // in the generic "Git error for revspec..." envelope, which would
+    // bury the suggested forward form the user needs to copy.
+    if lower.contains("range reversed") {
+        return raw;
+    }
+    if lower.contains("parent") && lower.contains("does not exist") {
+        return format!(
+            "Cannot resolve revspec '{base}': the history does not reach that many parents (e.g. `HEAD~999` on a shallow clone or newly-created branch). Pick a smaller offset, or use a branch name like `origin/main..HEAD`. (git: {raw})"
+        );
+    }
+    if lower.contains("not found") || lower.contains("unable to parse") || lower.contains("invalid")
+    {
+        return format!(
+            "Cannot resolve revspec '{base}' to a git range. Typical forms: `main..HEAD`, `origin/main..HEAD`, `HEAD~3`, or a commit SHA. (git: {raw})"
+        );
+    }
+    format!("Git error for revspec '{base}': {raw}")
+}
+
 fn diff_impact_worktree_hint(project_root: &std::path::Path, base: &str) -> Option<String> {
     let repo = git2::Repository::discover(project_root).ok()?;
     let effective = if base.contains("..") {
@@ -506,11 +592,27 @@ fn format_risk_summary(
     } else {
         risks.iter().map(|(_, r, _, _)| r).sum::<f64>() / risks.len() as f64
     };
-    let highest = risks.iter().enumerate().max_by(|a, b| {
-        a.1.1
-            .partial_cmp(&b.1.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // WHY: "Highest risk" is a prioritization pointer for follow-up
+    // work. A complex test file can still dominate the ranking (low
+    // health from high CC pulls risk up), which misleads callers into
+    // thinking a test needs more tests. Prefer production files when
+    // any exist; only fall back to the full set for tests-only diffs.
+    let highest = risks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !is_test_path(&indexed[*i].path))
+        .max_by(|a, b| {
+            a.1.1
+                .partial_cmp(&b.1.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| {
+            risks.iter().enumerate().max_by(|a, b| {
+                a.1.1
+                    .partial_cmp(&b.1.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
 
     out.push_str(&format!(
         "\n## Risk summary\nOverall risk: {avg_risk:.1} / 10\n",
@@ -520,7 +622,16 @@ fn format_risk_summary(
             "Boundary violations: {total_violations} (in changed files)\n",
         ));
     }
-    out.push_str(&format!("Untested files: {untested} / {non_test_count}\n",));
+    if non_test_count == 0 {
+        // Every file in the diff is a test file. Emitting `0 / 0`
+        // read as a successful "all production files have coverage"
+        // when the truth is that there ARE no production files to
+        // evaluate. Name the shape instead so callers understand the
+        // denominator.
+        out.push_str("Diff is tests-only; no production files to evaluate for test coverage.\n");
+    } else {
+        out.push_str(&format!("Untested files: {untested} / {non_test_count}\n",));
+    }
     if let Some((idx, (health, risk, bv, has_test))) = highest {
         let mut reasons = Vec::new();
         if *health < 4.0 {
@@ -533,7 +644,14 @@ fn format_risk_summary(
             reasons.push("boundary violations");
         }
         if reasons.is_empty() {
-            reasons.push("high coupling");
+            // Every risk dimension came back clean. Emit `low coupling`
+            // instead of the old `high coupling` default, which read
+            // as a contradiction on tests-only diffs where blast
+            // radius is zero and no production file participates in
+            // the scoring. The label now reflects the actual
+            // condition the formula measured (no elevated signal on
+            // any axis).
+            reasons.push("low coupling");
         }
         out.push_str(&format!(
             "Highest risk: {} ({:.1}) - {}\n",
@@ -542,4 +660,43 @@ fn format_risk_summary(
             reasons.join(", "),
         ));
     }
+}
+
+/// Deterministic marker path for an `ack=true` call: derives from the
+/// base revspec and the sorted list of changed files so two calls on
+/// the same diff resolve to the same file. Calling `qartez_diff_impact
+/// ack=true` twice is then a no-op on the filesystem because the
+/// marker already exists and the caller skips touching the per-file
+/// ack rows. The marker itself is empty - consumers only check its
+/// existence.
+fn diff_ack_marker_path(
+    project_root: &std::path::Path,
+    base: &str,
+    changed: &[String],
+) -> std::path::PathBuf {
+    // FNV-1a 64 over (base\n<sorted rel-paths joined by \n>). Mirrors
+    // the construction already used by `guard::ack_path` so the two
+    // hashing schemes stay consistent.
+    let mut sorted: Vec<&str> = changed.iter().map(String::as_str).collect();
+    sorted.sort();
+    let mut hash: u64 = 0xcbf29ce4_84222325;
+    for byte in base.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= b'\n' as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+    for p in &sorted {
+        for byte in p.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= b'\n' as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    project_root
+        .join(".qartez")
+        .join("acks")
+        .join("diff-markers")
+        .join(format!("{hash:016x}"))
 }

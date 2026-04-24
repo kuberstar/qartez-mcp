@@ -401,3 +401,242 @@ fn refs_filters_defining_file_from_direct_references() {
         "defining file must still be surfaced in the `Defined in:` header:\n{out}"
     );
 }
+
+// --------------------------------------------------------------------------
+// B7 (2026-04-23 batch): multi-candidate `qartez_calls` refuses to report
+// per-candidate callers/callees numbers and asks the caller to narrow via
+// `file_path` or `kind`. Before the fix, `append_callers` reported the
+// GLOBAL textual count of `name` for every candidate (e.g. identical
+// `callers: 1357` under all 7 `new` overloads) and `render_callee_row`
+// emitted the `ambiguous (N candidates)` block INSIDE the callees list.
+// --------------------------------------------------------------------------
+
+#[test]
+fn calls_multi_candidate_refuses_without_disambiguation() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_cargo_manifest(root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub mod foo;\npub mod bar;\n").unwrap();
+    fs::write(
+        src.join("foo.rs"),
+        "pub struct Foo;\nimpl Foo {\n    pub fn overload() {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("bar.rs"),
+        "pub struct Bar;\nimpl Bar {\n    pub fn overload() {}\n}\n",
+    )
+    .unwrap();
+
+    let server = build_and_index(root);
+    let out = server
+        .call_tool_by_name(
+            "qartez_calls",
+            json!({
+                "name": "overload",
+            }),
+        )
+        .expect("qartez_calls on a multi-candidate name must not error");
+
+    assert!(
+        out.contains("resolves to 2 function-like candidate(s)"),
+        "multi-candidate must print a resolves-to banner, got:\n{out}"
+    );
+    assert!(
+        !out.contains("callers:"),
+        "multi-candidate must NOT emit a per-candidate `callers:` count (it would be the global name count, not per-overload):\n{out}"
+    );
+    assert!(
+        !out.contains("callees:"),
+        "multi-candidate must NOT list per-candidate callees before disambiguation:\n{out}"
+    );
+    assert!(
+        out.contains("src/foo.rs") && out.contains("src/bar.rs"),
+        "candidate listing must cover both defining files:\n{out}"
+    );
+}
+
+#[test]
+fn calls_multi_candidate_narrows_via_file_path() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_cargo_manifest(root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub mod foo;\npub mod bar;\n").unwrap();
+    fs::write(
+        src.join("foo.rs"),
+        "pub struct Foo;\nimpl Foo {\n    pub fn overload() {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("bar.rs"),
+        "pub struct Bar;\nimpl Bar {\n    pub fn overload() {}\n}\n",
+    )
+    .unwrap();
+
+    let server = build_and_index(root);
+    let out = server
+        .call_tool_by_name(
+            "qartez_calls",
+            json!({
+                "name": "overload",
+                "file_path": "src/foo.rs",
+            }),
+        )
+        .expect("disambiguated qartez_calls must succeed");
+
+    assert!(
+        out.contains("overload"),
+        "resolved target symbol must be echoed:\n{out}"
+    );
+    assert!(
+        out.contains("src/foo.rs"),
+        "output must carry the narrowed defining file:\n{out}"
+    );
+    assert!(
+        !out.contains("resolves to"),
+        "once file_path narrows to a single candidate the disambiguation banner must disappear:\n{out}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// B8 (2026-04-23 batch): depth=0 is the seed-only shortcut. Mirrors
+// qartez_hierarchy max_depth=0 so both tools speak the same vocabulary.
+// --------------------------------------------------------------------------
+
+#[test]
+fn calls_depth_zero_is_seed_only() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_cargo_manifest(root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn root() { leaf(); }\npub fn leaf() {}\n",
+    )
+    .unwrap();
+
+    let server = build_and_index(root);
+    let out = server
+        .call_tool_by_name(
+            "qartez_calls",
+            json!({
+                "name": "root",
+                "depth": 0,
+            }),
+        )
+        .expect("depth=0 must succeed");
+
+    assert!(
+        out.contains("root"),
+        "seed-only output must echo the resolved symbol header:\n{out}"
+    );
+    assert!(
+        out.contains("seed-only"),
+        "depth=0 must emit the explicit seed-only marker so callers know no walk happened:\n{out}"
+    );
+    assert!(
+        !out.contains("leaf"),
+        "depth=0 must NOT expand callees (leaf is a direct callee of root):\n{out}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// B9 (2026-04-23 batch): qartez_refs concise mode collapses duplicate file
+// paths with a trailing `xN` count, matching the detailed-mode convention.
+// Before the fix, a single importer file supplying 6 edges produced 6 copies
+// of the same path in the comma-separated list.
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// B10 (2026-04-23 batch): mermaid rendering honours `token_budget`. Before
+// the fix it bypassed the budget entirely and could emit 10x the caller's
+// requested token cap on hub functions.
+// --------------------------------------------------------------------------
+
+#[test]
+fn calls_mermaid_honours_token_budget() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_cargo_manifest(root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // A hub with many callees - the mermaid renderer would produce
+    // >50 lines (~400 tokens) without a budget guard.
+    let mut body = String::from("pub fn hub() {\n");
+    for i in 0..40 {
+        body.push_str(&format!("    callee_{i}();\n"));
+    }
+    body.push_str("}\n");
+    for i in 0..40 {
+        body.push_str(&format!("pub fn callee_{i}() {{}}\n"));
+    }
+
+    fs::write(src.join("lib.rs"), body).unwrap();
+
+    let server = build_and_index(root);
+    let out = server
+        .call_tool_by_name(
+            "qartez_calls",
+            json!({
+                "name": "hub",
+                "direction": "callees",
+                "format": "mermaid",
+                "token_budget": 100,
+            }),
+        )
+        .expect("qartez_calls mermaid must succeed");
+
+    let approx_tokens = out.chars().count() / 3;
+    assert!(
+        approx_tokens <= 200,
+        "mermaid must honour token_budget=100 (got ~{approx_tokens} tokens):\n{out}"
+    );
+    assert!(
+        out.contains("truncated"),
+        "budget-exhausted mermaid output must emit the truncation marker so callers notice the cut:\n{out}"
+    );
+}
+
+#[test]
+fn refs_concise_collapses_duplicate_paths() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_cargo_manifest(root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub mod target;\npub mod heavy_user;\n").unwrap();
+    fs::write(src.join("target.rs"), "pub fn hot() {}\n").unwrap();
+    // A single importer file that calls `hot` from three different functions.
+    fs::write(
+        src.join("heavy_user.rs"),
+        "use crate::target::hot;\npub fn a() { hot(); }\npub fn b() { hot(); }\npub fn c() { hot(); }\n",
+    )
+    .unwrap();
+
+    let server = build_and_index(root);
+    let out = server
+        .call_tool_by_name(
+            "qartez_refs",
+            json!({
+                "symbol": "hot",
+                "format": "concise",
+            }),
+        )
+        .expect("qartez_refs concise must succeed");
+
+    let occurrences = out.matches("src/heavy_user.rs").count();
+    assert!(
+        occurrences <= 1,
+        "concise mode must emit each importer path at most once (saw {occurrences} occurrences of src/heavy_user.rs):\n{out}"
+    );
+}

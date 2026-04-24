@@ -36,10 +36,44 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulRenameParams>,
     ) -> Result<String, String> {
+        // Surface empty inputs as a validation error instead of letting
+        // the resolver fall through to `"No symbol found with name ''"`.
+        // That message framed the shape bug as a data miss, which cost
+        // minutes of caller debugging for what is a two-word fix.
+        if params.old_name.trim().is_empty() {
+            return Err("Refusing to rename: `old_name` is empty.".to_string());
+        }
         if params.old_name == params.new_name {
             return Ok(format!(
                 "No-op: old_name and new_name are identical ('{}').",
                 params.old_name,
+            ));
+        }
+
+        // Identifier-shape validation. A rename that slips a Rust keyword,
+        // a leading digit, or an identifier-illegal character into the
+        // target file does not produce a "rename broke one place" bug, it
+        // produces a parse failure the caller has to unpick by hand.
+        if let Some(err) = validate_new_name(&params.new_name) {
+            return Err(err);
+        }
+
+        // Builtin-method-name guard. Names like `new`, `default`, `from`,
+        // `clone`, `len`, etc. live on every other trait impl in the
+        // codebase; even a kind-filtered rename FROM one of these names
+        // hits dozens of unrelated `.new()` / `.clone()` sites because
+        // tree-sitter cannot bind receiver types. Renaming TO one of
+        // these names is almost as hostile because every file that
+        // already calls a same-named builtin will still compile but now
+        // routes through the renamed symbol. Require `allow_collision=true`
+        // as an explicit override.
+        let allow_collision = params.allow_collision.unwrap_or(false);
+        if !allow_collision
+            && let Some(name) = is_builtin_method_name(&params.old_name)
+                .or_else(|| is_builtin_method_name(&params.new_name))
+        {
+            return Err(format!(
+                "Refusing to rename: '{name}' is a builtin trait/inherent method name (new, default, from, clone, len, iter, next, ...). A plain rename would rewrite every unrelated `.{name}()` call site because tree-sitter cannot bind receiver types across the project - even with `file_path` set, call sites in OTHER files that hit a same-named builtin on a DIFFERENT type would still be rewritten and produce wrong-target bindings. Pass `allow_collision=true` to proceed anyway (you are asserting you have audited the unrelated sites).",
             ));
         }
 
@@ -59,7 +93,39 @@ impl QartezServer {
         .map_err(|e| format!("DB error: {e}"))?;
 
         if candidates.is_empty() {
-            return Err(format!("No symbol found with name '{}'", params.old_name));
+            // Distinguish "symbol does not exist" from "symbol exists
+            // but the disambiguator hint excluded every candidate".
+            // Before this split, a bad `kind` / `file_path` looked
+            // identical to a typo in the symbol name and the caller
+            // had no way to tell whether to fix the name, the kind,
+            // or the path.
+            let any_match = read::find_symbol_by_name(&conn, &params.old_name)
+                .map_err(|e| format!("DB error: {e}"))?;
+            if any_match.is_empty() {
+                return Err(format!("No symbol found with name '{}'", params.old_name));
+            }
+            let available_kinds: std::collections::BTreeSet<String> =
+                any_match.iter().map(|(s, _)| s.kind.clone()).collect();
+            let available_files: std::collections::BTreeSet<String> =
+                any_match.iter().map(|(_, f)| f.path.clone()).collect();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(k) = params.kind.as_deref().filter(|s| !s.is_empty()) {
+                parts.push(format!(
+                    "kind='{k}' did not match any definition (available kinds: {})",
+                    available_kinds.into_iter().collect::<Vec<_>>().join(", "),
+                ));
+            }
+            if let Some(fp) = params.file_path.as_deref().filter(|s| !s.is_empty()) {
+                parts.push(format!(
+                    "file_path='{fp}' did not match any definition (available files: {})",
+                    available_files.into_iter().collect::<Vec<_>>().join(", "),
+                ));
+            }
+            return Err(format!(
+                "Symbol '{}' exists in the index but the disambiguator filter excluded every candidate: {}",
+                params.old_name,
+                parts.join("; "),
+            ));
         }
 
         let distinct_kinds: std::collections::BTreeSet<String> =
@@ -73,7 +139,13 @@ impl QartezServer {
             .as_deref()
             .filter(|s| !s.is_empty())
             .is_some();
-        if candidates.len() > 1 && !kind_set && !file_hint_set {
+        // Disambiguate whenever more than one candidate survives the filters.
+        // The previous guard tripped only when NEITHER `kind` NOR `file_path`
+        // was set, which meant `kind=method` alone happily covered 7 distinct
+        // `impl ... { fn same_name() }` blocks and renamed every one at once.
+        // Requiring `file_path` once the caller already picked `kind` keeps
+        // the rename scoped to a single definition.
+        if candidates.len() > 1 && !file_hint_set {
             let locations: Vec<String> = candidates
                 .iter()
                 .map(|(s, f)| {
@@ -83,7 +155,7 @@ impl QartezServer {
                     )
                 })
                 .collect();
-            let hint = if distinct_kinds.len() > 1 {
+            let hint = if !kind_set && distinct_kinds.len() > 1 {
                 "Pass `kind` (e.g. 'function', 'method') to pick one, or `file_path` to scope to a single file."
             } else if distinct_files.len() > 1 {
                 "Pass `file_path` to pick a single defining file."
@@ -143,6 +215,30 @@ impl QartezServer {
                 file_set.insert(path);
             }
         }
+        // Trait-impl awareness: when the rename target is a trait or
+        // interface, every `impl OldTrait for X` block carries the trait
+        // name as a bare identifier. `get_symbol_references_filtered` and
+        // body FTS together do not reliably surface those files when the
+        // implementor relies on a prelude re-export or lives in the same
+        // module as the trait. The `type_hierarchy` table is the
+        // authoritative record of those sites; pull every subtype's file
+        // into the scan set so the per-file tree-sitter walk below
+        // rewrites the `impl OldTrait for X` line along with everything
+        // else.
+        let defining_kinds: std::collections::BTreeSet<String> = candidates
+            .iter()
+            .map(|(s, _)| s.kind.to_ascii_lowercase())
+            .collect();
+        let is_trait_rename = defining_kinds
+            .iter()
+            .any(|k| k == "trait" || k == "interface");
+        let mut trait_impl_files: BTreeSet<String> = BTreeSet::new();
+        if is_trait_rename && let Ok(subtypes) = read::get_subtypes(&conn, &params.old_name) {
+            for (_rel, file) in subtypes {
+                trait_impl_files.insert(file.path.clone());
+                file_set.insert(file.path);
+            }
+        }
         // When the caller pinned to a single file via `file_path`, drop
         // homonym files from the scan set. Cross-file same-name symbols
         // (e.g. `is_test_path` defined in both src/a.rs and src/b.rs)
@@ -159,36 +255,48 @@ impl QartezServer {
                     result.insert(importer_file.path.clone());
                 }
             }
+            // Trait-impl sites must survive the file_path narrowing.
+            // Dropping them would leave `impl OldTrait for X` untouched
+            // in concrete-implementor files even though the caller's
+            // narrowing was for the trait definition, not a call-site
+            // filter.
+            for impl_file in &trait_impl_files {
+                result.insert(impl_file.clone());
+            }
             result.into_iter().collect()
         } else {
             file_set.into_iter().collect()
         };
 
         // Detect collisions with `new_name` before any write. A rename that
-        // silently collides with an existing symbol in a touched file is
-        // indistinguishable in the output from a legitimate merge, and the
-        // resulting source typically won't compile. Require opt-in via
-        // `allow_collision=true`.
-        let allow_collision = params.allow_collision.unwrap_or(false);
+        // silently collides with an existing symbol is indistinguishable in
+        // the output from a legitimate merge, and the resulting source
+        // typically won't compile. Require opt-in via `allow_collision=true`.
+        //
+        // Scope: check the full project index, not just touched files. A
+        // rename from `parse_file` to `Parser` must fail when `Parser`
+        // already exists as a struct anywhere in the codebase, because the
+        // renamed call-sites will start binding to that type.
         if !allow_collision {
             let mut collisions: Vec<String> = Vec::new();
-            for rel_path in &files_to_scan {
-                if let Ok(Some(file_row)) = read::get_file_by_path(&conn, rel_path)
-                    && let Ok(file_syms) = read::get_symbols_for_file(&conn, file_row.id)
-                {
-                    for s in file_syms {
-                        if s.name == params.new_name {
-                            collisions.push(format!(
-                                "  {} ({}) in {} [L{}-L{}]",
-                                s.name, s.kind, rel_path, s.line_start, s.line_end
-                            ));
-                        }
-                    }
-                }
+            let touched_set: std::collections::BTreeSet<&str> =
+                files_to_scan.iter().map(|s| s.as_str()).collect();
+            let index_wide = read::find_symbol_by_name(&conn, &params.new_name).unwrap_or_default();
+            for (s, f) in &index_wide {
+                let in_touched = touched_set.contains(f.path.as_str());
+                collisions.push(format!(
+                    "  {} ({}) in {} [L{}-L{}]{}",
+                    s.name,
+                    s.kind,
+                    f.path,
+                    s.line_start,
+                    s.line_end,
+                    if in_touched { " (touched)" } else { "" },
+                ));
             }
             if !collisions.is_empty() {
                 return Err(format!(
-                    "Refusing to rename '{}' -> '{}': new_name already defined in touched file(s). Pass `allow_collision=true` to proceed anyway.\n{}",
+                    "Refusing to rename '{}' -> '{}': new_name is already defined in the codebase. Pass `allow_collision=true` to proceed anyway.\n{}",
                     params.old_name,
                     params.new_name,
                     collisions.join("\n"),
@@ -386,24 +494,170 @@ impl QartezServer {
             // omitted (reader has the file) - delivers the same actionable
             // info at ~40% fewer tokens than the diff-style output used
             // previously.
-            let mut out = format!(
+            //
+            // MCP transports cap response bytes; common-name renames can
+            // otherwise dump >100 KB of occurrence rows and blow past the
+            // cap, losing the header summary too. Bound the body at a
+            // generous threshold and emit a truncation footer that tells
+            // the caller how to narrow the scope or commit directly.
+            const MAX_PREVIEW_BYTES: usize = 48 * 1024;
+            let header = format!(
                 "{} → {}: {} occ in {} file(s)\n",
                 params.old_name,
                 params.new_name,
                 total_occurrences,
                 files_touched.len(),
             );
+            let mut body = String::new();
             let mut current_file = String::new();
+            let mut emitted_files: HashSet<String> = HashSet::new();
+            let mut emitted_occurrences: usize = 0;
+            let mut truncated = false;
             for (file, line_num, _before, after) in &changes {
+                let trimmed = after.trim();
+                let mut row = String::new();
                 if *file != current_file {
-                    out.push_str(&format!("{file}\n"));
-                    current_file = file.clone();
+                    row.push_str(file);
+                    row.push('\n');
                 }
-                out.push_str(&format!("  L{}: {}\n", line_num, after.trim()));
+                row.push_str(&format!("  L{line_num}: {trimmed}\n"));
+                if header.len() + body.len() + row.len() > MAX_PREVIEW_BYTES {
+                    truncated = true;
+                    break;
+                }
+                body.push_str(&row);
+                if *file != current_file {
+                    current_file = file.clone();
+                    emitted_files.insert(file.clone());
+                }
+                emitted_occurrences += 1;
+            }
+            let mut out = header;
+            out.push_str(&body);
+            if truncated {
+                let remaining_occ = total_occurrences.saturating_sub(emitted_occurrences);
+                let remaining_files = files_touched.len().saturating_sub(emitted_files.len());
+                out.push_str(&format!(
+                    "... {remaining_files} more file(s) / {remaining_occ} more occurrence(s) truncated by preview cap. Pass `file_path` to narrow, or apply=true to execute without preview.\n",
+                ));
             }
             Ok(out)
         }
     }
+}
+
+/// Reject `new_name` values that would never compile in any of the
+/// languages qartez currently supports. Identifier shape is conservative:
+/// every supported language admits `[A-Za-z_][A-Za-z0-9_]*`, so enforcing
+/// that on the Rust side also prevents obvious TS/Python/Go parse errors.
+/// Rust strict / reserved keywords are rejected explicitly so callers do
+/// not rename `parse_file` to `if` and paint themselves into a corner.
+fn validate_new_name(new_name: &str) -> Option<String> {
+    if new_name.is_empty() {
+        return Some("Refusing to rename: `new_name` is empty.".to_string());
+    }
+    // Bare `_` is a pattern placeholder, not a legal symbol name at module
+    // scope. `fn _() {}` emits E0424 at parse time; a rename producing this
+    // silently wedges the caller with a downstream build break.
+    if new_name == "_" {
+        return Some(
+            "Refusing to rename: `new_name` '_' is a reserved placeholder identifier and cannot be used as a function, type, or module-scope name.".to_string(),
+        );
+    }
+    // Raw-identifier support. `r#<keyword>` is Rust-legal syntax that lets
+    // callers reuse reserved words as symbol names (`r#fn`, `r#type`). The
+    // previous shape check treated `#` as illegal and rejected every raw
+    // identifier even though the compiler accepts them; strip the prefix
+    // so the downstream checks run against the identifier core only.
+    let (prefix, core) = if let Some(stripped) = new_name.strip_prefix("r#") {
+        ("r#", stripped)
+    } else {
+        ("", new_name)
+    };
+    if core.is_empty() {
+        return Some(format!(
+            "Refusing to rename: `new_name` '{new_name}' is the bare `r#` raw-identifier prefix without an identifier core.",
+        ));
+    }
+    let first = core.chars().next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Some(format!(
+            "Refusing to rename: `new_name` '{new_name}' is not a valid identifier (must start with an ASCII letter or underscore, optionally preceded by the `r#` raw-identifier prefix).",
+        ));
+    }
+    if !core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Some(format!(
+            "Refusing to rename: `new_name` '{new_name}' contains characters outside [A-Za-z0-9_] (ignoring optional `r#` prefix).",
+        ));
+    }
+    // Reserved-word gate fires ONLY for the non-prefixed form. `r#fn` is
+    // the whole point of the `r#` escape hatch, so allow it through.
+    if prefix.is_empty() && RUST_RESERVED.contains(&new_name) {
+        return Some(format!(
+            "Refusing to rename: `new_name` '{new_name}' is a Rust keyword or reserved word. Pick a different identifier, or prepend `r#` to use a raw identifier.",
+        ));
+    }
+    None
+}
+
+/// Rust keywords (strict + reserved). A rename target that matches any of
+/// these would emit a parse error at the first call site.
+const RUST_RESERVED: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "union",
+];
+
+/// Return the matched name when `candidate` is a name that exists as a
+/// builtin trait method (Iterator, IntoIterator, AsRef, Default, Clone,
+/// From, Into, Deref, Drop, std::fmt::Display, ...) or an inherent method
+/// present on most stdlib containers. A rename that touches one of these
+/// without the caller's explicit consent ends up rewriting every
+/// `.new()` / `.clone()` / `.iter()` site in every importer file, which
+/// is never the user's intent.
+fn is_builtin_method_name(candidate: &str) -> Option<&'static str> {
+    const BUILTIN_METHOD_NAMES: &[&str] = &[
+        "new",
+        "default",
+        "from",
+        "into",
+        "try_from",
+        "try_into",
+        "as_ref",
+        "as_mut",
+        "as_str",
+        "as_slice",
+        "clone",
+        "drop",
+        "deref",
+        "deref_mut",
+        "len",
+        "is_empty",
+        "iter",
+        "iter_mut",
+        "into_iter",
+        "next",
+        "fmt",
+        "hash",
+        "eq",
+        "cmp",
+        "partial_cmp",
+        "to_string",
+        "to_owned",
+        "borrow",
+        "borrow_mut",
+        "unwrap",
+        "expect",
+        "map",
+        "filter",
+        "collect",
+    ];
+    BUILTIN_METHOD_NAMES
+        .iter()
+        .find(|n| **n == candidate)
+        .copied()
 }
 
 /// Count whole-word occurrences of `old` in `line` and, when at least one
@@ -447,7 +701,7 @@ fn scan_line_for_rename(line: &str, old: &str, new: &str) -> Option<(usize, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::scan_line_for_rename;
+    use super::{is_builtin_method_name, scan_line_for_rename, validate_new_name};
 
     #[test]
     fn multi_occurrence_line_returns_single_fully_rewritten_line() {
@@ -473,5 +727,27 @@ mod tests {
     #[test]
     fn empty_needle_returns_none() {
         assert!(scan_line_for_rename("foo bar", "", "qux").is_none());
+    }
+
+    #[test]
+    fn validate_new_name_accepts_ordinary_identifier() {
+        assert!(validate_new_name("parse_file").is_none());
+        assert!(validate_new_name("_private").is_none());
+        assert!(validate_new_name("Parser").is_none());
+    }
+
+    #[test]
+    fn validate_new_name_rejects_digit_leading_and_spaces_and_keywords() {
+        assert!(validate_new_name("123_bad").is_some());
+        assert!(validate_new_name("has space").is_some());
+        assert!(validate_new_name("if").is_some());
+        assert!(validate_new_name("").is_some());
+    }
+
+    #[test]
+    fn builtin_method_name_detection() {
+        assert_eq!(is_builtin_method_name("new"), Some("new"));
+        assert_eq!(is_builtin_method_name("clone"), Some("clone"));
+        assert_eq!(is_builtin_method_name("parse_file"), None);
     }
 }

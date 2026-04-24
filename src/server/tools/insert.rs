@@ -61,6 +61,20 @@ impl QartezServer {
 
 impl QartezServer {
     fn do_insert(&self, params: SoulInsertSymbolParams, pos: InsertPos) -> Result<String, String> {
+        // Reject empty `new_code`. A bare `""` previously produced a
+        // "No changes" success whose only effect on apply was a phantom
+        // blank line. Match the stricter contract in
+        // `qartez_replace_symbol` so insert cannot act as a disguised
+        // no-op.
+        if params.new_code.trim().is_empty() {
+            let pos_label = match pos {
+                InsertPos::Before => "before",
+                InsertPos::After => "after",
+            };
+            return Err(format!(
+                "Empty `new_code` for qartez_insert_{pos_label}_symbol. Supply the source to insert or omit the call.",
+            ));
+        }
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let (sym, source_file) = resolve_unique_symbol(
             &conn,
@@ -69,6 +83,24 @@ impl QartezServer {
             params.file_path.as_deref(),
         )?;
         drop(conn);
+
+        // Parity with qartez_replace_symbol: when the destination is a
+        // Rust file, nudge the caller if `new_code` does not start with a
+        // recognisable item introducer. We only WARN (not refuse) because
+        // inserts can legitimately splice raw expression snippets inside
+        // `#[cfg]` blocks or between existing items. The warning shows in
+        // the preview so mistakes are visible before apply.
+        let target_is_rust_source = source_file.path.ends_with(".rs");
+        let non_rust_shape_warning = if target_is_rust_source
+            && !looks_like_rust_item_shape(&params.new_code)
+        {
+            Some(
+                "WARNING: `new_code` does not start with a Rust item introducer (fn/pub/impl/struct/enum/trait/mod/use/type/const/static/async fn/unsafe fn/macro_rules!/#[attr]/doc-comment). Inserting arbitrary text into a `.rs` file compiles only by accident. Review the preview carefully before apply=true."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
         let abs_path = self.safe_resolve(&source_file.path)?;
         let content = std::fs::read_to_string(&abs_path)
@@ -110,6 +142,10 @@ impl QartezServer {
                 "Preview: insert {pos_label} '{}' ({}) in {} at L{} ({} line(s))\n\n",
                 sym.name, sym.kind, source_file.path, insert_line_1_based, new_code_lines_count,
             );
+            if let Some(ref w) = non_rust_shape_warning {
+                out.push_str(w);
+                out.push_str("\n\n");
+            }
             out.push_str(&format!(
                 "new_code: {} bytes supplied, {} bytes after trailing-newline normalization ({}).\n",
                 supplied_bytes,
@@ -155,13 +191,77 @@ impl QartezServer {
         }
 
         write_atomic(&abs_path, &new_content)?;
-        Ok(format!(
+        let mut ok = format!(
             "Inserted {} line(s) {pos_label} '{}' ({}) in {} at L{}.\n",
             new_code_lines_count,
             sym.name,
             sym.kind,
             source_file.path,
             insert_idx + 1,
-        ))
+        );
+        if let Some(w) = non_rust_shape_warning {
+            ok.push_str(&w);
+            ok.push('\n');
+        }
+        Ok(ok)
     }
+}
+
+/// Best-effort predicate that decides whether `new_code` looks like a Rust
+/// item (function, struct, enum, impl, use, mod, type, const, static,
+/// trait, macro_rules!). Lives next to the insert tools so callers that
+/// accidentally paste shell, markdown, or raw expression snippets into a
+/// `.rs` file get a preview WARNING instead of a silent apply that only
+/// fails at `cargo build` time. Returns `true` when the first meaningful
+/// line (skipping attributes, doc comments, and blank lines) starts with
+/// a known introducer or obvious continuation token; returns `true` on
+/// ambiguous shapes so the warning stays opt-in conservative.
+fn looks_like_rust_item_shape(new_code: &str) -> bool {
+    const INTRODUCERS: &[&str] = &[
+        "fn",
+        "pub",
+        "impl",
+        "struct",
+        "enum",
+        "trait",
+        "mod",
+        "use",
+        "type",
+        "const",
+        "static",
+        "async",
+        "unsafe",
+        "extern",
+        "macro_rules!",
+        "macro",
+        "union",
+    ];
+    for line in new_code.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Attributes and doc comments are legitimate prelude lines.
+        // Advance past them until we find the actual item head.
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        for intro in INTRODUCERS {
+            if let Some(after) = trimmed.strip_prefix(intro) {
+                match after.chars().next() {
+                    None => return true,
+                    Some(c) if !c.is_alphanumeric() && c != '_' => return true,
+                    _ => {}
+                }
+            }
+        }
+        return false;
+    }
+    // All whitespace / comments / attrs: the empty-check above already
+    // rejects pure whitespace, so treat this as ambiguous-yes so the
+    // WARNING does not fire on valid doc-only prelude.
+    true
 }

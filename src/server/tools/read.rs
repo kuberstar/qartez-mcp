@@ -36,11 +36,60 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulReadParams>,
     ) -> Result<String, String> {
-        // 25_000 bytes ≈ 6 KiB of tokens — a comfortable ceiling for two
-        // or three mid-sized functions while still leaving headroom in a
-        // 200k context window. Callers can raise it if they know they
-        // want more.
-        let max_bytes = params.max_bytes.unwrap_or(25_000) as usize;
+        // Reject contradictory requests up front. The schema advertises
+        // `symbol_name` OR `symbols`, not both; silently ignoring one
+        // when the other is set made multi-arg calls impossible to
+        // debug. Empty placeholders on either field are still tolerated
+        // so clients that always pass a default shape stay compatible.
+        let both_set = matches!(&params.symbol_name, Some(s) if !s.is_empty())
+            && matches!(&params.symbols, Some(v) if !v.is_empty());
+        if both_set {
+            return Err(
+                "Pass either `symbol_name` OR `symbols=[...]`, not both. They were both provided; the combination is ambiguous."
+                    .to_string(),
+            );
+        }
+
+        // Reject `max_bytes=0` up front. Every rendered section is at
+        // least one line long, so a zero cap deterministically produces
+        // a "truncated at 0-byte cap" payload that wastes a round trip.
+        // Non-zero caps below the section size simply render fewer
+        // sections, which is a legitimate budget and not a bug.
+        if matches!(params.max_bytes, Some(0)) {
+            return Err(
+                "`max_bytes=0` is not a useful budget (every rendered section is at least a few lines). Pass a positive byte cap, or omit `max_bytes` for the default 25 KiB."
+                    .to_string(),
+            );
+        }
+
+        // Reject `start_line=0` explicitly. Schema documents it as
+        // 1-based; silently coercing 0 to 1 masked off-by-one bugs in
+        // caller scripts so the observed "first line" semantics
+        // depended on whether the caller had read the docstring.
+        if matches!(params.start_line, Some(0)) {
+            return Err(
+                "`start_line` is 1-based. Use 1 for the first line or omit the parameter."
+                    .to_string(),
+            );
+        }
+
+        // Floor explicitly-requested `max_bytes` below 256 up to the
+        // minimum that can render the "Lx-y shown" header plus at
+        // least one content line. Without the floor, `max_bytes=1`
+        // rendered a header and a truncation marker with zero actual
+        // body lines - a payload that read as a pipeline bug. The
+        // caller's "tight budget" intent is preserved via a note.
+        const MIN_USEFUL_MAX_BYTES: usize = 256;
+        let (max_bytes, max_bytes_note) = match params.max_bytes {
+            Some(user_value) if (user_value as usize) < MIN_USEFUL_MAX_BYTES => (
+                MIN_USEFUL_MAX_BYTES,
+                Some(format!(
+                    "// note: max_bytes={user_value} raised to {MIN_USEFUL_MAX_BYTES} (minimum to render one line with header)\n",
+                )),
+            ),
+            Some(v) => (v as usize, None),
+            None => (25_000usize, None),
+        };
         let context_lines = params.context_lines.unwrap_or(0) as usize;
 
         // Raw file-range mode: file_path given without any symbol. Dumps the
@@ -50,13 +99,38 @@ impl QartezServer {
         let no_symbols_requested = params.symbol_name.as_deref().is_none_or(|s| s.is_empty())
             && params.symbols.as_ref().is_none_or(|v| v.is_empty());
         if no_symbols_requested && let Some(ref fp) = params.file_path {
-            return self.read_file_slice(
+            // `limit` is documented as an alternative to `end_line`. Accepting
+            // all three at once lets callers write unresolvable specifications
+            // (e.g. `start=5 end=5 limit=10`). Reject the combination so the
+            // mistake is visible immediately.
+            if params.start_line.is_some() && params.end_line.is_some() && params.limit.is_some() {
+                return Err(
+                    "`limit` is mutually exclusive with `end_line`: pass `start_line + end_line` OR `start_line + limit`, not all three."
+                        .to_string(),
+                );
+            }
+            // Enforce start<=end ordering BEFORE any file-length check so the
+            // error wording is independent of the target file size. Only run
+            // when both are explicit (both > 0); unset/0 values resolve to
+            // defaults inside `read_file_slice`.
+            if let (Some(s), Some(e)) = (params.start_line, params.end_line)
+                && s > 0
+                && e > 0
+                && s > e
+            {
+                return Err(format!("start_line ({s}) > end_line ({e})"));
+            }
+            let mut body = self.read_file_slice(
                 fp,
                 params.start_line,
                 params.end_line,
                 params.limit,
                 max_bytes,
-            );
+            )?;
+            if let Some(note) = max_bytes_note {
+                body.insert_str(0, &note);
+            }
+            return Ok(body);
         }
 
         let queries = parse_symbol_queries(params.symbols, params.symbol_name)?;
@@ -68,7 +142,12 @@ impl QartezServer {
             .as_deref()
             .map(|s| crate::index::to_forward_slash(s.to_string()));
 
-        self.read_symbol_batch(&queries, file_filter.as_deref(), max_bytes, context_lines)
+        let mut body =
+            self.read_symbol_batch(&queries, file_filter.as_deref(), max_bytes, context_lines)?;
+        if let Some(note) = max_bytes_note {
+            body.insert_str(0, &note);
+        }
+        Ok(body)
     }
 
     /// Raw file-range read used when no symbol name is supplied. Returns
@@ -91,12 +170,19 @@ impl QartezServer {
             ));
         }
         let source = std::fs::read_to_string(&abs_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidData
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // Never echo `abs_path` when the file is missing - the
+                // workspace root leaks `/Users/<name>/...` into whatever
+                // client the caller is piping output into.
+                format!(
+                    "{fp} not found in project root. Check the path is relative to the project root and the file exists.",
+                )
+            } else if e.kind() == std::io::ErrorKind::InvalidData
                 || e.to_string().contains("did not contain valid UTF-8")
             {
                 format!("{fp} appears to be binary; qartez_read supports text only")
             } else {
-                format!("Cannot read {}: {e}", abs_path.display())
+                format!("Cannot read {fp}: {e}")
             }
         })?;
         let lines: Vec<&str> = source.lines().collect();
@@ -234,17 +320,35 @@ impl QartezServer {
         let total_symbols: usize = per_query.iter().map(|(_, f)| f.len()).sum();
         let mut out = String::new();
 
-        // Ambiguity warning: when a single query matched definitions in
-        // two or more distinct files and the caller did not pin a
-        // `file_path`, surface every hit up front so the caller knows the
-        // concatenated output spans multiple translation units. We still
-        // return all matches - this is advisory, not an error.
+        // Ambiguity policy.
+        //
+        // 2-4 matching files with no `file_path` filter emit a
+        // warning and return every hit concatenated - common dual-
+        // impl Rust patterns (e.g. `fn new` on `Foo` + `Bar`) stay
+        // convenient.
+        //
+        // >= 5 matching files with no `file_path` filter refuses up
+        // front. At that scale the concatenation burns many thousand
+        // tokens and the refactor tools already require disambiguation
+        // for the same name, so reading should not silently disagree.
+        const MAX_IMPLICIT_AMBIGUOUS_FILES: usize = 4;
         if file_filter.is_none() {
             for (_idx, filtered) in &per_query {
                 let mut seen_files: std::collections::BTreeSet<&str> =
                     std::collections::BTreeSet::new();
                 for (_, file) in filtered.iter() {
                     seen_files.insert(file.path.as_str());
+                }
+                if seen_files.len() > MAX_IMPLICIT_AMBIGUOUS_FILES
+                    && let Some((sym, _)) = filtered.first()
+                {
+                    let joined: Vec<String> = seen_files.iter().map(|s| (*s).to_string()).collect();
+                    return Err(format!(
+                        "Refusing to read '{}': {} distinct files define this name. Pass `file_path=<one-of>` to pick one:\n  {}\nThis matches the refactor-tool policy so `qartez_read` does not silently spray the same name across tiers.",
+                        sym.name,
+                        seen_files.len(),
+                        joined.join("\n  "),
+                    ));
                 }
                 if seen_files.len() >= 2
                     && let Some((sym, _)) = filtered.first()
@@ -289,12 +393,14 @@ impl QartezServer {
         }
 
         if !rendered_any {
-            // Tailor the message to the request arity: single-name
-            // lookups read naturally as `No symbol found with name
-            // 'Foo'`, while multi-name batches keep the `name(s)
-            // [a, b, c]` array form. This avoids the awkward
-            // `[NoSuchSymbol]` bracket-wrap for the common single
-            // lookup without losing the list form when it matters.
+            // Single-name lookups keep the hard error so callers see a
+            // clean `Err` instead of an empty payload; the query is a
+            // point lookup and a 0-hit result is unambiguous. Batch
+            // lookups (`symbols=[...]`) are lenient: partial-hit batches
+            // already emit a `(N not found: ...)` notice, so total-miss
+            // batches follow the same shape instead of flipping to Err.
+            // This makes `symbols=[missing]` and `symbols=[A, missing]`
+            // behave the same from a scripting caller's point of view.
             if queries.len() == 1 {
                 let name = &queries[0];
                 if let Some(fp) = file_filter {
@@ -303,12 +409,18 @@ impl QartezServer {
                 return Err(format!("No symbol found with name '{name}'"));
             }
             let joined = queries.join(", ");
-            if let Some(fp) = file_filter {
-                return Err(format!(
-                    "No symbols [{joined}] found in file matching '{fp}'"
-                ));
-            }
-            return Err(format!("No symbol found with name(s) [{joined}]"));
+            let header = if let Some(fp) = file_filter {
+                format!("No symbols [{joined}] found in file matching '{fp}'\n")
+            } else {
+                format!("No symbol found with name(s) [{joined}]\n")
+            };
+            let mut out = header;
+            out.push_str(&format!(
+                "// ({} not found: {})\n",
+                missing.len(),
+                missing.join(", ")
+            ));
+            return Ok(out);
         }
 
         if !missing.is_empty() {
@@ -348,7 +460,15 @@ impl QartezServer {
             ));
         }
         let source = std::fs::read_to_string(&abs_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidData
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // Same rule as `read_file_slice`: never leak the
+                // absolute workspace path when the file disappeared
+                // between index time and read time.
+                format!(
+                    "{} not found in project root. Check the path is relative to the project root and the file exists.",
+                    file.path
+                )
+            } else if e.kind() == std::io::ErrorKind::InvalidData
                 || e.to_string().contains("did not contain valid UTF-8")
             {
                 format!(
@@ -356,7 +476,7 @@ impl QartezServer {
                     file.path
                 )
             } else {
-                format!("Cannot read {}: {e}", abs_path.display())
+                format!("Cannot read {}: {e}", file.path)
             }
         })?;
 

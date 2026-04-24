@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_semantic",
-        description = "Natural language code search. Finds symbols by meaning rather than exact keywords (e.g. 'authentication handler', 'database retry logic'). Combines vector similarity with keyword search via hybrid ranking. Requires `qartez-setup` to download the embedding model first.",
+        description = "Natural language code search. Finds symbols by meaning rather than exact keywords (e.g. 'authentication handler', 'database retry logic'). Combines vector similarity with keyword search via hybrid ranking. Two prerequisites: (1) the qartez binary must be built with `--features semantic` (`cargo install qartez-mcp --features semantic`); a binary without that feature returns the rebuild command as an error. (2) Once built, run `qartez-setup` once to download the embedding model; a missing model errors with the run command.",
         annotations(
             title = "Semantic Search",
             read_only_hint = true,
@@ -138,8 +138,13 @@ fn qartez_semantic_dispatch(
     _server: &QartezServer,
     _params: SemanticParams,
 ) -> Result<String, String> {
+    // Two-step failure message so the caller knows which prerequisite
+    // is missing. qartez_tools lists this tool as `[x] enabled` in the
+    // tier index (the `#[tool]` attribute unconditionally registers
+    // it), so the only signal a caller receives that the current
+    // binary cannot actually run semantic search is this error.
     Err(
-        "Semantic search requires the `semantic` feature. Rebuild with: cargo install qartez-mcp --features semantic"
+        "Semantic search is not available in this build. Rebuild with:\n  cargo install qartez-mcp --features semantic\nAfter rebuilding, run `qartez-setup` once to download the embedding model."
             .to_string(),
     )
 }

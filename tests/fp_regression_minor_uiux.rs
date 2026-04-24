@@ -309,7 +309,7 @@ fn smells_rejects_unknown_kind() {
         .call_tool_by_name("qartez_smells", json!({ "kind": "bogus_kind" }))
         .expect_err("unknown kind must error");
     assert!(
-        err.contains("unknown smell kind 'bogus_kind'"),
+        err.contains("no known smell kinds") && err.contains("bogus_kind"),
         "must name the bad value, got: {err}"
     );
     assert!(
@@ -393,24 +393,28 @@ fn health_rejects_negative_max_health() {
         .call_tool_by_name("qartez_health", json!({ "max_health": -5.0 }))
         .expect_err("negative max_health must error");
     assert!(
-        err.contains("max_health must be >= 0.0"),
-        "must return validation error, got: {err}"
+        err.contains("max_health") && err.contains("range") && err.contains("10"),
+        "must return a validation error describing the 0..=10 range, got: {err}"
     );
 }
 
 #[test]
 fn health_clamps_max_health_above_ten() {
+    // Unified range policy: max_health above 10 is a caller typo (e.g.
+    // 999 instead of 9) and is now rejected rather than clamped, so
+    // the mistake is surfaced at the call site instead of being masked
+    // by identity output with max_health=10.
     let dir = TempDir::new().unwrap();
     let server = build_and_index(dir.path(), &[("src/a.rs", "fn a() {}\n")]);
-    let at_ten = server
+    server
         .call_tool_by_name("qartez_health", json!({ "max_health": 10.0 }))
-        .expect("max_health=10 must succeed");
-    let above_ten = server
+        .expect("max_health=10 must succeed (inclusive upper bound)");
+    let err = server
         .call_tool_by_name("qartez_health", json!({ "max_health": 999.0 }))
-        .expect("max_health>10 must clamp, not error");
-    assert_eq!(
-        at_ten, above_ten,
-        "values above 10 must produce identical output to 10.0"
+        .expect_err("max_health>10 must now be rejected");
+    assert!(
+        err.contains("max_health") && err.contains("range") && err.contains("10"),
+        "rejection must describe the valid range, got: {err}"
     );
 }
 
@@ -420,29 +424,17 @@ fn health_clamps_max_health_above_ten() {
 
 #[test]
 fn unused_limit_zero_returns_all_rows() {
-    // Seed two indisputably-dead exports so the result set has > 1 row.
+    // Unified rejection contract (matches clones / trend). `limit=0` is a
+    // caller mistake, not a no-cap shortcut. The canonical message names
+    // the contract explicitly so callers fix the argument.
     let dir = TempDir::new().unwrap();
-    fs::create_dir_all(dir.path().join(".git")).unwrap();
-    let cargo =
-        "[package]\nname=\"u\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[lib]\npath=\"src/dead.rs\"\n";
-    let dead = r#"pub fn dead_one() -> u32 { 1 }
-pub fn dead_two() -> u32 { 2 }
-"#;
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    fs::write(dir.path().join("src/dead.rs"), dead).unwrap();
-    fs::write(dir.path().join("Cargo.toml"), cargo).unwrap();
-    let conn = setup_db();
-    index::full_index(&conn, dir.path(), false).unwrap();
-    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
-
-    let out = server
+    let server = build_and_index(dir.path(), &[("src/a.rs", "pub fn x() {}\n")]);
+    let err = server
         .call_tool_by_name("qartez_unused", json!({ "limit": 0 }))
-        .expect("qartez_unused limit=0 must succeed");
-    // Both names must be in the output. The off-by-one bug truncated to
-    // a single row when `limit=0` was coerced to `1`.
+        .expect_err("qartez_unused limit=0 must now be rejected");
     assert!(
-        out.contains("dead_one") && out.contains("dead_two"),
-        "limit=0 must list every unused export, got: {out}"
+        err.contains("limit must be > 0") && err.contains("no-cap"),
+        "rejection must describe the zero-limit contract, got: {err}"
     );
 }
 

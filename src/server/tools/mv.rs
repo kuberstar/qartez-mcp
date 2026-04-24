@@ -39,6 +39,27 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulMoveParams>,
     ) -> Result<String, String> {
+        // Module-root and crate-root basenames get the same refusal
+        // that `qartez_rename_file` applies. Moving a symbol into
+        // `mod.rs` / `lib.rs` / `main.rs` silently mutates the
+        // module/crate entry point in ways the caller almost never
+        // intends; surface the explicit error before any DB work.
+        validate_move_target_basename(&params.to_file)?;
+
+        // Builtin-method names (new, default, from, clone, ...) resolve
+        // by name across every type - extracting a `new` into a different
+        // file breaks every unrelated `Type::new()` call site because
+        // method dispatch is name-based, not type-based. Unlike the
+        // rename guard there is no `allow_collision` escape here: moving
+        // such a symbol is categorically unsafe. Callers must rename it
+        // first or delete it via `qartez_safe_delete`.
+        if let Some(name) = is_builtin_method_name(&params.symbol) {
+            return Err(format!(
+                "Refusing to move '{name}' ({kind}): '{name}' is a builtin-method name. Moving it risks breaking unrelated callers that reference a same-named method on a different type. Pass a new name via qartez_rename first, or use qartez_safe_delete if you want to remove it.",
+                kind = params.kind.as_deref().unwrap_or("symbol"),
+            ));
+        }
+
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let (sym, source_file) = validate_source(
             &conn,
@@ -48,14 +69,50 @@ impl QartezServer {
             &params.to_file,
         )?;
 
+        // Cross-language moves are never correct: a Rust symbol pasted
+        // into a `.ts` file would compile-fail on both sides of the
+        // move. Reject when the target extension differs from the
+        // source, and reject unknown extensions outright so the caller
+        // cannot silently retarget assets, docs, or config files.
+        validate_move_target_extension(&source_file.path, &params.to_file)?;
+
+        let normalized_to = crate::index::to_forward_slash(params.to_file.clone());
+        if normalized_to == source_file.path {
+            return Err(format!(
+                "Refusing to move '{}' ({}): `to_file` equals the source file '{}'. A self-move would double-insert or lose the symbol body on apply.",
+                sym.name, sym.kind, source_file.path,
+            ));
+        }
+
         let source_abs = self.safe_resolve(&source_file.path)?;
         let target_abs = self.safe_resolve(&params.to_file)?;
+
+        if !target_abs.exists()
+            && let Some(parent) = target_abs.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            return Err(format!(
+                "Refusing to move '{}' ({}): parent directory for `to_file` '{}' does not exist. Create it first or pick an existing directory.",
+                sym.name, sym.kind, params.to_file,
+            ));
+        }
 
         let source_content = std::fs::read_to_string(&source_abs)
             .map_err(|e| format!("Cannot read {}: {e}", source_abs.display()))?;
         let (extracted_code, lines) = extract_lines(&source_content, &sym, &source_file.path)?;
         let start_idx = (sym.line_start as usize).saturating_sub(1);
         let end_idx = (sym.line_end as usize).min(lines.len());
+
+        // Count identifier occurrences of `sym.name` that live in the
+        // source file but OUTSIDE the extract range. A non-zero count
+        // means the move would leave same-file callers (commonly
+        // `#[cfg(test)] mod tests { ... }`) pointing at a symbol that
+        // no longer lives in this file. We surface this both in the
+        // preview (as a WARNING) and as a hard refusal on apply,
+        // because no `force` param is wired through the tool schema.
+        let dangling_self_refs =
+            count_same_file_refs_outside_range(&lines, start_idx, end_idx, &sym.name);
 
         let importer_files = gather_importers(&conn, source_file.id, &sym)?;
 
@@ -69,6 +126,14 @@ impl QartezServer {
                 start_idx,
                 end_idx,
                 &importer_files,
+                dangling_self_refs,
+            ));
+        }
+
+        if dangling_self_refs > 0 {
+            return Err(format!(
+                "Refusing to move '{}' ({}): {} same-file reference(s) to '{}' outside the extract range will be left dangling after move. Use qartez_rename or qartez_safe_delete first, or re-point them before moving. Re-run with apply=false to inspect the preview.",
+                sym.name, sym.kind, dangling_self_refs, sym.name,
             ));
         }
 
@@ -239,22 +304,19 @@ fn validate_source(
 
     let (sym, source_file) = results.remove(0);
 
+    // Destination-collision guard: when the target file already defines
+    // anything (any kind) with the same name, refuse. Same-name items
+    // in one file are the usual Rust name-resolution ambiguity (shadowed
+    // impl methods, conflicting `fn` vs. `const`, etc.) that the move
+    // would silently create. Caller must rename one side first.
     if source_file.path != to_file
         && let Ok(Some(target_file)) = read::get_file_by_path(conn, to_file)
         && let Ok(target_syms) = read::get_symbols_for_file(conn, target_file.id)
-        && let Some(conflict) = target_syms
-            .iter()
-            .find(|s| s.name == sym.name && s.kind == sym.kind)
+        && target_syms.iter().any(|s| s.name == sym.name)
     {
         return Err(format!(
-            "Cannot move '{}' ({}): destination '{}' already defines a {} '{}' at L{}-L{}. Refusing to overwrite.",
-            sym.name,
-            sym.kind,
-            to_file,
-            conflict.kind,
-            conflict.name,
-            conflict.line_start,
-            conflict.line_end,
+            "Refusing to move '{}' ({}): target file '{}' already defines a symbol with that name. Rename either side first.",
+            sym.name, sym.kind, to_file,
         ));
     }
 
@@ -336,12 +398,31 @@ fn gather_importers(
         }
     }
 
+    // Trait-impl awareness: moving a trait relocates the canonical
+    // `use` path every `impl OldTrait for X` file depends on.
+    // `symbol_refs` records name-resolved usages only and misses
+    // implementor files whose `use` line comes from a prelude re-export
+    // or a sibling-module shortcut. `type_hierarchy` is the
+    // authoritative map of those sites; pull every subtype's file into
+    // the importer set so `rewrite_importers` can rewrite the `use`
+    // path along with the ordinary name-import sites.
+    if sym.kind.eq_ignore_ascii_case("trait") || sym.kind.eq_ignore_ascii_case("interface") {
+        let subtypes = read::get_subtypes(conn, &sym.name).map_err(|e| format!("DB error: {e}"))?;
+        for (_rel, file) in subtypes {
+            if file.id == source_file_id {
+                continue;
+            }
+            seen.entry(file.path).or_insert(None);
+        }
+    }
+
     Ok(seen.into_iter().collect())
 }
 
 /// Format the dry-run report shown when `apply=false`. Includes a 500-byte
 /// (char-boundary-safe) preview of the extracted code plus the list of
 /// importers that the apply pass would rewrite.
+#[allow(clippy::too_many_arguments)]
 fn format_move_preview(
     sym: &crate::storage::models::SymbolRow,
     source_path: &str,
@@ -350,11 +431,20 @@ fn format_move_preview(
     start_idx: usize,
     end_idx: usize,
     importer_files: &[(String, Option<String>)],
+    dangling_self_refs: usize,
 ) -> String {
     let mut out = format!(
         "Preview: move '{}' ({}) from {} to {}\n\n",
         sym.name, sym.kind, source_path, to_file,
     );
+
+    if dangling_self_refs > 0 {
+        out.push_str(&format!(
+            "WARNING: {dangling} same-file reference(s) to '{name}' outside the extract range will be left dangling after move. Use qartez_rename or qartez_safe_delete first, or re-point them before moving.\n\n",
+            dangling = dangling_self_refs,
+            name = sym.name,
+        ));
+    }
 
     out.push_str(&format!(
         "Code to extract (L{}-L{}, {} lines):\n",
@@ -375,13 +465,40 @@ fn format_move_preview(
     if importer_files.is_empty() {
         out.push_str("No files import this symbol.\n");
     } else {
+        // Compute the future import stem pairs once. The apply path uses
+        // the exact same `rename_stem_pairs` output to rewrite importers,
+        // so the preview now shows what the caller will actually see
+        // post-apply instead of "(unspecified)" for every symbol-refs
+        // importer (which never has a `use` specifier to display).
+        let old_stem = path_to_import_stem(source_path);
+        let new_stem = path_to_import_stem(to_file);
+        let stem_pairs = rename_stem_pairs(&old_stem, &new_stem);
+        let primary_pair = stem_pairs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| (old_stem.clone(), new_stem.clone()));
+
         out.push_str(&format!(
             "Files that import this symbol ({}):\n",
             importer_files.len()
         ));
         for (path, spec) in importer_files {
-            let spec_str = spec.as_deref().unwrap_or("(unspecified)");
-            out.push_str(&format!("  {path} — via '{spec_str}'\n"));
+            match spec.as_deref() {
+                Some(s) if !s.is_empty() => {
+                    out.push_str(&format!("  {path} - via '{s}'\n"));
+                }
+                _ => {
+                    // No `use` specifier in the index (the importer
+                    // reached the symbol through a non-import edge such
+                    // as a re-export chain or a qualified parent-module
+                    // call). Show the deterministic rewrite pair so the
+                    // caller knows which `::` path will flip on apply.
+                    out.push_str(&format!(
+                        "  {path} - symbol-ref (will rewrite '{}' -> '{}')\n",
+                        primary_pair.0, primary_pair.1,
+                    ));
+                }
+            }
         }
         out.push_str(
             "\nImport paths in these files will be updated to point to the new location.\n",
@@ -460,4 +577,211 @@ fn apply_move_writes(
     refactor_common::write_atomic(source_abs, &source_final)?;
 
     Ok(())
+}
+
+/// Reject move destinations whose basename is a Rust module root
+/// (`mod.rs`) or crate entry (`lib.rs` / `main.rs`). These names are
+/// load-bearing for the build system; silently dropping a symbol into
+/// one of them mutates module resolution or Cargo bin/lib registration.
+/// `qartez_rename_file` applies the symmetric guard on its `to` arg.
+fn validate_move_target_basename(to_file: &str) -> Result<(), String> {
+    let norm = crate::index::to_forward_slash(to_file.to_string());
+    let basename = std::path::Path::new(&norm)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    match basename {
+        "mod.rs" => Err(format!(
+            "Refusing to move into '{to_file}': 'mod.rs' is a Rust module root. Pick a sibling file or create a new one instead.",
+        )),
+        "lib.rs" | "main.rs" => Err(format!(
+            "Refusing to move into '{to_file}': '{basename}' is a Rust crate entry point registered in Cargo.toml. Pick a module file instead.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Reject cross-language moves and unknown-extension targets. A move
+/// mixes source and target file contents, so the extensions must agree
+/// on the language being written. The recognised set mirrors the
+/// languages the indexer parses (`rs`, `ts`, `tsx`, `js`, `jsx`, `py`,
+/// `go`, `java`, `rb`). Anything else is either a binary/asset or a
+/// config file that should never receive a symbol body.
+fn validate_move_target_extension(source_path: &str, to_file: &str) -> Result<(), String> {
+    const KNOWN: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyi", "go", "java", "kt", "kts", "rb",
+        "swift", "scala",
+    ];
+    let to_norm = crate::index::to_forward_slash(to_file.to_string());
+    let to_ext = std::path::Path::new(&to_norm)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let src_ext = std::path::Path::new(source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let Some(to_ext) = to_ext else {
+        return Err(format!(
+            "Refusing to move into '{to_file}': target has no file extension. Supply a source file path (e.g. `.rs`, `.ts`, `.py`).",
+        ));
+    };
+    if !KNOWN.contains(&to_ext.as_str()) {
+        return Err(format!(
+            "Refusing to move into '{to_file}': unsupported target extension '.{to_ext}'. Known extensions: {}.",
+            KNOWN.join(", "),
+        ));
+    }
+    if let Some(src) = src_ext
+        && src != to_ext
+    {
+        return Err(format!(
+            "Refusing to move into '{to_file}': source extension '.{src}' does not match target extension '.{to_ext}'. Cross-language moves are not supported.",
+        ));
+    }
+    Ok(())
+}
+
+/// Return `Some(name)` when `candidate` matches a Rust builtin trait /
+/// inherent method name. Moving such a symbol by name is unsafe because
+/// method dispatch does not carry receiver-type information into the
+/// index: every `.new()` / `.clone()` / `.len()` call site resolves by
+/// name, so relocating the definition silently breaks unrelated callers.
+/// This mirrors `rename.rs::is_builtin_method_name` but is duplicated
+/// here so both guards can evolve independently.
+fn is_builtin_method_name(candidate: &str) -> Option<&'static str> {
+    const BUILTIN_METHOD_NAMES: &[&str] = &[
+        "new",
+        "default",
+        "from",
+        "into",
+        "as_ref",
+        "as_mut",
+        "clone",
+        "drop",
+        "deref",
+        "fmt",
+        "len",
+        "is_empty",
+        "iter",
+        "next",
+        "hash",
+        "eq",
+        "cmp",
+        "partial_cmp",
+        "push",
+        "pop",
+        "insert",
+        "remove",
+        "get",
+        "contains",
+    ];
+    BUILTIN_METHOD_NAMES
+        .iter()
+        .find(|n| **n == candidate)
+        .copied()
+}
+
+/// Count identifier occurrences of `needle` in `lines` that fall OUTSIDE
+/// the line range `[start_idx..end_idx]`. Uses a word-boundary character
+/// classifier so a reference to `foo_bar` is not counted as a hit for
+/// `foo`. The scan is intentionally permissive: it does not try to
+/// distinguish comments from code, because a stale doc link to a moved
+/// symbol is still a real caller-visible regression.
+fn count_same_file_refs_outside_range(
+    lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    needle: &str,
+) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if i >= start_idx && i < end_idx {
+            continue;
+        }
+        count += count_identifier_hits(line, needle);
+    }
+    count
+}
+
+/// Count whole-identifier matches of `needle` in `haystack`. A match
+/// requires the surrounding chars (or the string ends) to be non-word
+/// so `foo` does not match inside `foo_bar` or `barfoo`.
+fn count_identifier_hits(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let bytes = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let mut i = 0usize;
+    let mut hits = 0usize;
+    while i + n.len() <= bytes.len() {
+        if &bytes[i..i + n.len()] == n {
+            let before_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+            let after_ok = i + n.len() == bytes.len() || !is_word_byte(bytes[i + n.len()]);
+            if before_ok && after_ok {
+                hits += 1;
+                i += n.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    hits
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[cfg(test)]
+mod move_validation_tests {
+    use super::{
+        count_same_file_refs_outside_range, is_builtin_method_name, validate_move_target_basename,
+        validate_move_target_extension,
+    };
+
+    #[test]
+    fn rejects_mod_and_crate_roots() {
+        assert!(validate_move_target_basename("src/mod.rs").is_err());
+        assert!(validate_move_target_basename("src/lib.rs").is_err());
+        assert!(validate_move_target_basename("src/main.rs").is_err());
+        assert!(validate_move_target_basename("src/a.rs").is_ok());
+    }
+
+    #[test]
+    fn rejects_cross_language_and_unknown_extensions() {
+        assert!(validate_move_target_extension("src/a.rs", "src/b.ts").is_err());
+        assert!(validate_move_target_extension("src/a.rs", "src/b.md").is_err());
+        assert!(validate_move_target_extension("src/a.rs", "src/b").is_err());
+        assert!(validate_move_target_extension("src/a.rs", "src/b.rs").is_ok());
+        assert!(validate_move_target_extension("src/a.ts", "src/b.ts").is_ok());
+    }
+
+    #[test]
+    fn builtin_method_names_detected() {
+        assert_eq!(is_builtin_method_name("new"), Some("new"));
+        assert_eq!(is_builtin_method_name("clone"), Some("clone"));
+        assert_eq!(is_builtin_method_name("len"), Some("len"));
+        assert_eq!(is_builtin_method_name("my_fn"), None);
+    }
+
+    #[test]
+    fn same_file_refs_count_only_outside_range() {
+        let lines: Vec<&str> = vec![
+            "fn foo() {}",        // 0: definition
+            "fn bar() { foo() }", // 1: outside caller
+            "// foo mentioned",   // 2: comment mention (still a hit)
+            "fn foo_bar() {}",    // 3: different identifier, no hit
+        ];
+        // Range = [0..1) means only line 0 is the extract; lines 1-3
+        // are outside and we expect 2 real hits on "foo".
+        assert_eq!(count_same_file_refs_outside_range(&lines, 0, 1, "foo"), 2);
+        // When the whole file is the range, there should be zero hits
+        // outside.
+        assert_eq!(count_same_file_refs_outside_range(&lines, 0, 4, "foo"), 0);
+    }
 }

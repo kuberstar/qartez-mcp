@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData};
@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_health",
-        description = "Prioritized, actionable health report that cross-references qartez_hotspots (complexity x coupling x churn) with qartez_smells (god functions, long parameter lists, feature envy). Files that score badly in both signals are surfaced first as 'critical' with a concrete suggested refactor technique. Use `qartez_refactor_plan file_path=<X>` to expand a recommendation into a step-by-step plan.",
+        description = "Prioritized, actionable health report that cross-references qartez_hotspots (complexity x coupling x churn) with qartez_smells (god functions, long parameter lists, feature envy). Files that score badly in both signals are surfaced first as 'critical' with a concrete suggested refactor technique. Use `qartez_refactor_plan file_path=<X>` to expand a recommendation into a step-by-step plan. Filter semantics: `max_health` is the upper bound on the 0-10 health scale (default 5.0); only files with score <= max_health that ALSO match a hotspot OR smell heuristic are listed. `max_health=10` therefore means \"include every file with at least one of max_cc > 0 or a named smell\", not \"every indexed file\". Pass `limit=0` to remove the row cap; the default is 15.",
         annotations(
             title = "Codebase Health Report",
             read_only_hint = true,
@@ -46,22 +46,35 @@ impl QartezServer {
             Some(0) => usize::MAX,
             Some(n) => n as usize,
         };
-        // Negative max_health is rejected outright: silently clamping a
-        // negative to 0 produced the "Avg health 10.0/10" stub on empty
-        // results, which read like success. Values above 10 clamp to 10
-        // for deterministic output (a 0-to-10 health scale cannot exceed
-        // 10, and callers using "999" as an "unbounded ceiling" idiom
-        // expect the same report as max_health=10).
+        // Reject max_health outside [0.0, 10.0] outright. The scale is
+        // a 0-to-10 health score, so values above 10 are meaningless -
+        // previously the tool silently clamped them to 10, which hid
+        // typos (`100` vs `10`) behind an identical response. Negative
+        // values never match any row and used to surface the "Avg
+        // health 10.0/10" stub, which read like success.
         if let Some(m) = params.max_health
-            && m < 0.0
+            && (!m.is_finite() || !(0.0..=10.0).contains(&m))
         {
             return Err(format!(
-                "max_health must be >= 0.0, got {m}. Use a value in [0.0, 10.0]."
+                "max_health must be in range 0..=10 (got {m}). Use a value in [0.0, 10.0]."
             ));
         }
-        let max_health = params.max_health.unwrap_or(5.0).min(10.0);
+        let max_health = params.max_health.unwrap_or(5.0);
+        // `min_complexity=0` labelled every CC=1 helper as a
+        // `god_function`, which is nonsense: the "god function"
+        // heuristic describes a function whose branch count alone
+        // makes it hard to understand. Reject 0 outright with a
+        // clear message instead of silently producing a wall of
+        // false positives. Wording mirrors `qartez_clones` /
+        // `qartez_smells` which already reject the same value so
+        // callers see a consistent remediation hint across tools.
+        if let Some(0) = params.min_complexity {
+            return Err(
+                "min_complexity must be >= 1 (0 matches every function). Use the default or a positive integer.".into(),
+            );
+        }
         let min_cc_explicit = params.min_complexity;
-        let min_cc = params.min_complexity.unwrap_or(15);
+        let min_cc = params.min_complexity.unwrap_or(15).max(1);
         let min_lines = params.min_lines.unwrap_or(50);
         let min_params = params.min_params.unwrap_or(5) as usize;
 
@@ -166,8 +179,49 @@ impl QartezServer {
             )
         });
         let total = rows.len();
-        if limit != usize::MAX {
-            rows.truncate(limit);
+        // Per-severity cap, NOT a whole-list truncate. Before, the
+        // list was sorted Critical -> High -> Medium and then sliced
+        // at `limit`, which dropped entire severity buckets whenever
+        // Critical alone met the cap. Callers then saw "max_health=10
+        // limit=5 -> 5 files" while "max_health=10 limit=0 -> 6 files"
+        // even though the two queries should differ only in whether
+        // the display is paginated. Applying `limit` per severity
+        // bucket keeps at least one row from each bucket in view and
+        // makes the "critical-first, then high, then medium" ordering
+        // visible on small caps. Round-robin across buckets so the
+        // cap divides evenly even when Critical dominates.
+        if limit != usize::MAX && limit < rows.len() {
+            let mut buckets: [VecDeque<FileHealthRow>; 3] =
+                [VecDeque::new(), VecDeque::new(), VecDeque::new()];
+            for r in rows.drain(..) {
+                let slot = r.severity.rank() as usize;
+                buckets[slot].push_back(r);
+            }
+            let mut kept: Vec<FileHealthRow> = Vec::with_capacity(limit);
+            'fill: loop {
+                let before = kept.len();
+                for bucket in buckets.iter_mut() {
+                    if let Some(row) = bucket.pop_front() {
+                        kept.push(row);
+                        if kept.len() >= limit {
+                            break 'fill;
+                        }
+                    }
+                }
+                if kept.len() == before {
+                    break;
+                }
+            }
+            // Re-sort into canonical severity+health order so the
+            // per-severity sections below render in sorted order.
+            kept.sort_by(|a, b| {
+                a.severity.rank().cmp(&b.severity.rank()).then(
+                    a.health
+                        .partial_cmp(&b.health)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+            rows = kept;
         }
 
         let avg_health = if rows.is_empty() {

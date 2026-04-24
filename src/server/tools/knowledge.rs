@@ -98,9 +98,21 @@ impl QartezServer {
             });
             if !any_match {
                 let roster = top_authors(&full_authorships, 5);
-                return Ok(format!(
+                // Surface the full author count so the caller knows
+                // whether the five-name roster is the complete list
+                // or a truncated preview. Without this, the message
+                // looked paginated-but-unbounded and a broader
+                // substring felt like a shot in the dark.
+                let total_authors = distinct_author_count(&full_authorships);
+                let mut msg = format!(
                     "No files touched by author matching '{author_query}'. Available authors: {roster}.",
-                ));
+                );
+                if total_authors > 5 {
+                    msg.push_str(&format!(
+                        "\n// showing 5 of {total_authors} authors. Use a broader substring to match more."
+                    ));
+                }
+                return Ok(msg);
             }
             full_authorships.retain(|f| {
                 f.authors
@@ -141,13 +153,13 @@ impl QartezServer {
                     }
                     Ok(out)
                 } else {
-                    let total_analyzed = file_paths.len();
+                    let total_scanned = file_paths.len();
                     let single_author_count = files.iter().filter(|f| f.bus_factor == 1).count();
                     let mut out = format!(
                         "# Knowledge / Bus Factor (file level)\n\n\
-                         Analyzed {} files. Showing top {} by risk (lowest bus factor first).\n\
-                         Single-author files in view: {}\n\n",
-                        total_analyzed,
+                         Scanned {} indexed file(s). Showing top {} by risk (lowest bus factor first).\n\
+                         Bus-factor=1 files in view: {}\n\n",
+                        total_scanned,
                         files.len(),
                         single_author_count,
                     );
@@ -163,12 +175,7 @@ impl QartezServer {
                             .iter()
                             .take(3)
                             .map(|(name, lines)| {
-                                let pct = if f.total_lines > 0 {
-                                    *lines as f64 / f.total_lines as f64 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                format!("{name} ({pct:.0}%)")
+                                format!("{name} ({})", format_contrib_pct(*lines, f.total_lines))
                             })
                             .collect();
                         out.push_str(&format!(
@@ -221,12 +228,7 @@ impl QartezServer {
                             .iter()
                             .take(3)
                             .map(|(name, lines)| {
-                                let pct = if m.total_lines > 0 {
-                                    *lines as f64 / m.total_lines as f64 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                format!("{name} ({pct:.0}%)")
+                                format!("{name} ({})", format_contrib_pct(*lines, m.total_lines))
                             })
                             .collect();
                         out.push_str(&format!(
@@ -245,6 +247,38 @@ impl QartezServer {
             }
         }
     }
+}
+
+/// Count distinct author names across every file in `authorships`.
+/// Needed by the "author not found" error path to tell the caller
+/// whether the five-name roster is the full list or a truncated
+/// preview, so they know whether a broader substring can find more.
+fn distinct_author_count(authorships: &[crate::git::knowledge::FileAuthorship]) -> usize {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for f in authorships {
+        for (name, _) in &f.authors {
+            seen.insert(name.as_str());
+        }
+    }
+    seen.len()
+}
+
+/// Render an author's share as a percent with `<1%` for non-zero
+/// contributions that round below one percent. Dropping non-zero
+/// line counts to a bare `0%` used to mask real-but-small
+/// contributors: a developer who touched 3 of 6000 module lines
+/// rendered as `Alice (0%)`, identical to "no blame", which hid the
+/// fact the author was on record. The `<1%` notation preserves the
+/// non-zero signal without widening the display column.
+fn format_contrib_pct(lines: u32, total_lines: u32) -> String {
+    if total_lines == 0 {
+        return "0%".to_string();
+    }
+    let pct = lines as f64 / total_lines as f64 * 100.0;
+    if lines > 0 && pct < 0.5 {
+        return "<1%".to_string();
+    }
+    format!("{pct:.0}%")
 }
 
 /// Sum per-author line counts across every file in `authorships` and

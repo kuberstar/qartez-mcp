@@ -36,12 +36,25 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulHotspotsParams>,
     ) -> Result<String, String> {
+        reject_mermaid(&params.format, "qartez_hotspots")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let limit = params.limit.unwrap_or(20) as usize;
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(HotspotLevel::File);
         let sort_by = params.sort_by.unwrap_or_default();
+        // `threshold=0` would require `health <= 0`, but the health
+        // formula (`10 / (1 + x)`) is strictly positive, so zero
+        // excludes every row. The previous build quietly clamped to
+        // 1.0 which hid the misunderstanding behind surprising output.
+        // Reject up front with an explanation of the value range so
+        // callers see why their filter is empty.
+        if let Some(0) = params.threshold {
+            return Err(
+                "threshold=0 excludes every file (only files with health score <= 0 would match, and health is always >= 0). Use threshold=10 to see all files, or the default for unhealthy-only view.".to_string(),
+            );
+        }
         let threshold = params.threshold.map(|t| t.min(10) as f64);
+        let threshold_notice: &str = "";
 
         // Health score per factor: 10 / (1 + value / halflife).
         // The halflife is the value at which the factor score drops to 5.0.
@@ -109,10 +122,33 @@ impl QartezServer {
                 scored.truncate(limit);
 
                 if scored.is_empty() {
-                    return Ok("No hotspots found. Re-index with git history (--git-depth > 0) and imperative language files for complexity data.".to_string());
+                    let mut msg = String::new();
+                    msg.push_str(threshold_notice);
+                    msg.push_str("No hotspots found. Re-index with git history (--git-depth > 0) and imperative language files for complexity data.");
+                    return Ok(msg);
                 }
 
                 let mut out = String::new();
+                out.push_str(threshold_notice);
+                // When the caller overrides the default composite sort
+                // with `sort_by=complexity` (or another axis), the table
+                // still shows the composite Score column. Annotate the
+                // header so the reader understands the ordering does
+                // not come from the Score column they see. Without the
+                // note, the ranking looked arbitrary because the top
+                // rows weren't highest by Score.
+                if !matches!(sort_by, HotspotSortBy::Score) {
+                    let axis = match sort_by {
+                        HotspotSortBy::Score => "score",
+                        HotspotSortBy::Health => "health",
+                        HotspotSortBy::Complexity => "complexity",
+                        HotspotSortBy::Coupling => "coupling",
+                        HotspotSortBy::Churn => "churn",
+                    };
+                    out.push_str(&format!(
+                        "// sorted by {axis}, Score column remains the composite\n"
+                    ));
+                }
                 // Compact header when the visible output would be at
                 // most three rows: the verbose banner (title + formula
                 // lines + column header + ruler = 5 lines) otherwise
@@ -216,10 +252,30 @@ impl QartezServer {
                 scored.truncate(limit);
 
                 if scored.is_empty() {
-                    return Ok("No symbol hotspots found. Complexity data requires imperative language files (Rust, TS, Python, Go, etc.).".to_string());
+                    let mut msg = String::new();
+                    msg.push_str(threshold_notice);
+                    msg.push_str("No symbol hotspots found. Complexity data requires imperative language files (Rust, TS, Python, Go, etc.).");
+                    return Ok(msg);
                 }
 
                 let mut out = String::new();
+                out.push_str(threshold_notice);
+                // See the file-level branch for the rationale: when the
+                // caller sorts by a non-default axis we still render the
+                // composite Score column, so callers need an explicit
+                // note that the column they see is NOT the sort key.
+                if !matches!(sort_by, HotspotSortBy::Score) {
+                    let axis = match sort_by {
+                        HotspotSortBy::Score => "score",
+                        HotspotSortBy::Health => "health",
+                        HotspotSortBy::Complexity => "complexity",
+                        HotspotSortBy::Coupling => "coupling",
+                        HotspotSortBy::Churn => "churn",
+                    };
+                    out.push_str(&format!(
+                        "// sorted by {axis}, Score column remains the composite\n"
+                    ));
+                }
                 // Compact header mirror of the file-level branch: drop
                 // the explanatory banner when the result set is tiny
                 // so the header block does not outweigh the payload.

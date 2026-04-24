@@ -88,7 +88,7 @@ fn selftest_boundaries_write_to_without_suggest_is_rejected() {
         )
         .expect_err("write_to without suggest must fail with a validation error");
     assert!(
-        err.contains("`write_to` is only valid when `suggest=true`"),
+        err.contains("write_to") && err.contains("suggest=true"),
         "error must mention the suggest requirement; got: {err}"
     );
 }
@@ -295,7 +295,7 @@ fn selftest_wiki_inline_output_respects_token_cap() {
             json!({
                 "min_cluster_size": 1,
                 "resolution": 2.0,
-                "token_budget": 1000,
+                "token_budget": 1024,
             }),
         )
         .expect("inline wiki must render");
@@ -305,8 +305,8 @@ fn selftest_wiki_inline_output_respects_token_cap() {
     // small overshoot from the truncation footer.
     let approx_tokens = out.chars().count() / 3;
     assert!(
-        approx_tokens <= 1200,
-        "inline output must respect token_budget=1000; got ~{approx_tokens} tokens"
+        approx_tokens <= 1250,
+        "inline output must respect token_budget=1024; got ~{approx_tokens} tokens"
     );
     assert!(
         out.contains("write_to=<path>") || out.contains("Set token_budget="),

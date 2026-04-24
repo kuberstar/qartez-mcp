@@ -32,8 +32,12 @@ const WIKI_DEFAULT_TOKEN_BUDGET: usize = 8000;
 /// Resolve a user-supplied write target for `qartez_wiki`.
 ///
 /// Accepts either a path relative to the project root (delegates to
-/// `safe_resolve`) or an absolute path whose parent directory already
-/// exists. Keeps the policy aligned with `qartez_boundaries`.
+/// `safe_resolve`) or an absolute path rooted in the project, `/tmp`,
+/// or the user's `$HOME`. The sandbox prefix list mirrors the rule
+/// callers reach for most often: "a scratch file next to my work" or
+/// "a throwaway under /tmp". An audit found the previous check only
+/// required the parent directory to exist, which let a stray absolute
+/// path land ARCHITECTURE.md anywhere on disk.
 fn resolve_write_target(server: &QartezServer, user_path: &str) -> Result<PathBuf, String> {
     let trimmed = user_path.trim();
     if trimmed.is_empty() {
@@ -48,6 +52,23 @@ fn resolve_write_target(server: &QartezServer, user_path: &str) -> Result<PathBu
             return Err(format!(
                 "Parent directory '{}' does not exist. Create it first or use a path relative to the project root.",
                 parent.display()
+            ));
+        }
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+        // macOS resolves `std::env::temp_dir()` to `/var/folders/<hash>/T/...`
+        // (via `TMPDIR`), not `/tmp`. Accept the OS-reported tempdir as
+        // well so `TempDir`-based tests and platform-sensible scratch
+        // writes do not hit the sandbox guard. `/tmp` stays explicit for
+        // Linux parity.
+        let os_tmp = std::env::temp_dir();
+        let inside_project = candidate.starts_with(&server.project_root);
+        let inside_tmp = candidate.starts_with("/tmp") || candidate.starts_with(&os_tmp);
+        let inside_home = home.as_ref().is_some_and(|h| candidate.starts_with(h));
+        if !(inside_project || inside_tmp || inside_home) {
+            return Err(format!(
+                "write_to absolute path '{}' is outside project root, tmpdir ({}), and $HOME. Use a relative path or one of those prefixes.",
+                candidate.display(),
+                os_tmp.display(),
             ));
         }
         return Ok(candidate.to_path_buf());
@@ -141,14 +162,57 @@ impl QartezServer {
         // `get_file_clusters_count`).
         let resolution_explicit = params.resolution.is_some();
         let min_cluster_size_explicit = params.min_cluster_size.is_some();
-        let recompute =
-            params.recompute.unwrap_or(false) || resolution_explicit || min_cluster_size_explicit;
+
+        // Louvain-style modularity is only defined for strictly positive
+        // resolutions. A value of 0 collapses every node onto the zero
+        // axis so the optimiser returns nonsense modularity, and
+        // negative resolutions (e.g. -1.0) produced a modularity of
+        // 1.17 which callers mistook for a score above the theoretical
+        // 1.0 ceiling. Reject values outside (0.0, 10.0] with an
+        // explicit range so the caller sees their input was wrong
+        // rather than trusting an impossible score. The 10.0 ceiling
+        // matches the Leiden literature recommendation: higher values
+        // fragment every node into its own cluster, which produces a
+        // meaningless wiki.
+        if let Some(r) = params.resolution {
+            if !r.is_finite() || r <= 0.0 {
+                return Err(format!(
+                    "resolution must be > 0.0 (got {r}). Valid range: (0.0, 10.0]. Typical values: 0.5 (coarse clusters), 1.0 (default), 2.0-5.0 (fine-grained)."
+                ));
+            }
+            if r > 10.0 {
+                return Err(format!(
+                    "resolution must be <= 10.0 (got {r}). Valid range: (0.0, 10.0]. Values above 10 fragment every file into its own cluster and defeat the summary."
+                ));
+            }
+        }
 
         let leiden = LeidenConfig {
             resolution: params.resolution.unwrap_or(1.0),
             min_cluster_size: params.min_cluster_size.unwrap_or(3),
             ..Default::default()
         };
+
+        // Cache-key parity: the cluster assignments stored in
+        // `file_clusters` are computed from a specific
+        // (resolution, min_cluster_size) pair. A previous call with
+        // `min_cluster_size=999` collapsed the project to a single
+        // cluster and persisted that; a follow-up default call then
+        // reused the cached 1-cluster result, making the knob appear
+        // sticky across invocations. Track the last config in
+        // `.qartez/wiki-cluster-key` and force a recompute whenever
+        // the current fingerprint differs, so subsequent calls with
+        // different parameters observe their configured granularity.
+        let config_fingerprint = format!("{:.6}:{}", leiden.resolution, leiden.min_cluster_size,);
+        let key_path = self.project_root.join(".qartez").join("wiki-cluster-key");
+        let stored_fingerprint = std::fs::read_to_string(&key_path).ok();
+        let fingerprint_mismatch = stored_fingerprint.as_deref().map(str::trim).unwrap_or("")
+            != config_fingerprint.as_str();
+        let recompute = params.recompute.unwrap_or(false)
+            || resolution_explicit
+            || min_cluster_size_explicit
+            || fingerprint_mismatch;
+
         let mut wiki_cfg = WikiConfig {
             project_name: self.project_name(),
             max_files_per_section: params
@@ -180,6 +244,17 @@ impl QartezServer {
             render_wiki(&conn, &wiki_cfg).map_err(|e| format!("Wiki render error: {e}"))?;
         drop(conn);
 
+        // Stamp the config fingerprint so the NEXT call can tell
+        // whether its requested params still match the cached
+        // clusters. Only update when we actually recomputed; otherwise
+        // the stored key would drift from the real on-disk state.
+        if recompute {
+            if let Some(parent) = key_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&key_path, &config_fingerprint);
+        }
+
         let mod_line = modularity
             .map(|q| format!(", modularity {q:.2}"))
             .unwrap_or_default();
@@ -188,6 +263,26 @@ impl QartezServer {
             .filter(|l| l.starts_with("## ") && !l.starts_with("## Table of contents"))
             .count();
 
+        // Inject the modularity score into the on-disk markdown so the
+        // file written to disk matches the header shape rendered
+        // inline. Without this, readers of ARCHITECTURE.md saw a
+        // cluster count but no quality signal for the partition, while
+        // the inline response included "modularity Q.QQ". We insert
+        // after the second-level `## Table of contents` heading if
+        // present, otherwise prepend so the note never gets lost.
+        let markdown_for_disk = if let Some(q) = modularity {
+            let banner = format!("Modularity: {q:.2}\n");
+            let anchor = "## Table of contents";
+            if let Some(pos) = markdown.find(anchor) {
+                let (head, tail) = markdown.split_at(pos);
+                format!("{head}{banner}\n{tail}")
+            } else {
+                format!("{banner}\n{markdown}")
+            }
+        } else {
+            markdown.clone()
+        };
+
         let write_to_trimmed = params.write_to.as_deref().map(str::trim).unwrap_or("");
         if !write_to_trimmed.is_empty() {
             let abs = resolve_write_target(self, write_to_trimmed)?;
@@ -195,17 +290,30 @@ impl QartezServer {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
             }
-            std::fs::write(&abs, &markdown)
+            std::fs::write(&abs, &markdown_for_disk)
                 .map_err(|e| format!("Cannot write {}: {e}", abs.display()))?;
             return Ok(format!(
                 "Wrote {} bytes to {} ({} clusters{})",
-                markdown.len(),
+                markdown_for_disk.len(),
                 abs.display(),
                 cluster_count,
                 mod_line,
             ));
         }
 
+        // Leiden resolution semantics: larger = more clusters. The
+        // optimizer penalizes merges harder with a higher gamma in the
+        // `louvain_local_move` gain formula, so nodes stay split. If
+        // you ever observe the inverse (e.g. resolution=0.5 produces
+        // MORE clusters than resolution=2.0), audit the modularity
+        // objective in `compute_modularity` -- not this validation.
+        if let Some(budget) = params.token_budget {
+            if (budget as usize) < 1024 {
+                return Err(format!(
+                    "token_budget must be >= 1024 to produce a useful wiki (got {budget}). Pass write_to=<path> to bypass the budget entirely."
+                ));
+            }
+        }
         let token_budget = params
             .token_budget
             .map(|v| v as usize)

@@ -45,6 +45,15 @@ impl QartezServer {
             Some(0) => usize::MAX,
             Some(n) => n as usize,
         };
+        // `max_commit_size=0` is meaningless: `commit.files.len() <= 0`
+        // matches nothing, so the tool would quietly fall through to
+        // the default-fallback list instead of applying the filter the
+        // caller asked for. Reject explicitly.
+        if let Some(0) = params.max_commit_size {
+            return Err(
+                "max_commit_size must be >= 1 (0 matches no commits; pick a positive cap like 30 to exclude mega-commits).".into(),
+            );
+        }
         let max_commit_size = params.max_commit_size.unwrap_or(30) as usize;
 
         let file_indexed = {
@@ -92,12 +101,27 @@ impl QartezServer {
                 let cc = read::get_cochanges(&conn, file.id, limit as i64)
                     .map_err(|e| format!("DB error: {e}"))?;
                 if cc.is_empty() {
-                    // Indexed file with git history but no shared commits with
-                    // peers (e.g. file was introduced alone, or git history is
-                    // truncated below the threshold).
+                    // Split the ambiguous "no shared commits" message
+                    // into two distinct cases. `file.change_count` is
+                    // the commit count populated at index time by the
+                    // git walk, so zero means the indexer never saw a
+                    // commit touching this file (e.g. git was disabled
+                    // at index time or history is truncated below the
+                    // threshold). A non-zero count plus an empty
+                    // co-change table means the file exists alone in
+                    // every commit that touched it. Previously both
+                    // cases collapsed to "no shared commits", forcing
+                    // callers to guess whether to re-index or accept
+                    // the file as a loner.
+                    if file.change_count == 0 {
+                        return Ok(format!(
+                            "No git history indexed for '{}'. Re-index with git enabled to populate co-change data.",
+                            params.file_path,
+                        ));
+                    }
                     return Ok(format!(
-                        "No co-change data for '{}' (no shared commits).",
-                        params.file_path,
+                        "No co-change partners for '{}'. It has {} commit(s) but none co-touched another indexed file.",
+                        params.file_path, file.change_count,
                     ));
                 }
                 cc.into_iter()

@@ -41,10 +41,21 @@ impl QartezServer {
         let concise = is_concise(&params.format);
         // Default 8 matches the tool description; an upper cap of 50 keeps
         // the rendered plan inside the MCP transport budget even when a
-        // caller passes a very large `limit`. The floor of 1 guarantees
-        // we still show at least the highest-impact step.
+        // caller passes a very large `limit`. `limit=0` follows the
+        // tool-wide "no cap" convention documented in params.rs (same
+        // as qartez_unused / qartez_context), but because oversized
+        // refactor plans blow the MCP response budget, the no-cap
+        // request is still capped at MAX_REFACTOR_STEPS with a
+        // separate informational notice.
         const MAX_REFACTOR_STEPS: u32 = 50;
-        let limit = params.limit.unwrap_or(8).clamp(1, MAX_REFACTOR_STEPS) as usize;
+        let requested_limit = params.limit.unwrap_or(8);
+        let limit = if requested_limit == 0 {
+            MAX_REFACTOR_STEPS as usize
+        } else {
+            requested_limit.min(MAX_REFACTOR_STEPS) as usize
+        };
+        let limit_was_clamped = requested_limit != 0 && requested_limit > MAX_REFACTOR_STEPS;
+        let limit_was_unlimited = requested_limit == 0;
         let min_cc = params.min_complexity.unwrap_or(15);
         let min_lines = params.min_lines.unwrap_or(50);
         let min_params = params.min_params.unwrap_or(5) as usize;
@@ -61,7 +72,7 @@ impl QartezServer {
         );
         let file = read::get_file_by_path(&conn, &rel)
             .map_err(|e| format!("DB error: {e}"))?
-            .ok_or_else(|| format!("File not found: {}", params.file_path))?;
+            .ok_or_else(|| format!("File '{}' not found in index", params.file_path))?;
         let symbols =
             read::get_symbols_for_file(&conn, file.id).map_err(|e| format!("DB error: {e}"))?;
 
@@ -221,6 +232,23 @@ impl QartezServer {
             out.push_str(
                 "- WARNING: no tests mapped to this file. Add characterization tests before refactoring.\n",
             );
+        }
+        if limit_was_clamped {
+            out.push_str(&format!(
+                "- note: limit={requested_limit} was clamped to the allowed maximum of {MAX_REFACTOR_STEPS}.\n",
+            ));
+        } else if limit_was_unlimited && total > MAX_REFACTOR_STEPS as usize {
+            // Only mention the MAX_REFACTOR_STEPS cap when the
+            // caller's `limit=0` request actually hit it. Before,
+            // the footer fired unconditionally for `limit=0` even
+            // on a file with 7 steps, which read like the tool had
+            // silently truncated the plan. Gating on the pre-cap
+            // step count keeps the note informative - it only
+            // appears when MAX_REFACTOR_STEPS really constrained
+            // the output.
+            out.push_str(&format!(
+                "- note: limit=0 requested no cap; still capped at {MAX_REFACTOR_STEPS} to stay inside the MCP response budget.\n",
+            ));
         }
         Ok(out)
     }

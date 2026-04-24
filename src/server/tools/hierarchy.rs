@@ -67,6 +67,23 @@ impl QartezServer {
 
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
+        // Differentiate "symbol absent from the index" from "symbol
+        // present but zero impls/supertypes". Previously both cases
+        // collapsed onto the same "No types found that implement or
+        // extend 'X'" / "No supertypes found for 'X'" strings, which
+        // hid typos in `symbol` behind what read like a legitimate
+        // empty result. `find_symbol_by_name` is a single indexed
+        // lookup so the overhead per call is negligible.
+        let symbol_exists = !read::find_symbol_by_name(&conn, &params.symbol)
+            .map_err(|e| format!("DB error: {e}"))?
+            .is_empty();
+        if !symbol_exists {
+            return Err(format!(
+                "Symbol '{}' not found in index. Check spelling or re-index if the type was added recently.",
+                params.symbol,
+            ));
+        }
+
         let mut out = String::new();
 
         match direction.as_str() {
@@ -131,6 +148,19 @@ impl QartezServer {
                                 depth, rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
                             ));
                         }
+                    } else if max_depth == 1 {
+                        // For trait `impl`-edges the direct
+                        // implementors are the complete "what
+                        // implements this?" answer, so
+                        // `max_depth=1 transitive=true` returns the
+                        // same rows as `max_depth=20 transitive=false`
+                        // on a flat hierarchy. The note spells that
+                        // out so callers don't spend time tuning
+                        // `max_depth` looking for a hidden cap.
+                        out.push_str(&format!(
+                            "\n// max_depth=1 caps the transitive walk at 1 hop; direct impls ({}) are always shown regardless of max_depth.\n",
+                            rows.len(),
+                        ));
                     }
                 }
             }

@@ -5526,7 +5526,7 @@ fn test_qartez_insert_preview_does_not_modify() {
 }
 
 #[test]
-fn test_qartez_insert_empty_new_code_is_noop() {
+fn test_qartez_insert_empty_new_code_is_rejected() {
     use qartez_mcp::server::QartezServer;
     use serde_json::json;
 
@@ -5541,7 +5541,7 @@ fn test_qartez_insert_empty_new_code_is_noop() {
     index::full_index(&conn, root, false).unwrap();
     let server = QartezServer::new(conn, root.to_path_buf(), 300);
 
-    let result = server
+    let err = server
         .call_tool_by_name(
             "qartez_insert_after_symbol",
             json!({
@@ -5550,14 +5550,14 @@ fn test_qartez_insert_empty_new_code_is_noop() {
                 "apply": true,
             }),
         )
-        .expect("empty insert must noop, not crash");
+        .expect_err("empty insert must be rejected to mirror qartez_replace_symbol");
     assert!(
-        result.contains("No changes"),
-        "empty insert must be a visible noop: {result}"
+        err.contains("Empty `new_code`"),
+        "empty insert must surface an explicit error: {err}"
     );
 
     let untouched = fs::read_to_string(src.join("lib.rs")).unwrap();
-    assert_eq!(untouched, original, "empty insert must not change file");
+    assert_eq!(untouched, original, "rejected insert must not change file");
 }
 
 #[test]

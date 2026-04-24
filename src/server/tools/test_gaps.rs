@@ -19,7 +19,7 @@ use crate::graph::blast;
 use crate::guard;
 use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
-use crate::test_paths::is_testable_source_language;
+use crate::test_paths::{is_testable_source_language, is_testable_source_path};
 use crate::toolchain;
 
 /// Extract the module-stem used by crate-rooted `use` imports in Rust.
@@ -192,14 +192,26 @@ impl QartezServer {
         );
 
         if let Some(ref fp) = params.file_path {
+            // Resolve relative to the project root via `safe_resolve`
+            // (which handles multi-root prefixes and path-escape
+            // rejection) and prefer the user-supplied relative form
+            // for display when `strip_prefix` against the primary
+            // project root does not match. Under multi-root setups,
+            // `safe_resolve` returns a path anchored to the ALIAS
+            // root (e.g. `qartez-public/...`) which is not a child
+            // of `self.project_root`; the old `unwrap_or(&resolved)`
+            // fallback then surfaced the absolute path in messages
+            // like `/private/tmp/src/...` after a spurious prefix
+            // strip. Falling back to the caller-supplied relative
+            // path keeps the displayed form stable across root
+            // configurations.
             let resolved = self.safe_resolve(fp).map_err(|e| e.to_string())?;
-            let rel = crate::index::to_forward_slash(
-                resolved
-                    .strip_prefix(&self.project_root)
-                    .unwrap_or(&resolved)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let rel = match resolved.strip_prefix(&self.project_root) {
+                Ok(stripped) => {
+                    crate::index::to_forward_slash(stripped.to_string_lossy().into_owned())
+                }
+                Err(_) => crate::index::to_forward_slash(fp.clone()),
+            };
 
             if is_test_path(&rel) {
                 let sources = test_to_sources
@@ -207,7 +219,17 @@ impl QartezServer {
                     .cloned()
                     .unwrap_or_default();
                 if sources.is_empty() {
-                    return Ok(format!("Test file '{rel}' has no indexed source imports."));
+                    let mut msg = format!("Test file '{rel}' has no indexed source imports.");
+                    if params.include_symbols.unwrap_or(false) {
+                        // Make the no-op status of `include_symbols`
+                        // observable. Silently ignoring the flag read
+                        // as a bug to callers who passed it expecting
+                        // a symbol-level breakdown.
+                        msg.push_str(
+                            " include_symbols=true had no effect: the flag needs at least one mapped source file on the test->sources side.",
+                        );
+                    }
+                    return Ok(msg);
                 }
                 let mut out = format!(
                     "# Test coverage: {rel}\n\nImports {} source file(s):\n",
@@ -224,9 +246,19 @@ impl QartezServer {
                 .cloned()
                 .unwrap_or_default();
             if tests.is_empty() {
-                return Ok(format!(
-                    "Source file '{rel}' has no test files importing it."
-                ));
+                let mut msg = format!("Source file '{rel}' has no test files importing it.");
+                if params.include_symbols.unwrap_or(false) {
+                    // Surface the remediation instead of a bare
+                    // "had no effect" note. The previous wording
+                    // made the flag look broken; this version
+                    // explains exactly why it did nothing (no test
+                    // file imports the source) and points at the
+                    // right mode to answer the bigger question.
+                    msg.push_str(&format!(
+                        " include_symbols=true had no effect: no test file imports '{rel}'. Use mode=gaps to find files without tests.",
+                    ));
+                }
+                return Ok(msg);
             }
             let mut out = format!("# Test coverage: {rel}\n\n{} test file(s):\n", tests.len(),);
             for t in tests.iter().take(limit) {
@@ -293,9 +325,33 @@ impl QartezServer {
             "# Test-to-source mapping\n\n{total_covered}/{total_source} source files covered by {total_test} test files\n\n",
         );
 
+        // When include_symbols is set on the project-wide listing,
+        // annotate every source row with the count of its own indexed
+        // symbols AND, in detailed mode, show up to a handful of them.
+        // The flag used to only affect the single-file branch above,
+        // so callers who set it here got no signal at all - now the
+        // output grows with whatever qartez actually knows about each
+        // source file.
+        let include_symbols_project = params.include_symbols.unwrap_or(false);
+
         if concise {
             for (src, tests) in entries.iter().take(limit) {
-                out.push_str(&format!("  {} ({})\n", src, tests.len()));
+                if include_symbols_project {
+                    let sym_count = ctx
+                        .path_to_id
+                        .get(src)
+                        .and_then(|id| read::get_symbols_for_file(conn, *id).ok())
+                        .map(|v| v.iter().filter(|s| s.kind != "field").count())
+                        .unwrap_or(0);
+                    out.push_str(&format!(
+                        "  {} ({} tests, {} symbols)\n",
+                        src,
+                        tests.len(),
+                        sym_count,
+                    ));
+                } else {
+                    out.push_str(&format!("  {} ({})\n", src, tests.len()));
+                }
             }
         } else {
             for (src, tests) in entries.iter().take(limit) {
@@ -305,6 +361,21 @@ impl QartezServer {
                 }
                 if tests.len() > 5 {
                     out.push_str(&format!("    ... and {} more\n", tests.len() - 5,));
+                }
+                if include_symbols_project
+                    && let Some(&file_id) = ctx.path_to_id.get(src)
+                    && let Ok(syms) = read::get_symbols_for_file(conn, file_id)
+                {
+                    let visible: Vec<_> = syms.iter().filter(|s| s.kind != "field").collect();
+                    if !visible.is_empty() {
+                        out.push_str(&format!("    symbols ({}):\n", visible.len()));
+                        for sym in visible.iter().take(5) {
+                            out.push_str(&format!("      - {} ({})\n", sym.name, sym.kind));
+                        }
+                        if visible.len() > 5 {
+                            out.push_str(&format!("      ... and {} more\n", visible.len() - 5,));
+                        }
+                    }
                 }
             }
         }
@@ -539,15 +610,17 @@ impl QartezServer {
             .map(|s| s.as_str())
             .filter(|p| !is_test_path(p))
             .filter(|p| {
-                // Skip non-testable file types (shell scripts, Cargo
-                // manifests, YAML, Dockerfile). Flagging them as
-                // "needs new tests" is noise. Unindexed paths fall
-                // through (handled as untested below).
-                ctx.path_to_id
-                    .get(p)
-                    .and_then(|id| ctx.id_to_file.get(id))
-                    .map(|f| is_testable_source_language(&f.language))
-                    .unwrap_or(true)
+                // Skip non-testable file types. Indexed paths use
+                // the precise `FileRow::language` signal; unindexed
+                // paths (CHANGELOG.md, Cargo.lock, install.ps1,
+                // SKILL.md) now fall back to a path-based classifier
+                // instead of the old `.unwrap_or(true)` which flagged
+                // every non-source file as "needs new tests" and
+                // diverged from qartez_diff_impact on the same input.
+                match ctx.path_to_id.get(p).and_then(|id| ctx.id_to_file.get(id)) {
+                    Some(f) => is_testable_source_language(&f.language),
+                    None => is_testable_source_path(p),
+                }
             })
             .collect();
         let changed_tests: Vec<&str> = changed

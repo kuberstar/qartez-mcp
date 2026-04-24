@@ -453,9 +453,35 @@ pub fn run_command(
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Drain whatever the child had already flushed to
+                    // its pipes before the kill so the caller can see
+                    // where the process was when it hung. The reader
+                    // threads close once the pipe FDs are reaped.
+                    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+                    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+                    let partial = String::from_utf8_lossy(&stderr_bytes);
+                    let tail: String = {
+                        // Keep the last 40 non-empty lines so callers
+                        // see the recent error context without drowning
+                        // in early build noise.
+                        const TAIL_LINES: usize = 40;
+                        let mut lines: Vec<&str> =
+                            partial.lines().filter(|l| !l.trim().is_empty()).collect();
+                        if lines.len() > TAIL_LINES {
+                            lines = lines.split_off(lines.len() - TAIL_LINES);
+                        }
+                        lines.join("\n")
+                    };
+                    let _ = stdout_bytes;
+                    if tail.is_empty() {
+                        return Err(format!(
+                            "Command '{}' timed out after {}s (no stderr captured before kill)",
+                            cmd[0], timeout_secs
+                        ));
+                    }
                     return Err(format!(
-                        "Command '{}' timed out after {}s",
-                        cmd[0], timeout_secs
+                        "Command '{}' timed out after {}s. Last stderr lines before kill:\n{}",
+                        cmd[0], timeout_secs, tail
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
