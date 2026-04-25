@@ -150,6 +150,7 @@ impl QartezServer {
             let body = self.build_symbol_overview(top_n, token_budget, concise);
             return Ok(prepend_warning(&combined_warning, body));
         }
+        let with_health = params.with_health.unwrap_or(false);
         let body = self.build_overview(
             top_n,
             token_budget,
@@ -157,6 +158,7 @@ impl QartezServer {
             params.boost_terms.as_deref(),
             concise,
             all_files,
+            with_health,
         );
         // Coercion annotation: `top_n=0` is the documented no-cap
         // path (treated as `all_files=true`). Surface the coercion so

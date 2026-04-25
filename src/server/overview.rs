@@ -7,8 +7,16 @@
 use std::collections::HashSet;
 
 use super::helpers::{elide_file_source, estimate_tokens, truncate_path};
+use super::tools::smells::count_signature_params;
 use crate::graph::blast;
 use crate::storage::read;
+
+/// Health-annotation thresholds. Mirror the defaults used by
+/// `qartez_health` / `qartez_smells` so a row tagged `god_function`
+/// here would also surface in those tools without surprise.
+const HEALTH_GOD_CC_THRESHOLD: u32 = 15;
+const HEALTH_GOD_LINES_THRESHOLD: u32 = 50;
+const HEALTH_LONG_PARAMS_THRESHOLD: usize = 5;
 
 impl super::QartezServer {
     pub(super) fn project_name(&self) -> String {
@@ -61,7 +69,15 @@ impl super::QartezServer {
                  languages without a reference extractor yet (see docs) or DBs that \
                  predate symbol PageRank. Falling back to file ranking.\n\n",
             );
-            out.push_str(&self.build_overview(top_n, token_budget, None, None, concise, false));
+            out.push_str(&self.build_overview(
+                top_n,
+                token_budget,
+                None,
+                None,
+                concise,
+                false,
+                false,
+            ));
             return out;
         }
 
@@ -126,6 +142,10 @@ impl super::QartezServer {
         out
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Render-control axes for the qartez_map response. Bundling them into a struct just to satisfy the lint would push the noise to every caller."
+    )]
     pub(super) fn build_overview(
         &self,
         top_n: i64,
@@ -134,6 +154,7 @@ impl super::QartezServer {
         boost_terms: Option<&[String]>,
         concise: bool,
         all_files: bool,
+        with_health: bool,
     ) -> String {
         let conn = match self.db.lock() {
             Ok(c) => c,
@@ -243,8 +264,9 @@ impl super::QartezServer {
             ));
         }
         if concise {
+            let health_col = if with_health { " health" } else { "" };
             out.push_str(&format!(
-                "{file_count} files, {symbol_count} symbols (rank path PR exp \u{2192}blast)\n",
+                "{file_count} files, {symbol_count} symbols (rank path PR exp \u{2192}blast{health_col})\n",
             ));
         } else {
             out.push_str(&format!(
@@ -253,8 +275,17 @@ impl super::QartezServer {
                 file_count,
                 symbol_count,
             ));
-            out.push_str(" # | File                                | PageRank | Exports | Blast\n");
-            out.push_str("---+-------------------------------------+----------+---------+------\n");
+            if with_health {
+                out.push_str(" # | File                                | PageRank | Exports | Blast | Health\n");
+                out.push_str("---+-------------------------------------+----------+---------+-------+--------\n");
+            } else {
+                out.push_str(
+                    " # | File                                | PageRank | Exports | Blast\n",
+                );
+                out.push_str(
+                    "---+-------------------------------------+----------+---------+------\n",
+                );
+            }
         }
 
         let mut file_symbols: Vec<(String, Vec<crate::storage::models::SymbolRow>)> = Vec::new();
@@ -264,14 +295,42 @@ impl super::QartezServer {
             let export_count = symbols.iter().filter(|s| s.is_exported).count();
             let blast_r = blast_radii.get(&file.id).copied().unwrap_or(0);
 
+            let health_tag = if with_health {
+                build_health_tag(&symbols)
+            } else {
+                String::new()
+            };
+
             let line = if concise {
+                if with_health {
+                    format!(
+                        "{} {} {:.3} {} \u{2192}{} {}\n",
+                        i + 1,
+                        file.path,
+                        file.pagerank,
+                        export_count,
+                        blast_r,
+                        health_tag,
+                    )
+                } else {
+                    format!(
+                        "{} {} {:.3} {} \u{2192}{}\n",
+                        i + 1,
+                        file.path,
+                        file.pagerank,
+                        export_count,
+                        blast_r,
+                    )
+                }
+            } else if with_health {
                 format!(
-                    "{} {} {:.3} {} \u{2192}{}\n",
+                    "{:>2} | {:<35} | {:>8.4} | {:>7} | \u{2192}{:<4} | {}\n",
                     i + 1,
-                    file.path,
+                    truncate_path(&file.path, 35),
                     file.pagerank,
                     export_count,
                     blast_r,
+                    health_tag,
                 )
             } else {
                 format!(
@@ -392,4 +451,52 @@ impl super::QartezServer {
 
         out
     }
+}
+
+/// Compose the per-row health tag for `qartez_map with_health=true`.
+///
+/// Returns a compact one-token marker like `CC=37 god_function`,
+/// `CC=12 long_params`, or `CC=4 ok`. The thresholds match
+/// `qartez_health` so a row tagged here can be expanded to a
+/// full report by feeding the file path back into the health tool.
+fn build_health_tag(symbols: &[crate::storage::models::SymbolRow]) -> String {
+    let max_cc = symbols
+        .iter()
+        .filter(|s| matches!(s.kind.as_str(), "function" | "method"))
+        .filter_map(|s| s.complexity)
+        .max()
+        .unwrap_or(0);
+
+    let has_god = symbols
+        .iter()
+        .filter(|s| matches!(s.kind.as_str(), "function" | "method"))
+        .any(|s| {
+            let body = s.line_end.saturating_sub(s.line_start) + 1;
+            s.complexity.is_some_and(|cc| {
+                cc >= HEALTH_GOD_CC_THRESHOLD && body >= HEALTH_GOD_LINES_THRESHOLD
+            })
+        });
+
+    let has_long_params = symbols
+        .iter()
+        .filter(|s| matches!(s.kind.as_str(), "function" | "method"))
+        .any(|s| {
+            s.signature
+                .as_deref()
+                .is_some_and(|sig| count_signature_params(sig) >= HEALTH_LONG_PARAMS_THRESHOLD)
+        });
+
+    let mut tags: Vec<&str> = Vec::new();
+    if has_god {
+        tags.push("god_function");
+    }
+    if has_long_params {
+        tags.push("long_params");
+    }
+    let tag_text = if tags.is_empty() {
+        "ok".to_string()
+    } else {
+        tags.join(",")
+    };
+    format!("CC={max_cc} {tag_text}")
 }

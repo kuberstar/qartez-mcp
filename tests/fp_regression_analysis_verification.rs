@@ -385,16 +385,19 @@ fn unused_description_documents_limit_zero_no_cap() {
         ],
     );
 
-    // Zero-limit semantics are now unified across tools: limit=0 is a
-    // caller mistake, not a "no-cap" shortcut. The rejection path
-    // produces a canonical message so the contract matches clones /
-    // cochange / trend rather than staying split between tools.
-    let err = server
+    // Zero-limit semantics are now unified on the no-cap convention:
+    // qartez_unused, qartez_hotspots, qartez_health, qartez_cochange and
+    // qartez_context all treat limit=0 as "remove the row cap" so the
+    // family agrees on a single contract. Tools that protect oversize
+    // output exclusively through `limit` (clones, trend) keep the
+    // explicit reject. This test pins the unused branch so a regression
+    // back to a silent default cap re-trips here.
+    let result = server
         .call_tool_by_name("qartez_unused", json!({ "limit": 0 }))
-        .expect_err("limit=0 must now be rejected, not silently mean no-cap");
+        .expect("limit=0 must mean no-cap, not error");
     assert!(
-        err.contains("limit must be") || err.contains("positive integer") || err.contains("no-cap"),
-        "rejection must describe the zero-limit contract, got: {err}"
+        !result.contains("limit must be") && !result.contains("positive integer"),
+        "limit=0 must be a no-cap shortcut, not rejected: {result}"
     );
 }
 

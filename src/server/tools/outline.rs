@@ -36,7 +36,19 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulOutlineParams>,
     ) -> Result<String, String> {
-        reject_mermaid(&params.format, "qartez_outline")?;
+        // Tool-specific mermaid rejection: the shared `reject_mermaid`
+        // alone tells callers to go to qartez_deps / qartez_calls /
+        // qartez_hierarchy, but none of those produce a per-file
+        // outline. Spell out the per-file mismatch first so callers
+        // who specifically want a symbol table do not hop through
+        // three graph tools, but still surface the graph alternatives
+        // for callers who actually want a Mermaid view of relationships.
+        if matches!(&params.format, Some(Format::Mermaid)) {
+            return Err(
+                "format=mermaid is not supported for qartez_outline. The outline is a per-file symbol table, not a graph. For the symbol table, omit `format` (default) or pass `format=concise`. For Mermaid graph views, use qartez_deps (file dependency graph), qartez_calls (call hierarchy), or qartez_hierarchy (type/trait inheritance) instead."
+                    .to_string(),
+            );
+        }
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);

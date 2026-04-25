@@ -1,6 +1,6 @@
 # Tool reference
 
-Qartez exposes 37 tools via MCP, organized into four tiers. By default all
+Qartez exposes 39 tools via MCP, organized into four tiers. By default all
 tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 `qartez_tools` are visible at startup; unlock others on demand.
 
@@ -11,7 +11,7 @@ tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 | **core** | 8 | Navigate, read, assess - the daily-driver set |
 | **analysis** | 18 | Deep investigation, debugging, review, architecture |
 | **refactor** | 7 | Codebase-wide rename, move, replace, insert, and safe-delete operations |
-| **meta** | 3 | Build toolchain, documentation, workspace admin |
+| **meta** | 5 | Build toolchain, documentation, workspace admin |
 | **discovery** | 1 | `qartez_tools` - always visible, manages tier visibility |
 
 ---
@@ -514,6 +514,35 @@ from the index in one bulk pass.
 | `action` | enum | **required** | `add` or `remove` |
 | `alias` | string | **required** | Domain prefix (ASCII letters, digits, `-`, `_`, `.`) |
 | `path` | string | - | Directory to register (required for `add`; `~/` and relative paths allowed) |
+
+### `qartez_add_root`
+
+Register an additional project root at runtime. Indexes the directory,
+refreshes pagerank/co-change, and hot-attaches a file watcher so saves
+under the new root reindex live. Distinct from `qartez_workspace add`
+in that the alias is optional (derived from the path basename and
+disambiguated with a numeric suffix on collision) and persistence to
+`.qartez/workspace.toml` can be toggled off for ephemeral roots.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | **required** | Directory to register (`~/` and relative paths allowed) |
+| `alias` | string | derived | Alias for the new root; defaults to a sanitized form of the basename |
+| `persist` | bool | `true` | Persist into `.qartez/workspace.toml` so the root is reattached on next start |
+| `watch` | bool | server default | Attach a `notify` watcher; respects the server's `--no-watch` flag when omitted |
+
+### `qartez_list_roots`
+
+List every project root currently tracked by the server. Each entry
+shows the canonical path, alias, source (`cli` for CLI args, `config`
+for `.qartez/workspace.toml` reattachments, `runtime` for additions
+made via `qartez_add_root` or `qartez_workspace`), watcher attachment
+state, the indexed file count under that root, and the last index
+timestamp.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `format` | enum | `detailed` | `concise` returns a bullet list; `detailed` renders the full markdown table |
 
 ---
 

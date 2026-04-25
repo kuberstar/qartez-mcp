@@ -612,6 +612,30 @@ struct CompiledRule<'a> {
     regex: Regex,
 }
 
+/// Return true when a regex match should be suppressed by a rule's
+/// per-rule allowlist (benign / safe usage that the regex cannot
+/// distinguish on its own).
+///
+/// Both passes inside `scan` - "did the rule fire?" and
+/// "which line did it fire on?" - need exactly the same allowlist
+/// semantics. They used to inline the match arms in two places, so
+/// adding an allowlist for a new rule meant editing both. Centralising
+/// the dispatch here keeps them pinned together: a SEC013 with an
+/// allowlist is a one-line change in one place.
+///
+/// Returns `false` for any rule_id that has no allowlist (the match
+/// is real and counts).
+fn is_match_allowlisted(rule_id: &str, m_str: &str, body: &str, m_start: usize) -> bool {
+    match rule_id {
+        "SEC001" => is_sec001_env_indirection(m_str),
+        "SEC004" => is_sec004_static_command(m_str, body, m_start),
+        "SEC005" => is_sec005_benign(body, m_start),
+        "SEC007" => is_sec007_benign(m_str, body, m_start),
+        "SEC008" => is_sec008_benign(body, m_start),
+        _ => false,
+    }
+}
+
 /// Run the security scan against all indexed symbols.
 ///
 /// Reads symbol source from disk (grouped by file for efficiency),
@@ -735,32 +759,10 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
                 }
 
                 let matched = match &cr.rule.pattern {
-                    SecurityPattern::BodyRegex(_) => {
-                        let body_match = cr.regex.is_match(&body);
-                        if body_match && cr.rule.id == "SEC007" {
-                            cr.regex
-                                .find_iter(&body)
-                                .any(|m| !is_sec007_benign(m.as_str(), &body, m.start()))
-                        } else if body_match && cr.rule.id == "SEC001" {
-                            cr.regex
-                                .find_iter(&body)
-                                .any(|m| !is_sec001_env_indirection(m.as_str()))
-                        } else if body_match && cr.rule.id == "SEC004" {
-                            cr.regex
-                                .find_iter(&body)
-                                .any(|m| !is_sec004_static_command(m.as_str(), &body, m.start()))
-                        } else if body_match && cr.rule.id == "SEC005" {
-                            cr.regex
-                                .find_iter(&body)
-                                .any(|m| !is_sec005_benign(&body, m.start()))
-                        } else if body_match && cr.rule.id == "SEC008" {
-                            cr.regex
-                                .find_iter(&body)
-                                .any(|m| !is_sec008_benign(&body, m.start()))
-                        } else {
-                            body_match
-                        }
-                    }
+                    SecurityPattern::BodyRegex(_) => cr
+                        .regex
+                        .find_iter(&body)
+                        .any(|m| !is_match_allowlisted(&cr.rule.id, m.as_str(), &body, m.start())),
                     SecurityPattern::SymbolName(_) => cr.regex.is_match(&sym.name),
                     SecurityPattern::SignatureRegex(_) => sym
                         .signature
@@ -792,13 +794,8 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
                         let chosen_pos = cr
                             .regex
                             .find_iter(&body)
-                            .find(|m| match cr.rule.id.as_str() {
-                                "SEC001" => !is_sec001_env_indirection(m.as_str()),
-                                "SEC004" => !is_sec004_static_command(m.as_str(), &body, m.start()),
-                                "SEC005" => !is_sec005_benign(&body, m.start()),
-                                "SEC007" => !is_sec007_benign(m.as_str(), &body, m.start()),
-                                "SEC008" => !is_sec008_benign(&body, m.start()),
-                                _ => true,
+                            .find(|m| {
+                                !is_match_allowlisted(&cr.rule.id, m.as_str(), &body, m.start())
                             })
                             .map(|m| m.start());
                         match chosen_pos {
@@ -1338,6 +1335,144 @@ mod tests {
         check_regex(pat, "-----BEGIN PRIVATE KEY-----", true);
         check_regex(pat, "-----BEGIN EC PRIVATE KEY-----", true);
         check_regex(pat, "-----BEGIN PUBLIC KEY-----", false);
+    }
+
+    // Lock in the allowlist dispatch matrix. Both passes inside `scan`
+    // (the matched-check and the line-locator) call this helper, so a
+    // future contributor adding SEC013 needs to extend exactly one
+    // place. Each rule with an allowlist gets a benign-vs-real pair so
+    // the dispatch can't silently swap arms.
+    #[test]
+    fn allowlist_dispatch_matrix() {
+        // Rules without an allowlist always fall through to false.
+        assert!(!is_match_allowlisted("SEC002", "anything", "", 0));
+        assert!(!is_match_allowlisted("SEC003", "anything", "", 0));
+        assert!(!is_match_allowlisted("SEC999", "anything", "", 0));
+
+        // SEC001: env-var indirection is benign, hardcoded secret is not.
+        assert!(is_match_allowlisted(
+            "SEC001",
+            "API_KEY = os.environ['API_KEY']",
+            "",
+            0
+        ));
+        assert!(!is_match_allowlisted(
+            "SEC001",
+            "API_KEY = \"sk-real-secret-value\"",
+            "",
+            0
+        ));
+
+        // SEC007: loopback is benign, real external HTTP is not.
+        let body_loopback = "let url = \"http://localhost:8080\";";
+        assert!(is_match_allowlisted(
+            "SEC007",
+            "http://localhost:8080",
+            body_loopback,
+            body_loopback.find("http").unwrap(),
+        ));
+        let body_external = "let url = \"http://api.example.com\";";
+        assert!(!is_match_allowlisted(
+            "SEC007",
+            "http://api.example.com",
+            body_external,
+            body_external.find("http").unwrap(),
+        ));
+    }
+
+    fn legacy_inline_dispatch(rule_id: &str, m_str: &str, body: &str, m_start: usize) -> bool {
+        match rule_id {
+            "SEC001" => is_sec001_env_indirection(m_str),
+            "SEC004" => is_sec004_static_command(m_str, body, m_start),
+            "SEC005" => is_sec005_benign(body, m_start),
+            "SEC007" => is_sec007_benign(m_str, body, m_start),
+            "SEC008" => is_sec008_benign(body, m_start),
+            _ => false,
+        }
+    }
+
+    /// Equivalence test: confirm `is_match_allowlisted` returns the
+    /// same answer as the pre-refactor inlined match arms for every
+    /// rule that ships with an allowlist. Pins the dispatch table
+    /// against drift if a future contributor renames a helper or
+    /// reorders an argument.
+    #[test]
+    fn allowlist_helper_matches_legacy_inline_dispatch() {
+        let body_localhost = "let url = \"http://localhost:8080\";";
+        let body_external = "let url = \"http://api.example.com\";";
+        let body_unsafe_real = "fn foo() { unsafe { std::ptr::null::<u8>(); } }";
+        let body_unsafe_in_string = "let s = \"unsafe\";";
+        let body_static_command = "Command::new(\"git\").arg(\"status\");";
+        let body_dynamic_command = "Command::new(user_input).spawn();";
+        let body_traversal_real = "let p = format!(\"../../../etc/passwd\");";
+        let body_traversal_embed = "include_str!(\"../../fixtures/sample.txt\");";
+        let body_secret_env = "API_KEY = os.environ['API_KEY']";
+        let body_secret_real = "API_KEY = \"sk-abcdef1234567890abcdef1234567890\"";
+
+        let probes: &[(&str, &str, &str, usize)] = &[
+            ("SEC001", body_secret_env, body_secret_env, 0),
+            ("SEC001", body_secret_real, body_secret_real, 0),
+            (
+                "SEC004",
+                "Command::new(\"git\")",
+                body_static_command,
+                body_static_command.find("Command").unwrap(),
+            ),
+            (
+                "SEC004",
+                "Command::new(user_input)",
+                body_dynamic_command,
+                body_dynamic_command.find("Command").unwrap(),
+            ),
+            (
+                "SEC005",
+                "../../fixtures/sample.txt",
+                body_traversal_embed,
+                body_traversal_embed.find("..").unwrap(),
+            ),
+            (
+                "SEC005",
+                "../../../etc/passwd",
+                body_traversal_real,
+                body_traversal_real.find("..").unwrap(),
+            ),
+            (
+                "SEC007",
+                "http://localhost:8080",
+                body_localhost,
+                body_localhost.find("http").unwrap(),
+            ),
+            (
+                "SEC007",
+                "http://api.example.com",
+                body_external,
+                body_external.find("http").unwrap(),
+            ),
+            (
+                "SEC008",
+                "unsafe",
+                body_unsafe_real,
+                body_unsafe_real.find("unsafe").unwrap(),
+            ),
+            (
+                "SEC008",
+                "unsafe",
+                body_unsafe_in_string,
+                body_unsafe_in_string.find("unsafe").unwrap(),
+            ),
+            ("SEC002", "BEGIN PRIVATE KEY", "BEGIN PRIVATE KEY", 0),
+            ("SEC003", "WHERE id={x}", "WHERE id={x}", 0),
+            ("SEC042", "anything", "any body", 0),
+        ];
+
+        for (rule, m_str, body, m_start) in probes {
+            let new_result = is_match_allowlisted(rule, m_str, body, *m_start);
+            let legacy_result = legacy_inline_dispatch(rule, m_str, body, *m_start);
+            assert_eq!(
+                new_result, legacy_result,
+                "dispatch divergence for rule={rule} m_str={m_str:?} body={body:?}",
+            );
+        }
     }
 
     #[test]

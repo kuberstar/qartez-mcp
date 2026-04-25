@@ -280,6 +280,19 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 /// (or touches) the ack file so subsequent edits within `ack_ttl_secs` are
 /// let through. Failures are swallowed - ack is an optimisation, not a
 /// correctness guarantee.
+///
+/// The on-disk format is two lines:
+///
+/// ```text
+/// <unix-seconds>
+/// <project-relative path the ack covers>
+/// ```
+///
+/// The path line is the audit manifest: operators cleaning up
+/// `.qartez/acks/<hex>` files no longer have to reverse the FNV-1a
+/// digest to learn which file each ack belongs to. `ack_is_fresh`
+/// continues to use mtime (not the file body) so the additional line
+/// has no impact on the freshness check.
 pub fn touch_ack(project_root: &Path, rel_path: &str) {
     let path = ack_path(project_root, rel_path);
     if let Some(parent) = path.parent()
@@ -291,7 +304,7 @@ pub fn touch_ack(project_root: &Path, rel_path: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = std::fs::write(&path, ts.to_string());
+    let _ = std::fs::write(&path, format!("{ts}\n{rel_path}\n"));
 }
 
 /// Returns `true` iff an ack file exists for `rel_path` and its mtime is
@@ -545,6 +558,32 @@ mod tests {
         let p3 = ack_path(root, "src/bar.rs");
         assert_eq!(p1, p2);
         assert_ne!(p1, p3);
+    }
+
+    #[test]
+    fn ack_file_records_relpath_for_audit() {
+        // Ack files are named by FNV-1a digest, so previously a
+        // `.qartez/acks/<hex>` directory listing left operators with
+        // no way to map the digest back to a project file. Persist the
+        // covered relpath as a second line so the file is self-
+        // describing and `cat .qartez/acks/<hex>` answers the audit
+        // question without a digest reverse-lookup.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let rel = "src/index/walker.rs";
+        touch_ack(root, rel);
+        let body = std::fs::read_to_string(ack_path(root, rel)).expect("ack file");
+        let mut lines = body.lines();
+        let ts_line = lines.next().expect("timestamp line");
+        let path_line = lines.next().expect("relpath line");
+        assert!(
+            ts_line.parse::<u64>().is_ok(),
+            "first line must be a unix timestamp, got: {ts_line}"
+        );
+        assert_eq!(
+            path_line, rel,
+            "second line must be the project-relative path covered by the ack",
+        );
     }
 
     #[test]

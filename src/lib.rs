@@ -6,6 +6,7 @@ pub mod git;
 pub mod graph;
 pub mod guard;
 pub mod index;
+pub mod lock;
 pub mod server;
 pub mod storage;
 pub(crate) mod str_utils;

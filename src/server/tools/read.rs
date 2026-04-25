@@ -90,7 +90,22 @@ impl QartezServer {
             Some(v) => (v as usize, None),
             None => (25_000usize, None),
         };
-        let context_lines = params.context_lines.unwrap_or(0) as usize;
+        // Clamp context_lines to a sane upper bound. Without the cap, callers
+        // passing `context_lines=9999` got a whole-file dump that read as
+        // "qartez_read silently ignored max_bytes". Cap at 50 (covers the
+        // usual "show me the surrounding use-block" intent) and emit a
+        // note when the cap is applied so the caller sees the correction.
+        const MAX_CONTEXT_LINES: u32 = 50;
+        let (context_lines, context_lines_note) = match params.context_lines {
+            Some(n) if n > MAX_CONTEXT_LINES => (
+                MAX_CONTEXT_LINES as usize,
+                Some(format!(
+                    "// note: context_lines={n} clamped to {MAX_CONTEXT_LINES} (use start_line/end_line for larger windows via file-slice mode)\n"
+                )),
+            ),
+            Some(n) => (n as usize, None),
+            None => (0usize, None),
+        };
 
         // Raw file-range mode: file_path given without any symbol. Dumps the
         // whole file by default, or a specific slice when start_line/end_line/
@@ -130,7 +145,24 @@ impl QartezServer {
             if let Some(note) = max_bytes_note {
                 body.insert_str(0, &note);
             }
+            if let Some(note) = context_lines_note {
+                body.insert_str(0, &note);
+            }
             return Ok(body);
+        }
+
+        // `start_line` / `end_line` / `limit` are file-slice parameters that
+        // only apply to the no-symbol read path. Silently dropping them when
+        // a symbol is also requested left callers debugging "why does my
+        // 5-line slice show the whole 200-line function". Reject the
+        // combination explicitly so the mistake is visible.
+        if (params.start_line.is_some() || params.end_line.is_some() || params.limit.is_some())
+            && !no_symbols_requested
+        {
+            return Err(
+                "`start_line` / `end_line` / `limit` only apply to file-slice mode (file_path without any symbol). Drop them when reading a symbol, or drop `symbol_name` / `symbols` to slice the file."
+                    .to_string(),
+            );
         }
 
         let queries = parse_symbol_queries(params.symbols, params.symbol_name)?;
@@ -145,6 +177,9 @@ impl QartezServer {
         let mut body =
             self.read_symbol_batch(&queries, file_filter.as_deref(), max_bytes, context_lines)?;
         if let Some(note) = max_bytes_note {
+            body.insert_str(0, &note);
+        }
+        if let Some(note) = context_lines_note {
             body.insert_str(0, &note);
         }
         Ok(body)
@@ -545,8 +580,8 @@ fn parse_symbol_queries(
     symbols: Option<Vec<String>>,
     symbol_name: Option<String>,
 ) -> Result<Vec<String>, String> {
-    let queries: Vec<String> = match (symbols, symbol_name) {
-        (Some(list), _) if !list.is_empty() => list.into_iter().filter(|s| !s.is_empty()).collect(),
+    let raw: Vec<String> = match (symbols, symbol_name) {
+        (Some(list), _) if !list.is_empty() => list,
         (_, Some(name)) if !name.is_empty() => vec![name],
         _ => {
             return Err(
@@ -554,8 +589,62 @@ fn parse_symbol_queries(
             );
         }
     };
+    // Dedupe while preserving first-seen order. Without this, callers who
+    // splat a list with repeats (`symbols=[handle_call, handle_call,
+    // handle_call]`) saw the same section rendered three times for hits
+    // and "(3 not found: handle_call, handle_call, handle_call)" for
+    // misses - both bugs that read as "qartez ignored my list".
+    let mut seen = HashSet::new();
+    let mut queries: Vec<String> = Vec::with_capacity(raw.len());
+    for q in raw {
+        let trimmed = q.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.clone()) {
+            queries.push(trimmed);
+        }
+    }
     if queries.is_empty() {
         return Err("No non-empty symbol names provided".to_string());
     }
     Ok(queries)
+}
+
+#[cfg(test)]
+mod parse_symbol_queries_tests {
+    use super::parse_symbol_queries;
+
+    #[test]
+    fn dedupes_repeated_names_preserving_order() {
+        let result = parse_symbol_queries(
+            Some(vec!["a".into(), "a".into(), "b".into(), "a".into()]),
+            None,
+        )
+        .expect("non-empty input should succeed");
+        assert_eq!(result, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn rejects_all_empty_and_whitespace() {
+        let result = parse_symbol_queries(Some(vec!["  ".into(), "".into()]), None);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn trims_whitespace_around_names() {
+        let result = parse_symbol_queries(
+            Some(vec!["  foo  ".into(), "foo".into(), "bar".into()]),
+            None,
+        )
+        .expect("non-empty input should succeed");
+        assert_eq!(result, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn falls_back_to_symbol_name_when_symbols_missing() {
+        let result = parse_symbol_queries(None, Some("solo".into()))
+            .expect("symbol_name should be honoured");
+        assert_eq!(result, vec!["solo".to_string()]);
+    }
 }

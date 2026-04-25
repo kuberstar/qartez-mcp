@@ -88,12 +88,29 @@ impl QartezServer {
         // saw no indication that 5 more existed.
         let total_candidates = refs.len();
         if !concise && total_candidates > 1 {
+            // Earlier copy ended with "Pass `kind` / `file_path` (on
+            // refactor tools) to narrow." which advertised parameters
+            // qartez_refs itself does not accept. Point the caller at
+            // the disambiguation surface that actually exists for
+            // reference walks: qartez_calls (which DOES take `kind`
+            // and `file_path`) for picking a single function-like
+            // candidate, or the same parameters on qartez_rename /
+            // qartez_safe_delete when about to mutate.
             out.push_str(&format!(
-                "# {} matches name '{}'. Pass `kind` / `file_path` (on refactor tools) to narrow. Reporting each candidate in order.\n\n",
-                total_candidates, params.symbol,
+                "# {} matches name '{}'. qartez_refs reports each candidate in order; use `qartez_calls name='{}' kind=... file_path=...` (or the same filters on qartez_rename / qartez_safe_delete) to disambiguate when narrowing matters.\n\n",
+                total_candidates, params.symbol, params.symbol,
             ));
         }
 
+        // Aggregate count of test-path importer rows hidden by the
+        // `include_tests=false` filter, summed across every candidate
+        // emitted in this response. Surfaced as a closing footer line
+        // so callers who flipped the flag off can tell at a glance how
+        // much test-only usage was suppressed and decide whether to
+        // re-run with `include_tests=true` for the full picture. The
+        // counter increments before the filter runs so the footer
+        // reflects raw rows, not collapsed-by-path lines.
+        let mut test_refs_hidden: usize = 0;
         for (candidates_emitted, (sym, file, importers)) in refs.iter().enumerate() {
             // Drop self-references only (a symbol whose `from_symbol_id`
             // equals the defining `sym.id`, i.e. `fn f() { f() }`) so the
@@ -108,6 +125,13 @@ impl QartezServer {
             // file path is classified as a test path. This is the same
             // predicate `qartez_calls` uses so both tools report a
             // consistent production-only view of a hub symbol.
+            if !include_tests {
+                test_refs_hidden += importers
+                    .iter()
+                    .filter(|(_, _, from_sym)| *from_sym != sym.id)
+                    .filter(|(_, f, _)| helpers::is_test_path(&f.path))
+                    .count();
+            }
             let external_importers: Vec<&(
                 crate::storage::models::EdgeRow,
                 crate::storage::models::FileRow,
@@ -124,7 +148,8 @@ impl QartezServer {
             if !concise && estimate_tokens(&out) > budget {
                 let remaining = total_candidates - candidates_emitted;
                 out.push_str(&format!(
-                    "\n... {remaining} candidate(s) truncated by token_budget. Pass `kind` / `file_path` to narrow, or raise `token_budget=`.\n",
+                    "\n... {remaining} candidate(s) truncated by token_budget. Raise `token_budget=`, or rerun via `qartez_calls name='{}' kind=... file_path=...` (or the same filters on qartez_rename / qartez_safe_delete) to narrow to a single candidate.\n",
+                    params.symbol,
                 ));
                 break;
             }
@@ -405,6 +430,19 @@ impl QartezServer {
                     }
                 }
             }
+        }
+
+        // Surface the include_tests=false suppression count so callers
+        // who pass the flag explicitly know how many test-only usages
+        // were hidden. The default include_tests=true path leaves this
+        // counter at zero and the footer is omitted.
+        if !include_tests && test_refs_hidden > 0 {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "// note: {test_refs_hidden} test ref(s) hidden by include_tests=false. Pass include_tests=true to surface them.\n",
+            ));
         }
 
         Ok(out)

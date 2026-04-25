@@ -521,6 +521,44 @@ impl QartezServer {
         gaps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         if gaps.is_empty() {
+            // When `min_pagerank` filtered every candidate out of the
+            // scan, the empty result is "filtered, not actually
+            // covered". Surface that distinction so callers do not
+            // mistake an aggressive filter for full coverage. Compare
+            // against `f64::EPSILON` rather than `> 0.0` so a
+            // deliberate `min_pagerank=0.0` from the schema default
+            // does not trigger the filtered-out branch.
+            let candidates_above_filter = ctx
+                .all_files
+                .iter()
+                .filter(|f| !is_test_path(&f.path) && is_testable_source_language(&f.language))
+                .filter(|f| match scope_rel.as_deref() {
+                    None => true,
+                    Some(scope) => {
+                        let dir = scope.trim_end_matches('/');
+                        f.path == scope
+                            || (!dir.is_empty()
+                                && (f.path.as_str() == dir
+                                    || f.path.starts_with(&format!("{dir}/"))))
+                    }
+                })
+                .count();
+            let any_above_filter = ctx.all_files.iter().any(|f| {
+                !is_test_path(&f.path)
+                    && is_testable_source_language(&f.language)
+                    && f.pagerank >= min_pagerank
+            });
+            if min_pagerank > f64::EPSILON && !any_above_filter && candidates_above_filter > 0 {
+                let msg = match scope_rel.as_deref() {
+                    Some(scope) => format!(
+                        "No source files met `min_pagerank={min_pagerank}` under scope `{scope}` ({candidates_above_filter} testable file(s) exist in the scope but all rank below the filter). Lower `min_pagerank` or omit it.",
+                    ),
+                    None => format!(
+                        "No source files met `min_pagerank={min_pagerank}` ({candidates_above_filter} testable file(s) exist but all rank below the filter). Lower `min_pagerank` or omit it.",
+                    ),
+                };
+                return Ok(msg);
+            }
             let msg = match scope_rel.as_deref() {
                 Some(scope) => format!(
                     "No untested source files found under scope `{scope}`. All files within the scope are covered by an external test file import or inline Rust tests (`#[cfg(test)]` / `#[test]`)."
@@ -599,7 +637,7 @@ impl QartezServer {
         )?;
 
         let changed = crate::git::diff::changed_files_in_range(&self.project_root, base)
-            .map_err(|e| format!("Git error: {e}"))?;
+            .map_err(|e| super::diff_impact::friendly_git_error(base, &e))?;
 
         if changed.is_empty() {
             return Ok(format!("No files changed in range '{base}'."));
@@ -850,5 +888,99 @@ fn augment_map_with_dispatcher_calls<'a>(
                 }
             }
         }
+    }
+}
+
+/// Coverage summary for a single source file. Drives the per-file
+/// annotation surfaced by `qartez_context include_test_gaps=true` so
+/// the compound flag uses the same coverage signal `qartez_test_gaps`
+/// applies in `mode=gaps`.
+#[derive(Debug, Default)]
+pub(in crate::server) struct FileCoverage {
+    /// Test files that directly import this source via the indexed
+    /// edge graph.
+    pub direct_test_paths: Vec<String>,
+    /// True when the source file declares its own `#[cfg(test)]`
+    /// or `#[test]` block. Inline-tested files are considered covered
+    /// even when no external test file imports them.
+    pub inline_rust_tests: bool,
+    /// Test files whose body text mentions the source's Rust module
+    /// stem. Catches Rust crate-rooted imports
+    /// (`use <crate>::<stem>`) that the edge resolver cannot see.
+    /// May overlap with `direct_test_paths`; the caller is responsible
+    /// for deduping if a single line listing is desired.
+    pub stem_mentioned_in_tests: Vec<String>,
+}
+
+impl FileCoverage {
+    /// True when any of the three signals fire. Mirrors the coverage
+    /// rule used by `test_gaps_find` so the answers stay consistent
+    /// across both surfaces.
+    pub(in crate::server) fn is_covered(&self) -> bool {
+        !self.direct_test_paths.is_empty()
+            || self.inline_rust_tests
+            || !self.stem_mentioned_in_tests.is_empty()
+    }
+}
+
+/// Compute coverage for `source_path` against the project. Public so
+/// `qartez_context include_test_gaps=true` and other compound surfaces
+/// can reuse the canonical signal without re-implementing it. The
+/// caller is expected to have already locked the DB.
+pub(in crate::server) fn coverage_for_source(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    source_path: &str,
+) -> FileCoverage {
+    let all_files = read::get_all_files(conn).unwrap_or_default();
+    // Resolve the source row by path. A miss is reported as
+    // FileCoverage::default() (untested) - same shape `qartez_context`
+    // already uses for missing input rows in the ranked listing.
+    let Some(file) = all_files.iter().find(|f| f.path == source_path) else {
+        return FileCoverage::default();
+    };
+
+    let test_paths: HashSet<&str> = all_files
+        .iter()
+        .filter(|f| is_test_path(&f.path))
+        .map(|f| f.path.as_str())
+        .collect();
+
+    // Direct edge importers that are themselves test files.
+    let mut direct: Vec<String> = Vec::new();
+    if let Ok(rows) = read::get_edges_to(conn, file.id) {
+        for edge in rows {
+            if let Ok(Some(importer)) = read::get_file_by_id(conn, edge.from_file)
+                && is_test_path(&importer.path)
+            {
+                direct.push(importer.path);
+            }
+        }
+    }
+    direct.sort();
+    direct.dedup();
+
+    let inline = has_inline_rust_tests(project_root, &file.path);
+
+    // FTS body-text fallback for crate-rooted Rust imports. Same
+    // helper test_gaps_find uses; the answer is the list of test
+    // file paths whose body contains the module stem.
+    let mut stem_mentioned: Vec<String> = Vec::new();
+    if let Some(stem) = rust_module_stem(&file.path)
+        && let Ok(paths) = read::find_file_paths_by_body_text(conn, &stem)
+    {
+        for p in paths {
+            if test_paths.contains(p.as_str()) {
+                stem_mentioned.push(p);
+            }
+        }
+    }
+    stem_mentioned.sort();
+    stem_mentioned.dedup();
+
+    FileCoverage {
+        direct_test_paths: direct,
+        inline_rust_tests: inline,
+        stem_mentioned_in_tests: stem_mentioned,
     }
 }

@@ -136,8 +136,19 @@ fn qartez_semantic_dispatch(
 #[cfg(not(feature = "semantic"))]
 fn qartez_semantic_dispatch(
     _server: &QartezServer,
-    _params: SemanticParams,
+    params: SemanticParams,
 ) -> Result<String, String> {
+    // Validate the query before reporting the missing-feature
+    // diagnostic so an empty input surfaces the same precise error
+    // the feature-enabled branch returns. Otherwise an empty query
+    // in a feature-disabled build silently routes to "rebuild with
+    // --features semantic", forcing the caller through a misleading
+    // rebuild loop: they fix the binary, retry with the same empty
+    // query, and only then see the real `query must be non-empty`
+    // error.
+    if params.query.trim().is_empty() {
+        return Err("query must be non-empty".to_string());
+    }
     // Two-step failure message so the caller knows which prerequisite
     // is missing. qartez_tools lists this tool as `[x] enabled` in the
     // tier index (the `#[tool]` attribute unconditionally registers

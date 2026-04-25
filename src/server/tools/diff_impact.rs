@@ -325,10 +325,37 @@ impl QartezServer {
                 "Files that historically change with the diff set but are NOT included:\n",
             );
             for (partner, pairs) in omissions.iter().take(15) {
+                // Resolve label collisions: when multiple source paths
+                // in the same partner row share the same basename
+                // (e.g. `server/mod.rs` + `index/mod.rs`), the bare
+                // basename is unreadable. Promote each colliding entry
+                // to `<parent>/<basename>` so the source files stay
+                // distinguishable. Non-colliding rows keep the bare
+                // basename to preserve the established short form.
+                let mut basename_counts: HashMap<&str, usize> = HashMap::new();
+                for (src, _) in pairs.iter() {
+                    let base = src.rsplit('/').next().unwrap_or(src);
+                    *basename_counts.entry(base).or_insert(0) += 1;
+                }
                 let detail: Vec<String> = pairs
                     .iter()
                     .map(|(src, count)| {
-                        format!("{} x{count}", src.rsplit('/').next().unwrap_or(src))
+                        let base = src.rsplit('/').next().unwrap_or(src);
+                        let label = if basename_counts.get(base).copied().unwrap_or(0) > 1 {
+                            let parts: Vec<&str> = src.rsplitn(3, '/').collect();
+                            // `rsplitn(3, '/')` yields up to [basename, parent, rest]
+                            // for `a/b/c.rs`, so `parts[0..2]` reversed is the
+                            // `parent/basename` pair we want. For top-level paths
+                            // (no parent) fall back to the full path.
+                            if parts.len() >= 2 {
+                                format!("{}/{}", parts[1], parts[0])
+                            } else {
+                                src.clone()
+                            }
+                        } else {
+                            base.to_string()
+                        };
+                        format!("{label} x{count}")
                     })
                     .collect();
                 out.push_str(&format!("  - {} ({})\n", partner, detail.join(", ")));
@@ -340,10 +367,26 @@ impl QartezServer {
         }
 
         if ack_enabled && !indexed.is_empty() {
-            out.push_str(&format!(
-                "\nGuard ACK written for {} indexed file(s).\n",
-                indexed.len(),
-            ));
+            // Differentiate per-file ACKs from the idempotency marker
+            // so a `.qartez/acks/` directory listing matches the count
+            // in this footer. The marker lives under
+            // `.qartez/acks/diff-markers/` (one file per (base, sorted
+            // changed paths) pair) and lets a repeated call on the
+            // same diff skip touching each per-file ACK; without this
+            // the audit reported "20 files" while ls showed 21 entries
+            // because the marker was undocumented in the user-visible
+            // footer.
+            if ack_marker_fresh {
+                out.push_str(&format!(
+                    "\nGuard ACK already current for {} indexed file(s) (idempotency marker matched in .qartez/acks/diff-markers/).\n",
+                    indexed.len(),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\nGuard ACK written for {} indexed file(s) (.qartez/acks/<digest>) plus 1 idempotency marker (.qartez/acks/diff-markers/<digest>).\n",
+                    indexed.len(),
+                ));
+            }
         }
 
         Ok(out)
@@ -372,7 +415,10 @@ fn is_head_self_compare(base: &str) -> bool {
 /// code=NotFound (-3)"` string straight through. Keep the underlying
 /// message as a trailing "(git:…)" suffix so operators who grep for
 /// the raw libgit2 codes still have them.
-fn friendly_git_error(base: &str, err: &impl std::fmt::Display) -> String {
+pub(in crate::server::tools) fn friendly_git_error(
+    base: &str,
+    err: &impl std::fmt::Display,
+) -> String {
     let raw = err.to_string();
     let lower = raw.to_ascii_lowercase();
     // WHY: `changed_files_in_range` rejects descendant-to-ancestor

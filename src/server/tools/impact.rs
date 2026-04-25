@@ -40,9 +40,26 @@ impl QartezServer {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
         let include_tests = params.include_tests.unwrap_or(false);
-        let file = read::get_file_by_path(&conn, &params.file_path)
+        // Mirror the on-disk hint that `qartez_cochange` emits so the
+        // two tools give the same recovery advice for the same input.
+        // Distinguishes "typo or wrong working dir" from "file exists
+        // but was added after the last index run" - the second form
+        // needs a reindex, not a path correction.
+        let file = match read::get_file_by_path(&conn, &params.file_path)
             .map_err(|e| format!("DB error: {e}"))?
-            .ok_or_else(|| format!("File '{}' not found in index", params.file_path))?;
+        {
+            Some(file) => file,
+            None => {
+                let resolved = self.project_root.join(&params.file_path);
+                if resolved.exists() {
+                    return Err(format!(
+                        "File '{}' not found in index (exists on disk, reindex the project)",
+                        params.file_path,
+                    ));
+                }
+                return Err(format!("File '{}' not found in index", params.file_path));
+            }
+        };
 
         // Record that Claude has now reviewed the impact of editing this
         // file. The guard binary reads this as an acknowledgment and lets

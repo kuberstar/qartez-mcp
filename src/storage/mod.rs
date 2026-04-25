@@ -1,3 +1,4 @@
+pub mod maintenance;
 pub mod models;
 pub mod read;
 pub mod schema;

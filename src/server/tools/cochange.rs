@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_cochange",
-        description = "Find files that historically change together (from git history). High co-change count means files are logically coupled — modifying one likely requires modifying the other.",
+        description = "Find files that historically change together (from git history). High co-change count means files are logically coupled - modifying one likely requires modifying the other. Pass `limit=0` to remove the row cap; the default is 10. Note: `max_commit_size` filters the live git walk, not the index-time cache. When git is unavailable or the working tree has diverged, the tool falls back to a pre-computed table whose pairs were captured under the index-time `--commit-size-cap` setting; in that fallback path `max_commit_size` is ignored.",
         annotations(
             title = "Co-change History",
             read_only_hint = true,
@@ -89,11 +89,22 @@ impl QartezServer {
             limit,
         );
 
+        // Track whether we served the result from the on-the-fly git
+        // walk or the pre-computed index-time cache. The two paths
+        // differ in which knobs are honoured: `max_commit_size` is
+        // applied per-commit by the git walk, but the cache was built
+        // under the indexer's own `--commit-size-cap` setting and
+        // cannot be re-filtered without reindexing. When the caller
+        // explicitly raised the filter and we still fall back, we
+        // surface a one-line note so the table doesn't look like the
+        // filter was silently applied.
+        let mut used_fallback = false;
         let pairs = match pairs {
             Some(p) if !p.is_empty() => p,
             _ => {
                 // Fallback: pre-computed table from index time. Useful when git
                 // is unavailable or has been modified since indexing.
+                used_fallback = true;
                 let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
                 let file = read::get_file_by_path(&conn, &params.file_path)
                     .map_err(|e| format!("DB error: {e}"))?
@@ -124,25 +135,50 @@ impl QartezServer {
                         params.file_path, file.change_count,
                     ));
                 }
-                cc.into_iter()
+                let mut fallback_pairs: Vec<(String, u32)> = cc
+                    .into_iter()
                     .map(|(c, f)| (f.path, c.count as u32))
-                    .collect()
+                    .collect();
+                // The DB query orders by `cc.count DESC` only, so two
+                // partners with the same co-change count come back in
+                // SQLite's row-id order which is stable per-session
+                // but not deterministic across re-indexes. The
+                // git-walk path already breaks ties by partner path
+                // (see `compute_cochange_pairs`), so we mirror that
+                // here to give callers a stable, comparable ordering
+                // regardless of which path they hit.
+                fallback_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                fallback_pairs
             }
+        };
+
+        // Only annotate when the caller explicitly set max_commit_size
+        // AND we served from cache. Default-arg callers never asked
+        // for a stricter filter, so the fallback's honest reading
+        // matches their request.
+        let max_commit_size_ignored = used_fallback && params.max_commit_size.is_some();
+        let cache_note = if max_commit_size_ignored {
+            format!(
+                " (cache fallback: max_commit_size={max_commit_size} not applied; reindex with that cap to enforce it)"
+            )
+        } else {
+            String::new()
         };
 
         if concise {
             let rendered: Vec<String> = pairs.iter().map(|(p, c)| format!("{p} ({c})")).collect();
             return Ok(format!(
-                "Co-changes for {} (max_commit_size={}): {}",
+                "Co-changes for {} (max_commit_size={}){}: {}",
                 params.file_path,
                 max_commit_size,
+                cache_note,
                 rendered.join(", ")
             ));
         }
 
         let mut out = format!(
-            "# Co-changes for: {} (max_commit_size={})\n\n",
-            params.file_path, max_commit_size,
+            "# Co-changes for: {} (max_commit_size={}){}\n\n",
+            params.file_path, max_commit_size, cache_note,
         );
         out.push_str(" # | File                                | Count\n");
         out.push_str("---+-------------------------------------+------\n");

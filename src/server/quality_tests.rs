@@ -783,7 +783,7 @@ fn elision_gap_marker_between_symbols() {
 #[test]
 fn overview_contains_header() {
     let (server, _dir) = setup();
-    let output = server.build_overview(20, 4000, None, None, false, false);
+    let output = server.build_overview(20, 4000, None, None, false, false, false);
     assert!(output.contains("# Codebase:"));
     assert!(output.contains("files"));
     assert!(output.contains("symbols indexed"));
@@ -793,7 +793,7 @@ fn overview_contains_header() {
 fn overview_budget_respected() {
     let (server, _dir) = setup();
     for budget in [100, 500, 1000, 2000, 4000] {
-        let output = server.build_overview(20, budget, None, None, false, false);
+        let output = server.build_overview(20, budget, None, None, false, false, false);
         let tokens = estimate_tokens(&output);
         let max_allowed = (budget as f64 * BUDGET_TOLERANCE) as usize;
         assert!(
@@ -806,8 +806,8 @@ fn overview_budget_respected() {
 #[test]
 fn overview_concise_smaller_than_detailed() {
     let (server, _dir) = setup();
-    let detailed = server.build_overview(20, 10000, None, None, false, false);
-    let concise = server.build_overview(20, 10000, None, None, true, false);
+    let detailed = server.build_overview(20, 10000, None, None, false, false, false);
+    let concise = server.build_overview(20, 10000, None, None, true, false, false);
 
     assert!(
         detailed.len() >= concise.len(),
@@ -820,7 +820,7 @@ fn overview_concise_smaller_than_detailed() {
 #[test]
 fn overview_concise_no_source_sections() {
     let (server, _dir) = setup();
-    let concise = server.build_overview(20, 10000, None, None, true, false);
+    let concise = server.build_overview(20, 10000, None, None, true, false, false);
     assert!(
         !concise.contains("## src/"),
         "concise overview should not contain file source sections"
@@ -830,8 +830,8 @@ fn overview_concise_no_source_sections() {
 #[test]
 fn overview_top_n_limits_files() {
     let (server, _dir) = setup();
-    let output_1 = server.build_overview(1, 10000, None, None, true, false);
-    let output_all = server.build_overview(100, 10000, None, None, true, false);
+    let output_1 = server.build_overview(1, 10000, None, None, true, false, false);
+    let output_all = server.build_overview(100, 10000, None, None, true, false, false);
 
     let count_1 = output_1.lines().filter(|l| l.contains('|')).count();
     let count_all = output_all.lines().filter(|l| l.contains('|')).count();
@@ -845,7 +845,7 @@ fn overview_top_n_limits_files() {
 #[test]
 fn overview_tiny_budget_still_has_header() {
     let (server, _dir) = setup();
-    let output = server.build_overview(20, 10, None, None, false, false);
+    let output = server.build_overview(20, 10, None, None, false, false, false);
     assert!(
         output.contains("# Codebase:"),
         "even with tiny budget, header should be present"
@@ -855,8 +855,15 @@ fn overview_tiny_budget_still_has_header() {
 #[test]
 fn overview_boost_terms_affect_ranking() {
     let (server, _dir) = setup();
-    let output_boosted =
-        server.build_overview(20, 10000, None, Some(&["Config".to_string()]), true, false);
+    let output_boosted = server.build_overview(
+        20,
+        10000,
+        None,
+        Some(&["Config".to_string()]),
+        true,
+        false,
+        false,
+    );
     // With boost_terms=["Config"], models.rs should appear higher
     let lines: Vec<&str> = output_boosted
         .lines()
@@ -2349,7 +2356,7 @@ fn budget_sweep_qartez_map() {
     let (server, _dir) = setup();
     let mut prev_len = 0;
     for budget in [50, 100, 500, 1000, 2000, 4000, 8000] {
-        let output = server.build_overview(20, budget, None, None, false, false);
+        let output = server.build_overview(20, budget, None, None, false, false, false);
         let tokens = estimate_tokens(&output);
         let max = (budget as f64 * BUDGET_TOLERANCE) as usize;
         assert!(
@@ -2493,7 +2500,7 @@ fn edge_empty_db_qartez_map() {
     fs::create_dir(dir.path().join(".git")).unwrap();
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
-    let output = server.build_overview(20, 4000, None, None, false, false);
+    let output = server.build_overview(20, 4000, None, None, false, false, false);
     assert!(output.contains("0 files"));
     assert!(output.contains("0 symbols"));
 }
@@ -2628,8 +2635,8 @@ fn format_consistency_all_tools() {
     let (server, _dir) = setup();
 
     // qartez_map
-    let d = server.build_overview(20, 10000, None, None, false, false);
-    let c = server.build_overview(20, 10000, None, None, true, false);
+    let d = server.build_overview(20, 10000, None, None, false, false, false);
+    let c = server.build_overview(20, 10000, None, None, true, false, false);
     assert!(d.len() >= c.len(), "qartez_map: detailed >= concise");
 
     // qartez_find
@@ -2761,7 +2768,7 @@ fn monotonicity_qartez_map() {
     let budgets = [100, 500, 1000, 4000];
     let outputs: Vec<String> = budgets
         .iter()
-        .map(|&b| server.build_overview(20, b, None, None, false, false))
+        .map(|&b| server.build_overview(20, b, None, None, false, false, false))
         .collect();
     for i in 1..outputs.len() {
         assert!(
@@ -3924,10 +3931,13 @@ fn qartez_hotspots_concise_health_field_position() {
 }
 
 #[test]
-fn qartez_hotspots_threshold_above_10_clamped() {
-    // threshold > 10 should be clamped to 10 (no effect)
+fn qartez_hotspots_threshold_above_10_rejected() {
+    // threshold > 10 must be rejected explicitly. The previous silent
+    // clamp to 10 turned the filter into a no-op (every file has
+    // health <= 10) without telling the caller their value was out
+    // of the documented 0-10 range.
     let (server, _dir) = setup_with_complexity();
-    let with_100 = server
+    let err = server
         .qartez_hotspots(Parameters(SoulHotspotsParams {
             limit: Some(100),
             level: Some(HotspotLevel::File),
@@ -3935,21 +3945,10 @@ fn qartez_hotspots_threshold_above_10_clamped() {
             threshold: Some(100),
             ..Default::default()
         }))
-        .unwrap();
-    let no_threshold = server
-        .qartez_hotspots(Parameters(SoulHotspotsParams {
-            limit: Some(100),
-            level: Some(HotspotLevel::File),
-            format: Some(Format::Concise),
-            threshold: None,
-            ..Default::default()
-        }))
-        .unwrap();
-    let t100_count = with_100.lines().skip(1).count();
-    let none_count = no_threshold.lines().skip(1).count();
-    assert_eq!(
-        t100_count, none_count,
-        "threshold=100 (clamped to 10) should return same as no threshold"
+        .unwrap_err();
+    assert!(
+        err.contains("outside the documented 0-10 range"),
+        "expected out-of-range error, got: {err}"
     );
 }
 
@@ -7849,6 +7848,208 @@ fn qartez_health_buckets_match_intersection_rule() {
     assert!(
         out.contains("## Medium") || out.contains("Medium"),
         "low-pagerank smells must fall into Medium bucket:\n{out}",
+    );
+}
+
+// =========================================================================
+// Section: compound surfaces (qartez_context flags, qartez_understand, qartez_map with_health)
+// =========================================================================
+
+#[test]
+fn qartez_context_include_impact_appends_section() {
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_context(Parameters(SoulContextParams {
+            files: vec!["src/main.rs".into()],
+            include_impact: Some(true),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        result.contains("## Impact (per input file)"),
+        "include_impact must append Impact section: {result}",
+    );
+    assert!(
+        result.contains("src/main.rs - direct=") && result.contains("transitive="),
+        "Impact section must show counts per input file: {result}",
+    );
+}
+
+#[test]
+fn qartez_context_include_test_gaps_appends_section() {
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_context(Parameters(SoulContextParams {
+            files: vec!["src/main.rs".into()],
+            include_test_gaps: Some(true),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        result.contains("## Test gaps (per input file)"),
+        "include_test_gaps must append Test gaps section: {result}",
+    );
+    // The fixture does not register any test files, so every input
+    // path lands in the `untested` branch. This guards both the
+    // tag wording and the per-row format the caller will read.
+    assert!(
+        result.contains("src/main.rs - untested"),
+        "fixture has no tests so input must be marked untested: {result}",
+    );
+}
+
+#[test]
+fn qartez_context_default_omits_compound_sections() {
+    // Default (both flags off) is a regression boundary: prior callers
+    // must see the same response shape they did before the flags
+    // landed. Without this test, a future tweak to the loop could
+    // start emitting empty headers and silently break existing
+    // assertions in downstream code.
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_context(Parameters(SoulContextParams {
+            files: vec!["src/main.rs".into()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        !result.contains("## Impact (per input file)"),
+        "default qartez_context must not include Impact section: {result}",
+    );
+    assert!(
+        !result.contains("## Test gaps (per input file)"),
+        "default qartez_context must not include Test gaps section: {result}",
+    );
+}
+
+#[test]
+fn qartez_understand_resolves_unique_symbol() {
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_understand(Parameters(SoulUnderstandParams {
+            name: "helper".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        result.contains("# Symbol:") && result.contains("helper"),
+        "happy path must surface header for the resolved symbol: {result}",
+    );
+    assert!(
+        result.contains("## Definition"),
+        "default sections must include Definition: {result}",
+    );
+}
+
+#[test]
+fn qartez_understand_unknown_section_errors() {
+    let (server, _dir) = setup();
+    let err = server
+        .qartez_understand(Parameters(SoulUnderstandParams {
+            name: "helper".into(),
+            sections: Some(vec!["definitions".into()]),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(
+        err.contains("Unknown section"),
+        "typo'd section name must surface a clear error: {err}",
+    );
+}
+
+#[test]
+fn qartez_understand_sections_filter_skips_excluded() {
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_understand(Parameters(SoulUnderstandParams {
+            name: "helper".into(),
+            sections: Some(vec!["definition".into()]),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        result.contains("## Definition"),
+        "Definition must be present when explicitly selected: {result}",
+    );
+    assert!(
+        !result.contains("## Calls"),
+        "Calls must be omitted when not in sections: {result}",
+    );
+    assert!(
+        !result.contains("## References"),
+        "References must be omitted when not in sections: {result}",
+    );
+    assert!(
+        !result.contains("## Co-change partners"),
+        "Co-change must be omitted when not in sections: {result}",
+    );
+}
+
+#[test]
+fn qartez_understand_missing_symbol_errors() {
+    let (server, _dir) = setup();
+    let err = server
+        .qartez_understand(Parameters(SoulUnderstandParams {
+            name: "completely_missing_symbol_xyz".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(
+        err.contains("No symbol found with name"),
+        "missing symbol must error with the unified wording: {err}",
+    );
+}
+
+#[test]
+fn qartez_understand_empty_name_errors() {
+    let (server, _dir) = setup();
+    let err = server
+        .qartez_understand(Parameters(SoulUnderstandParams {
+            name: "   ".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(
+        err.contains("`name` must be non-empty"),
+        "whitespace-only name must error: {err}",
+    );
+}
+
+#[test]
+fn qartez_map_with_health_emits_cc_column() {
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_map(Parameters(QartezParams {
+            with_health: Some(true),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        result.contains("Health"),
+        "with_health=true must include the Health column header: {result}",
+    );
+    assert!(
+        result.contains("CC="),
+        "with_health=true must include the CC marker per row: {result}",
+    );
+}
+
+#[test]
+fn qartez_map_default_no_health_column() {
+    // Same regression-boundary rationale as the qartez_context default
+    // test: silent shape changes in qartez_map's response would break
+    // every caller that parses the existing rank/path/PR table.
+    let (server, _dir) = setup();
+    let result = server
+        .qartez_map(Parameters(QartezParams::default()))
+        .unwrap();
+    assert!(
+        !result.contains("CC="),
+        "default qartez_map must not emit a CC marker: {result}",
+    );
+    assert!(
+        !result.contains("Health"),
+        "default qartez_map must not emit the Health column: {result}",
     );
 }
 

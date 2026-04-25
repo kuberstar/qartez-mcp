@@ -108,6 +108,19 @@ impl QartezServer {
                 any_match.iter().map(|(s, _)| s.kind.clone()).collect();
             let available_files: std::collections::BTreeSet<String> =
                 any_match.iter().map(|(_, f)| f.path.clone()).collect();
+            // Cap the file list shown to the caller. A `file_path` typo on
+            // a heavily-imported symbol (`HashMap`, `Result`, `Option`)
+            // could otherwise dump hundreds of paths from every indexed
+            // root into the error message, which is both noisy and a
+            // gratuitous information leak when the workspace contains
+            // multiple roots the caller did not deliberately query.
+            const MAX_AVAILABLE_FILES_SHOWN: usize = 20;
+            let total_available = available_files.len();
+            let shown_files: Vec<String> = available_files
+                .iter()
+                .take(MAX_AVAILABLE_FILES_SHOWN)
+                .cloned()
+                .collect();
             let mut parts: Vec<String> = Vec::new();
             if let Some(k) = params.kind.as_deref().filter(|s| !s.is_empty()) {
                 parts.push(format!(
@@ -116,9 +129,17 @@ impl QartezServer {
                 ));
             }
             if let Some(fp) = params.file_path.as_deref().filter(|s| !s.is_empty()) {
+                let suffix = if total_available > MAX_AVAILABLE_FILES_SHOWN {
+                    format!(
+                        ", ... ({} more)",
+                        total_available - MAX_AVAILABLE_FILES_SHOWN,
+                    )
+                } else {
+                    String::new()
+                };
                 parts.push(format!(
-                    "file_path='{fp}' did not match any definition (available files: {})",
-                    available_files.into_iter().collect::<Vec<_>>().join(", "),
+                    "file_path='{fp}' did not match any definition (available files: {}{suffix})",
+                    shown_files.join(", "),
                 ));
             }
             return Err(format!(

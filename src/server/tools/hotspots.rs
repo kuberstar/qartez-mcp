@@ -23,7 +23,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_hotspots",
-        description = "Find hotspot files or functions with a normalized 0-10 health score. Combines complexity, coupling (PageRank), and churn (git change frequency) into both a raw hotspot score and a health rating (10 = healthiest, 0 = worst). Use sort_by to rank by any individual factor; use threshold to filter unhealthy code (e.g. threshold=4 shows only files scoring 4 or below). Requires a prior index with git depth > 0.",
+        description = "Find hotspot files or functions with a normalized 0-10 health score. Combines complexity, coupling (PageRank), and churn (git change frequency) into both a raw hotspot score and a health rating (10 = healthiest, 0 = worst). Use sort_by to rank by any individual factor; use threshold to filter unhealthy code (e.g. threshold=4 shows only files scoring 4 or below). Requires a prior index with git depth > 0. For level=symbol the churn factor is the file's change_count - tooling cannot attribute git churn to individual symbols, so high-churn files inflate every symbol's hotspot score even when the symbol itself was never edited. Pass `limit=0` to remove the row cap; the default is 20.",
         annotations(
             title = "Hotspot Analysis",
             read_only_hint = true,
@@ -38,7 +38,14 @@ impl QartezServer {
     ) -> Result<String, String> {
         reject_mermaid(&params.format, "qartez_hotspots")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
-        let limit = params.limit.unwrap_or(20) as usize;
+        // `limit=0` means "no cap" project-wide convention, matching
+        // `qartez_cochange` / `qartez_health` / `qartez_unused`. `None`
+        // keeps the historical default of 20.
+        let limit = match params.limit {
+            None => 20_usize,
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+        };
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(HotspotLevel::File);
         let sort_by = params.sort_by.unwrap_or_default();
@@ -53,7 +60,19 @@ impl QartezServer {
                 "threshold=0 excludes every file (only files with health score <= 0 would match, and health is always >= 0). Use threshold=10 to see all files, or the default for unhealthy-only view.".to_string(),
             );
         }
-        let threshold = params.threshold.map(|t| t.min(10) as f64);
+        // Reject out-of-range threshold values explicitly. The previous
+        // build silently clamped values > 10 to 10, which made
+        // `threshold=100` a no-op (every file passes since health <= 10
+        // by construction). Surfacing the misuse beats letting the
+        // filter quietly do nothing.
+        if let Some(n) = params.threshold
+            && n > 10
+        {
+            return Err(format!(
+                "threshold={n} is outside the documented 0-10 range (10 = healthiest, 0 = least healthy). Use threshold=10 to see all files, or a value 1-9 for an unhealthy-only view."
+            ));
+        }
+        let threshold = params.threshold.map(|t| t as f64);
         let threshold_notice: &str = "";
 
         // Health score per factor: 10 / (1 + value / halflife).
@@ -304,7 +323,8 @@ impl QartezServer {
                         out.push_str(
                             "Health = mean of per-factor scores (0-10 scale, 10 = healthiest)\n",
                         );
-                        out.push_str("Hotspot score = complexity x symbol_pagerank x (1 + file_change_count)\n\n");
+                        out.push_str("Hotspot score = complexity x symbol_pagerank x (1 + file_change_count)\n");
+                        out.push_str("Note: the churn factor here is the FILE's change_count, not the symbol's. Tooling cannot attribute git churn to individual symbols, so symbols inside a high-churn file all inherit the same churn weight even when the specific symbol was never edited.\n\n");
                     }
                     out.push_str("  # | Score    | Health | Symbol                    | Kind     | File                          | CC | PageRank | Churn\n");
                     out.push_str("----+----------+--------+---------------------------+----------+-------------------------------+----+----------+------\n");

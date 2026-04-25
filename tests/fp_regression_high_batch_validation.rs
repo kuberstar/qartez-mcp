@@ -86,6 +86,80 @@ fn replace_symbol_rejects_trailing_content() {
 }
 
 // ---------------------------------------------------------------------------
+// H1.5 replace_symbol's trailing-content gate must reject Rust input
+// containing lifetimes followed by extra items. Pre-fix, `'a` and
+// `'static` consumed every brace/semicolon up to the next `'` because
+// the state machine treated the apostrophe as the start of a char
+// literal; this silently let `fn foo<'a>(x: &'a str) -> &'a str { x }
+// \nbar();` slip past the gate. The end-to-end test wires the bug
+// through `qartez_replace_symbol` to lock in the fix at the MCP layer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replace_symbol_rejects_trailing_content_after_lifetime() {
+    let dir = TempDir::new().unwrap();
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod a;\n"),
+        (
+            "src/a.rs",
+            "pub fn foo<'a>(x: &'a str) -> &'a str { x }\npub fn helper() {}\n",
+        ),
+    ];
+    let server = build_and_index(dir.path(), &files);
+
+    let err = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "foo",
+                "new_code": "pub fn foo<'a>(x: &'a str) -> &'a str { x }\nstuff();\ngarbage;",
+            }),
+        )
+        .expect_err("trailing junk after a function with lifetimes must be rejected");
+    assert!(
+        err.contains("trailing content") || err.contains("one top-level item"),
+        "rejection must mention trailing content, got: {err}",
+    );
+}
+
+#[test]
+fn replace_symbol_accepts_clean_lifetime_function() {
+    // Counterpart to the rejection test: a clean replacement that uses
+    // lifetimes must not be rejected by the trailing-content gate.
+    let dir = TempDir::new().unwrap();
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod a;\n"),
+        (
+            "src/a.rs",
+            "pub fn foo<'a>(x: &'a str) -> &'a str { x }\npub fn helper() {}\n",
+        ),
+    ];
+    let server = build_and_index(dir.path(), &files);
+
+    let preview = server
+        .call_tool_by_name(
+            "qartez_replace_symbol",
+            json!({
+                "symbol": "foo",
+                "new_code": "pub fn foo<'a>(x: &'a str) -> &'a str { x.trim() }",
+            }),
+        )
+        .expect("clean lifetime replacement must be accepted (preview mode)");
+    assert!(
+        !preview.to_lowercase().contains("trailing content"),
+        "clean lifetime replacement must not trigger the trailing-content gate, got: {preview}",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // H2 replace_symbol refuses when the defined identifier does not match.
 // ---------------------------------------------------------------------------
 

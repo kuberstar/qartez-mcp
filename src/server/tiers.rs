@@ -48,6 +48,7 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
     "qartez_semantic",
     "qartez_test_gaps",
     "qartez_knowledge",
+    "qartez_understand",
 ];
 
 /// Destructive refactoring tools unlocked on demand.
@@ -65,9 +66,18 @@ pub(super) const TIER_REFACTOR: &[&str] = &[
 ///
 /// `qartez_workspace` lives here (not in core) because it mutates
 /// `.qartez/workspace.toml`, rewrites in-memory `project_roots`, and can
-/// bulk-delete from the index — configuration actions, not the daily
-/// navigate/read/assess loop.
-pub(super) const TIER_META: &[&str] = &["qartez_project", "qartez_wiki", "qartez_workspace"];
+/// bulk-delete from the index - configuration actions, not the daily
+/// navigate/read/assess loop. `qartez_maintenance` lives here for the
+/// same reason: vacuum/checkpoint/purge actions are operator-driven
+/// upkeep, not analysis.
+pub(super) const TIER_META: &[&str] = &[
+    "qartez_project",
+    "qartez_wiki",
+    "qartez_workspace",
+    "qartez_add_root",
+    "qartez_list_roots",
+    "qartez_maintenance",
+];
 
 /// The `qartez_tools` discovery tool is always visible regardless of mode.
 pub(super) const META_TOOL_NAME: &str = "qartez_tools";

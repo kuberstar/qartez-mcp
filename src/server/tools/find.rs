@@ -130,9 +130,21 @@ impl QartezServer {
                 return Ok(format!("No symbol found with name '{name}'"));
             }
             let suggestions = suggest_similar_names(&conn, &name);
-            let hint = format!(
-                "\nTry `qartez_grep query={name}*` for prefix search, or pass `regex=true` for a pattern match.",
-            );
+            // FTS5 treats most punctuation as syntax (e.g. `Config!@#$*`
+            // is a parse error). When the name is not a clean
+            // alphanumeric/underscore prefix, recommend `regex=true`
+            // first since the FTS prefix-search recovery would just
+            // surface another error. The plain-prefix hint stays for
+            // legitimate identifier-shaped misses.
+            let is_plain_prefix =
+                !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+            let hint = if is_plain_prefix {
+                format!(
+                    "\nTry `qartez_grep query={name}*` for prefix search, or pass `regex=true` for a pattern match.",
+                )
+            } else {
+                "\nThe name contains characters FTS5 treats as syntax. Pass `regex=true` for a pattern match instead of a prefix search.".to_string()
+            };
             if suggestions.is_empty() {
                 return Ok(format!("No symbol found with name '{name}'{hint}"));
             }

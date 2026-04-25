@@ -56,6 +56,20 @@ impl QartezServer {
         let min_cc = params.min_complexity.unwrap_or(15);
         let min_lines = params.min_lines.unwrap_or(50);
         let min_params = params.min_params.unwrap_or(5) as usize;
+        // Validate `envy_ratio` against the documented contract. The
+        // detector compares `external_calls / own_calls > envy_ratio`,
+        // so a value <= 0 makes every method match (the ratio is
+        // non-negative by construction) and NaN/Inf produce a useless
+        // wall of false positives. Reject explicitly to mirror the
+        // already-strict `max_health` validation in qartez_health
+        // rather than silently accepting an unusable threshold.
+        if let Some(r) = params.envy_ratio
+            && (!r.is_finite() || r <= 0.0)
+        {
+            return Err(format!(
+                "envy_ratio must be a finite value > 0 (got {r}). The detector compares external_calls/own_calls > envy_ratio; values <= 0 match every method and produce noise."
+            ));
+        }
         let envy_ratio = params.envy_ratio.unwrap_or(2.0);
 
         // Parse the comma-separated kind selection leniently: empty
@@ -952,7 +966,7 @@ fn format_feature_envy(
 /// receiver params (`self`, `&self`, `&mut self` in Rust, `self`/`cls` in
 /// Python). Handles nested generics (`HashMap<K, V>`) and nested parens so
 /// commas inside type parameters are not miscounted.
-pub(super) fn count_signature_params(sig: &str) -> usize {
+pub(in crate::server) fn count_signature_params(sig: &str) -> usize {
     // Find the first '(' and its matching ')'
     let start = match sig.find('(') {
         Some(i) => i + 1,

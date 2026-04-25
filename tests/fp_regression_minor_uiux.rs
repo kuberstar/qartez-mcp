@@ -424,17 +424,20 @@ fn health_clamps_max_health_above_ten() {
 
 #[test]
 fn unused_limit_zero_returns_all_rows() {
-    // Unified rejection contract (matches clones / trend). `limit=0` is a
-    // caller mistake, not a no-cap shortcut. The canonical message names
-    // the contract explicitly so callers fix the argument.
+    // qartez_unused was realigned with the rest of the tool family on
+    // the no-cap convention: limit=0 removes the row cap, matching
+    // qartez_cochange / qartez_health / qartez_hotspots /
+    // qartez_context. The original "limit=0 is a mistake" stance was
+    // the inconsistent outlier; settle on no-cap so callers do not
+    // have to remember per-tool exceptions.
     let dir = TempDir::new().unwrap();
     let server = build_and_index(dir.path(), &[("src/a.rs", "pub fn x() {}\n")]);
-    let err = server
+    let result = server
         .call_tool_by_name("qartez_unused", json!({ "limit": 0 }))
-        .expect_err("qartez_unused limit=0 must now be rejected");
+        .expect("qartez_unused limit=0 must mean no-cap, not error");
     assert!(
-        err.contains("limit must be > 0") && err.contains("no-cap"),
-        "rejection must describe the zero-limit contract, got: {err}"
+        !result.contains("limit must be > 0"),
+        "limit=0 must not produce a rejection, got: {result}"
     );
 }
 

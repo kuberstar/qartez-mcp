@@ -94,8 +94,24 @@ impl QartezServer {
                 }
                 out.push('\n');
             }
-            out.push_str("Use `enable: [\"analysis\"]` or `enable: [\"all\"]` to unlock tiers.\n");
-            out.push_str("Use `disable: [\"refactor\"]` to hide tiers.\n");
+            if progressive {
+                out.push_str(
+                    "Use `enable: [\"analysis\"]` or `enable: [\"all\"]` to unlock tiers.\n",
+                );
+                out.push_str("Use `disable: [\"refactor\"]` to hide tiers.\n");
+            } else {
+                // Non-progressive mode auto-enables every tier at startup,
+                // so the `enable[...]` invitation is misleading. Keep the
+                // call-shape examples (callers can still toggle individual
+                // tiers) but lead with the explicit contract so a fresh
+                // reader does not assume a tier is locked.
+                out.push_str(
+                    "All tiers are auto-enabled in this build; `enable: [...]` is a no-op for tier names already shown as `enabled`. Set `QARTEZ_PROGRESSIVE=1` to require opt-in for non-core tiers.\n",
+                );
+                out.push_str(
+                    "`disable: [\"refactor\"]` still hides a tier for the current session even outside progressive mode.\n",
+                );
+            }
             return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
 

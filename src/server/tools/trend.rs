@@ -162,8 +162,13 @@ impl QartezServer {
                     params.file_path,
                 )
             } else {
+                // Avoid the previous "file may have been non-code"
+                // wording: it gaslit callers about a 21-line lib.rs
+                // that is real code but has no per-symbol complexity
+                // (declaration-only modules, type aliases, re-exports).
+                // Name the actual condition the analyzer measured.
                 format!(
-                    "Complexity not computable for '{}'. The file may have been non-code.",
+                    "No per-symbol complexity series for '{}'. The file is indexed across {file_commit_count} commits, but no function or method had measurable cyclomatic complexity (declaration-only modules, type aliases, or re-exports). Pass a `symbol_name` defined inside this file to see whether the parser extracted it.",
                     params.file_path,
                 )
             };

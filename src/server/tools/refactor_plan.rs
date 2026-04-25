@@ -76,6 +76,15 @@ impl QartezServer {
         let symbols =
             read::get_symbols_for_file(&conn, file.id).map_err(|e| format!("DB error: {e}"))?;
 
+        // Hard CC floor for god-step entries. The rationale text
+        // ("{cc} decision points in a {lines}-line body is past the
+        // usual review/test budget") is calibrated for non-trivial
+        // complexity; below CC=5 the wording is misleading because a
+        // CC=1 function has zero branching by definition. The user's
+        // `min_complexity` knob still applies on top of this floor.
+        // The long-params axis is unaffected.
+        const REFACTOR_PLAN_GOD_CC_FLOOR: u32 = 5;
+        let effective_min_cc = min_cc.max(REFACTOR_PLAN_GOD_CC_FLOOR);
         let mut steps: Vec<Step> = Vec::new();
         for sym in &symbols {
             if !matches!(sym.kind.as_str(), "function" | "method") {
@@ -83,7 +92,7 @@ impl QartezServer {
             }
             if let Some(cc) = sym.complexity {
                 let body = sym.line_end.saturating_sub(sym.line_start) + 1;
-                if cc >= min_cc && body >= min_lines {
+                if cc >= effective_min_cc && body >= min_lines {
                     steps.push(Step::god(sym, cc, body));
                 }
             }
@@ -97,7 +106,7 @@ impl QartezServer {
 
         if steps.is_empty() {
             return Ok(format!(
-                "No smells detected in `{rel}` at min_complexity={min_cc}, min_lines={min_lines}, min_params={min_params}. Lower thresholds to widen, or inspect the file with `qartez_outline file_path={rel}`."
+                "No smells detected in `{rel}` at min_complexity={effective_min_cc}, min_lines={min_lines}, min_params={min_params}. Lower thresholds to widen, or inspect the file with `qartez_outline file_path={rel}`."
             ));
         }
 

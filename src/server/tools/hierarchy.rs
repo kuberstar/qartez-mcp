@@ -31,11 +31,30 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulHierarchyParams>,
     ) -> Result<String, String> {
+        // `symbol=""` previously fell through to the index lookup and
+        // surfaced the generic "Symbol '' not found in index" error,
+        // which hid the actual misuse (an empty/missing required
+        // argument) behind a "looks like a typo" message. Reject up
+        // front so the caller sees the contract violation directly.
+        if params.symbol.trim().is_empty() {
+            return Err(
+                "symbol must be a non-empty string (got an empty value). Pass a type or trait name like 'Display' or 'LanguageSupport'.".into(),
+            );
+        }
         let concise = is_concise(&params.format);
         let direction = params.direction.as_deref().unwrap_or("sub").to_lowercase();
         let transitive = params.transitive.unwrap_or(false);
         const DEFAULT_MAX_DEPTH: u32 = 20;
-        let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        // Hard ceiling matches `qartez_calls` MAX_CALL_DEPTH: hierarchy
+        // walks fan out through `type_hierarchy` rows, so an unbounded
+        // request on a hub trait (e.g. `LanguageSupport` with 37+ direct
+        // impls feeding a transitive sweep) can blow up the BFS frontier
+        // before any result is rendered. Clamp values above the cap and
+        // surface a `!warning:` so the caller sees the cap was applied.
+        const MAX_HIERARCHY_DEPTH: u32 = 50;
+        let requested_max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let max_depth = requested_max_depth.min(MAX_HIERARCHY_DEPTH);
+        let max_depth_clamped = requested_max_depth > MAX_HIERARCHY_DEPTH;
 
         if is_mermaid(&params.format) {
             return self.qartez_hierarchy_mermaid(
@@ -85,6 +104,15 @@ impl QartezServer {
         }
 
         let mut out = String::new();
+        // Surface the depth clamp as a `!warning:` line up front so a
+        // caller skimming the head of the output immediately sees that
+        // the traversal was capped. Mirrors the equivalent banner in
+        // `qartez_calls`.
+        if max_depth_clamped {
+            out.push_str(&format!(
+                "!warning: max_depth={requested_max_depth} was clamped to {MAX_HIERARCHY_DEPTH} (server-side hard cap to prevent hub-trait blow-up).\n\n",
+            ));
+        }
 
         match direction.as_str() {
             "sub" | "down" | "implementors" => {

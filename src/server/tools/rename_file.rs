@@ -84,6 +84,26 @@ impl QartezServer {
                 params.from,
             ));
         }
+        // Build-system manifests (Cargo.toml, package.json, pyproject.toml,
+        // go.mod, etc.) are discovered by exact basename by every toolchain
+        // that owns them. Renaming detaches the package from its resolver
+        // and the build fails with a cryptic error rather than the precise
+        // refusal callers get for `mod.rs` / `lib.rs`. Symmetry with
+        // `is_crate_root_file` demands the same guard here, applied to BOTH
+        // `from` and `to` so a rename cannot smuggle a build-breaking
+        // destination basename either.
+        if let Some(manifest) = is_protected_manifest_file(&params.from) {
+            return Err(format!(
+                "Refusing to rename '{}': '{manifest}' is a build-system manifest discovered by basename (Cargo, npm, Python build backends, Go modules, etc.). Renaming detaches the package from its resolver. Restructure the package by moving its directory, not the manifest itself.",
+                params.from,
+            ));
+        }
+        if let Some(manifest) = is_protected_manifest_file(&params.to) {
+            return Err(format!(
+                "Refusing to rename '{}' -> '{}': target basename '{manifest}' is a build-system manifest. Creating one by rename clobbers any existing manifest discovery and breaks the build. Pick a non-manifest destination basename.",
+                params.from, params.to,
+            ));
+        }
 
         let from_norm = crate::index::to_forward_slash(params.from.clone());
         let to_norm = crate::index::to_forward_slash(params.to.clone());
@@ -385,9 +405,43 @@ fn is_crate_root_file(rel_path: &str) -> bool {
     last == "src" || (last == "bin" && second_last == "src")
 }
 
+/// Detect build-system manifests that toolchains (Cargo, npm, Python build
+/// backends, Go modules, etc.) discover by exact basename. Renaming such
+/// a file detaches the package from its resolver and surfaces as a cryptic
+/// build error rather than a precise refusal. The check is basename-only -
+/// directory layout does not matter, because every one of these names is
+/// reserved by basename across the entire ecosystem.
+fn is_protected_manifest_file(rel_path: &str) -> Option<&'static str> {
+    const MANIFEST_BASENAMES: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "go.mod",
+        "go.sum",
+        "build.gradle",
+        "build.gradle.kts",
+        "pom.xml",
+        "Gemfile",
+        "Gemfile.lock",
+        "composer.json",
+        "composer.lock",
+        "Pipfile",
+        "Pipfile.lock",
+    ];
+    let norm = rel_path.replace('\\', "/");
+    let basename = norm.rsplit('/').next()?;
+    MANIFEST_BASENAMES.iter().find(|n| **n == basename).copied()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_crate_root_file, validate_rename_path_arg};
+    use super::{is_crate_root_file, is_protected_manifest_file, validate_rename_path_arg};
 
     #[test]
     fn validate_path_arg_rejects_absolute_and_traversal() {
@@ -419,5 +473,34 @@ mod tests {
         assert!(!is_crate_root_file("qartez-public/src/index/parser.rs"));
         assert!(!is_crate_root_file("qartez-public/tests/main.rs"));
         assert!(!is_crate_root_file("qartez-public/examples/lib.rs"));
+    }
+
+    #[test]
+    fn manifest_detection_recognizes_canonical_basenames() {
+        assert_eq!(is_protected_manifest_file("Cargo.toml"), Some("Cargo.toml"));
+        assert_eq!(
+            is_protected_manifest_file("crates/foo/Cargo.toml"),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            is_protected_manifest_file("frontend/package.json"),
+            Some("package.json")
+        );
+        assert_eq!(
+            is_protected_manifest_file("services/svc/go.mod"),
+            Some("go.mod")
+        );
+        assert_eq!(
+            is_protected_manifest_file("libs/x/pyproject.toml"),
+            Some("pyproject.toml")
+        );
+    }
+
+    #[test]
+    fn manifest_detection_rejects_non_manifest_files() {
+        assert!(is_protected_manifest_file("src/lib.rs").is_none());
+        assert!(is_protected_manifest_file("README.md").is_none());
+        assert!(is_protected_manifest_file("Cargo.toml.bak").is_none());
+        assert!(is_protected_manifest_file("my_package.json").is_none());
     }
 }

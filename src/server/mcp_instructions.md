@@ -11,7 +11,7 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 
 ## Tool tiers
 
-Qartez organizes its 37 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
+Qartez organizes its 39 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
 
 ### Core (always available)
 
@@ -57,9 +57,12 @@ Codebase-wide rename, move, replace, insert, and safe-delete operations:
 
 ### Meta (unlock via `qartez_tools enable: ["meta"]`)
 
-Build toolchain and documentation:
+Build toolchain, documentation, and runtime workspace management:
 - `qartez_project` - detected toolchain (test/build/lint commands)
 - `qartez_wiki` - auto-generate ARCHITECTURE.md
+- `qartez_workspace` - add or remove workspace domains at runtime
+- `qartez_add_root` - register an additional project root at runtime (alias optional, watcher hot-attached)
+- `qartez_list_roots` - list every tracked root with source, watcher state, and file count
 
 ### Discovery tool
 

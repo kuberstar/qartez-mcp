@@ -77,7 +77,7 @@ fn is_plugin_entry_point_path(path: &str) -> bool {
 impl QartezServer {
     #[tool(
         name = "qartez_unused",
-        description = "Find dead code: exported symbols with zero importers in the codebase. Safe candidates for removal or inlining. Pre-materialized at index time, so the whole-repo scan is a single indexed SELECT. Pass `limit` / `offset` to page through large result sets. `limit` must be > 0; omit `limit` to accept the 50-row default.",
+        description = "Find dead code: exported symbols with zero importers in the codebase. Safe candidates for removal or inlining. Pre-materialized at index time, so the whole-repo scan is a single indexed SELECT. Pass `limit` / `offset` to page through large result sets. `limit=0` removes the row cap (project-wide convention); omit `limit` to accept the 50-row default.",
         annotations(
             title = "Find Unused Exports",
             read_only_hint = true,
@@ -92,19 +92,15 @@ impl QartezServer {
     ) -> Result<String, String> {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
 
-        // `limit=0` is rejected rather than silently treated as a
-        // "no cap" sentinel, matching `qartez_clones` / `qartez_cochange`
-        // which already reject `limit=0` explicitly. Keeping the
-        // semantics aligned across the tool surface removes the
-        // silent divergence where `qartez_unused` alone returned
-        // every remaining row for the zero value.
-        if let Some(0) = params.limit {
-            return Err(
-                "limit must be > 0 (use a positive integer; there is no 'no-cap' mode).".into(),
-            );
-        }
+        // `limit=0` means "no cap" project-wide convention, matching
+        // `qartez_cochange` / `qartez_health`. `limit=None` keeps the
+        // historical default of 50. The previous build rejected
+        // `limit=0` outright, which made `qartez_unused` the only
+        // page-able tool that did NOT accept the no-cap sentinel and
+        // forced callers to pick an arbitrary upper bound.
         let limit = match params.limit {
             None => 50_i64,
+            Some(0) => i64::MAX,
             Some(n) => n as i64,
         };
         let offset = params.offset.unwrap_or(0) as i64;
@@ -132,8 +128,20 @@ impl QartezServer {
             crate::storage::models::FileRow,
         )> = Vec::new();
         let mut fetch_offset = offset;
+        // `consumed_offset` tracks the DB-row position right AFTER the
+        // last row we either kept or skipped as a plugin entry. It is
+        // the cursor a caller should pass as `offset` for the next
+        // page so they neither skip rows (when a batch was over-
+        // sampled past the kept rows) nor revisit rows already shown
+        // (when plugin-filtered rows sit between kept rows). Before
+        // this fix, the "next: offset=" hint reported `fetch_offset`
+        // which advanced in FETCH_PAGE_SIZE chunks, so e.g. limit=5
+        // produced "next: offset=64" and clicking through the pages
+        // skipped 59 rows on every step.
+        let mut consumed_offset = offset;
         let mut plugin_filtered = 0i64;
-        loop {
+        let mut db_exhausted = false;
+        'outer: loop {
             let remaining_room = (limit - page.len() as i64).max(0);
             if remaining_room == 0 {
                 break;
@@ -142,6 +150,7 @@ impl QartezServer {
             let batch = read::get_unused_exports_page(&conn, batch_size, fetch_offset)
                 .map_err(|e| format!("DB error: {e}"))?;
             if batch.is_empty() {
+                db_exhausted = true;
                 break;
             }
             let batch_len = batch.len() as i64;
@@ -149,18 +158,21 @@ impl QartezServer {
             for row in batch {
                 if is_plugin_entry_point_path(&row.1.path) {
                     plugin_filtered += 1;
+                    consumed_offset += 1;
                     continue;
                 }
                 if page.len() as i64 >= limit {
-                    break;
+                    break 'outer;
                 }
                 page.push(row);
+                consumed_offset += 1;
             }
             if batch_len < batch_size {
+                db_exhausted = true;
                 break;
             }
         }
-        let next_offset = fetch_offset;
+        let next_offset = consumed_offset;
 
         if page.is_empty() {
             return Ok(format!(
@@ -178,7 +190,7 @@ impl QartezServer {
         // explains why entries are hidden, and places the counter
         // inside a parenthetical so it reads as a note instead of
         // a flag to investigate.
-        let mut out = if next_offset < total {
+        let mut out = if !db_exhausted && next_offset < total {
             if plugin_filtered > 0 {
                 format!(
                     "{total} unused export(s); showing {shown} from offset {offset} (next: offset={next_offset}; {plugin_filtered} plugin-manifest entries hidden - they're intentional).\n",

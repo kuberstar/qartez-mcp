@@ -153,7 +153,7 @@ impl QartezServer {
         use crate::graph::boundaries::{check_boundaries, load_config};
         use crate::graph::leiden::LeidenConfig;
         use crate::graph::wiki::{WikiConfig, render_wiki};
-        use crate::storage::read::{get_all_edges, get_all_files};
+        use crate::storage::read::{get_all_edges, get_all_files, get_edge_count};
 
         // Force a cluster recompute whenever the caller explicitly
         // passes `resolution` or `min_cluster_size`. Without this, the
@@ -240,9 +240,26 @@ impl QartezServer {
             }
         }
 
+        // Probe the import-graph size before rendering. When the edge
+        // table is empty the Leiden pass cannot find any community
+        // structure, so every file falls into the `misc` bucket and
+        // the wiki silently advertises a single uninformative cluster.
+        // Capture the count here so the response can lead with an
+        // explicit warning instead of letting callers chase a phantom
+        // architecture summary.
+        let edge_total = get_edge_count(&conn).map_err(|e| format!("DB error: {e}"))?;
         let (markdown, modularity) =
             render_wiki(&conn, &wiki_cfg).map_err(|e| format!("Wiki render error: {e}"))?;
         drop(conn);
+
+        let no_edges_warning = if edge_total == 0 {
+            Some(
+                "Warning: no import edges are recorded for this project. Clustering has nothing to partition, so every file falls into a single `misc` bucket. Run `qartez_workspace refresh=true` (or `qartez_maintenance reindex=true`) to rebuild the import graph before trusting this output.\n\n"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
         // Stamp the config fingerprint so the NEXT call can tell
         // whether its requested params still match the cached
@@ -283,6 +300,21 @@ impl QartezServer {
             markdown.clone()
         };
 
+        // Prepend the no-edges warning to both rendering paths so the
+        // disk artefact and the inline reply lead with the same
+        // contract: "this clustering is uninformative, here is how to
+        // rebuild the graph". Without this, an empty edge table
+        // produces a single misc cluster that looks indistinguishable
+        // from a tiny but well-clustered repo.
+        let markdown_for_disk = match no_edges_warning.as_ref() {
+            Some(banner) => format!("{banner}{markdown_for_disk}"),
+            None => markdown_for_disk,
+        };
+        let markdown = match no_edges_warning.as_ref() {
+            Some(banner) => format!("{banner}{markdown}"),
+            None => markdown,
+        };
+
         let write_to_trimmed = params.write_to.as_deref().map(str::trim).unwrap_or("");
         if !write_to_trimmed.is_empty() {
             let abs = resolve_write_target(self, write_to_trimmed)?;
@@ -306,18 +338,29 @@ impl QartezServer {
         // `louvain_local_move` gain formula, so nodes stay split. If
         // you ever observe the inverse (e.g. resolution=0.5 produces
         // MORE clusters than resolution=2.0), audit the modularity
-        // objective in `compute_modularity` -- not this validation.
-        if let Some(budget) = params.token_budget {
-            if (budget as usize) < 1024 {
-                return Err(format!(
-                    "token_budget must be >= 1024 to produce a useful wiki (got {budget}). Pass write_to=<path> to bypass the budget entirely."
-                ));
-            }
-        }
-        let token_budget = params
-            .token_budget
-            .map(|v| v as usize)
+        // objective in `compute_modularity` - not this validation.
+        //
+        // The advertised JSON Schema for `token_budget` does not
+        // declare a lower bound (the field is `Option<u32>` and
+        // schemars does not synthesize a `range(min = ...)` for it),
+        // so a hard reject of `< 1024` surfaced as a runtime error
+        // that contradicted the schema contract. Clamp instead: any
+        // value below 1024 is silently raised to 1024 with a note
+        // that mirrors the truncation footer's "we capped your
+        // output, here is how" contract.
+        const TOKEN_BUDGET_FLOOR: usize = 1024;
+        let requested_budget = params.token_budget.map(|v| v as usize);
+        let token_budget = requested_budget
+            .map(|b| b.max(TOKEN_BUDGET_FLOOR))
             .unwrap_or(WIKI_DEFAULT_TOKEN_BUDGET);
-        Ok(truncate_to_budget(&markdown, cluster_count, token_budget))
+        let mut rendered = truncate_to_budget(&markdown, cluster_count, token_budget);
+        if let Some(req) = requested_budget
+            && req < TOKEN_BUDGET_FLOOR
+        {
+            rendered.push_str(&format!(
+                "\nNote: token_budget={req} is below the minimum useful value; clamped to {TOKEN_BUDGET_FLOOR}. Pass write_to=<path> to bypass the budget entirely.\n"
+            ));
+        }
+        Ok(rendered)
     }
 }

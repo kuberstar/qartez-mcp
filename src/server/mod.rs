@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -14,6 +14,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, prompt_handler, tool, tool_handler, tool_router};
+use tokio::task::JoinHandle;
 
 mod cache;
 mod helpers;
@@ -37,12 +38,59 @@ use crate::storage::read;
 use crate::storage::read::sanitize_fts_query;
 use crate::toolchain;
 
+/// Origin of a registered project root.
+///
+/// Surfaced by `qartez_list_roots` so agents can tell the difference
+/// between a root passed on the command line, a root reattached from
+/// `.qartez/workspace.toml` at startup, and a root added through the
+/// `qartez_add_root` runtime tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootSource {
+    /// Passed via `--root` on the command line, or detected as the
+    /// project root.
+    CliArg,
+    /// Loaded from `.qartez/workspace.toml` at startup.
+    WorkspaceToml,
+    /// Added at runtime through `qartez_add_root` / `qartez_workspace`.
+    Runtime,
+}
+
+impl RootSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CliArg => "cli",
+            Self::WorkspaceToml => "config",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct QartezServer {
     db: Arc<Mutex<Connection>>,
     project_root: PathBuf,
     project_roots: Arc<RwLock<Vec<PathBuf>>>,
     root_aliases: Arc<RwLock<HashMap<PathBuf, String>>>,
+    /// Origin tag for each root, keyed by the canonical path.
+    ///
+    /// Populated alongside `project_roots`. Missing entries fall back
+    /// to `RootSource::CliArg` for back-compat with constructors that
+    /// did not receive an explicit map (the legacy `with_roots` path).
+    root_sources: Arc<RwLock<HashMap<PathBuf, RootSource>>>,
+    /// Live watcher tasks keyed by root path. The `JoinHandle` is held
+    /// so a future remove operation can `abort()` the task and reclaim
+    /// the file descriptors and notify channel.
+    watchers: Arc<Mutex<HashMap<PathBuf, JoinHandle<()>>>>,
+    /// Whether the server was started in watch-enabled mode. Runtime
+    /// `qartez_add_root` calls honour this default when the caller did
+    /// not pass an explicit `watch` flag.
+    watch_enabled: bool,
+    /// Directory containing the cross-process index lock file.
+    ///
+    /// Threaded into every spawned `Watcher` so the watcher's incremental
+    /// reindex briefly tries the same lock the background indexer holds,
+    /// avoiding `SQLITE_BUSY` when both fire on the same repo.
+    lock_dir: Option<PathBuf>,
     git_depth: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -56,12 +104,74 @@ impl QartezServer {
         Self::with_roots(conn, project_root, project_roots, HashMap::new(), git_depth)
     }
 
+    /// Construct a server, tagging every root as a CLI arg by default.
+    ///
+    /// Callers that need to distinguish CLI roots from `workspace.toml`
+    /// roots (so that `qartez_list_roots` can label them correctly) use
+    /// [`Self::with_roots_and_sources`] instead. The bare `with_roots`
+    /// stays as the back-compat entry point.
     pub fn with_roots(
         conn: Connection,
         project_root: PathBuf,
         project_roots: Vec<PathBuf>,
         root_aliases: HashMap<PathBuf, String>,
         git_depth: u32,
+    ) -> Self {
+        let sources = project_roots
+            .iter()
+            .map(|p| (p.clone(), RootSource::CliArg))
+            .collect();
+        Self::build(
+            conn,
+            project_root,
+            project_roots,
+            root_aliases,
+            sources,
+            git_depth,
+            false,
+            None,
+        )
+    }
+
+    /// Full constructor: lets the caller tag every root with its
+    /// origin and pass through whether file watching is enabled.
+    ///
+    /// `main.rs` uses this so `qartez_list_roots` can render `cli` vs.
+    /// `config` for the initial roots and `runtime` for the ones added
+    /// later through `qartez_add_root`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_roots_and_sources(
+        conn: Connection,
+        project_root: PathBuf,
+        project_roots: Vec<PathBuf>,
+        root_aliases: HashMap<PathBuf, String>,
+        root_sources: HashMap<PathBuf, RootSource>,
+        git_depth: u32,
+        watch_enabled: bool,
+        lock_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::build(
+            conn,
+            project_root,
+            project_roots,
+            root_aliases,
+            root_sources,
+            git_depth,
+            watch_enabled,
+            lock_dir,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        conn: Connection,
+        project_root: PathBuf,
+        project_roots: Vec<PathBuf>,
+        root_aliases: HashMap<PathBuf, String>,
+        root_sources: HashMap<PathBuf, RootSource>,
+        git_depth: u32,
+        watch_enabled: bool,
+        lock_dir: Option<PathBuf>,
     ) -> Self {
         // Self-heal the body FTS index. Existing `.qartez/index.db` files
         // built before the schema-migration fix have an empty
@@ -80,8 +190,16 @@ impl QartezServer {
         let symbol_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
             .unwrap_or(0);
-        if body_count == 0
-            && symbol_count > 0
+        // Trigger rebuild when bodies are absent (legacy migration) or
+        // significantly under-populated relative to the symbol count
+        // (signals a previously-corrupted rebuild that left orphan rows).
+        // The `body_count * 2 < symbol_count` form avoids the
+        // integer-division pitfall of `< symbol_count / 2` (which
+        // collapses to `< 0` for symbol_count=1 and would never fire);
+        // it also still catches the original `body_count == 0` case
+        // for any symbol_count >= 1.
+        if symbol_count > 0
+            && body_count.saturating_mul(2) < symbol_count
             && let Err(e) =
                 crate::storage::write::rebuild_symbol_bodies_multi(&conn, &project_roots)
         {
@@ -101,11 +219,76 @@ impl QartezServer {
             project_root,
             project_roots: Arc::new(RwLock::new(project_roots)),
             root_aliases: Arc::new(RwLock::new(root_aliases)),
+            root_sources: Arc::new(RwLock::new(root_sources)),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            watch_enabled,
+            lock_dir,
             git_depth,
             tool_router: router,
             parse_cache: Arc::new(Mutex::new(ParseCache::default())),
             enabled_tools,
         }
+    }
+
+    /// Whether file watching was enabled when the server started.
+    ///
+    /// `qartez_add_root` consults this to default the per-call
+    /// `watch` flag when the caller did not pass it explicitly. Tests
+    /// also use it to assert the watcher pipeline is wired up.
+    pub fn watch_enabled(&self) -> bool {
+        self.watch_enabled
+    }
+
+    /// Spawn a `notify` watcher for `root` and remember the join
+    /// handle so it can be aborted if the root is later removed.
+    ///
+    /// `path_prefix` must match the prefix `full_index_multi`/
+    /// `full_index_root` used for that root. Multi-root mode prefixes
+    /// every file row with `<alias>/`; single-root mode passes an
+    /// empty prefix. Mismatch here orphans incremental rows.
+    pub fn attach_watcher(&self, root: PathBuf, path_prefix: String) -> anyhow::Result<()> {
+        let db = self.db_arc();
+        let mut watcher = crate::watch::Watcher::with_prefix(db, root.clone(), path_prefix);
+        if let Some(ref lock_dir) = self.lock_dir {
+            watcher = watcher.with_lock_dir(lock_dir.clone());
+        }
+        let root_display = root.display().to_string();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = watcher.run().await {
+                tracing::error!("watcher error for {root_display}: {e}");
+            }
+        });
+        let mut watchers = self.watchers.lock().expect("watchers mutex poisoned");
+        if let Some(prev) = watchers.insert(root, handle) {
+            // A second attach for the same root replaces the prior
+            // task. Aborting the previous handle keeps the notify
+            // channel and inotify FDs from leaking across reattaches.
+            prev.abort();
+        }
+        Ok(())
+    }
+
+    /// Read-only snapshot of which roots currently have an attached
+    /// watcher. Used by `qartez_list_roots` to render the watcher
+    /// column without holding the mutex while formatting output.
+    fn watcher_roots(&self) -> Vec<PathBuf> {
+        let watchers = self.watchers.lock().expect("watchers mutex poisoned");
+        watchers.keys().cloned().collect()
+    }
+
+    /// Mark a freshly added root with `RootSource::Runtime` so the
+    /// listing tool can report its origin. Called by `qartez_add_root`
+    /// after the root has been added to `project_roots`.
+    pub(in crate::server) fn record_root_source(&self, root: &Path, source: RootSource) {
+        let mut sources = self.root_sources.write().expect("root_sources poisoned");
+        sources.insert(root.to_path_buf(), source);
+    }
+
+    /// Read the source tag for a root, defaulting to `CliArg` when
+    /// the map has no entry (covers older constructors).
+    pub(in crate::server) fn root_source_for(&self, root: &Path) -> RootSource {
+        let sources = self.root_sources.read().expect("root_sources poisoned");
+        sources.get(root).copied().unwrap_or(RootSource::CliArg)
     }
 
     /// Compatibility shim for clients that pass wrapper syntax around path args.
@@ -273,6 +456,8 @@ impl QartezServer {
                 "qartez_map"         => qartez_map:         QartezParams,
                 "qartez_find"        => qartez_find:        SoulFindParams,
                 "qartez_workspace"   => qartez_workspace:   SoulWorkspaceParams,
+                "qartez_add_root"    => qartez_add_root:    SoulAddRootParams,
+                "qartez_list_roots"  => qartez_list_roots:  SoulListRootsParams,
                 "qartez_read"        => qartez_read:        SoulReadParams,
                 "qartez_impact"      => qartez_impact:      SoulImpactParams,
                 "qartez_diff_impact" => qartez_diff_impact: SoulDiffImpactParams,
@@ -306,6 +491,8 @@ impl QartezServer {
                 "qartez_insert_before_symbol" => qartez_insert_before_symbol: SoulInsertSymbolParams,
                 "qartez_insert_after_symbol"  => qartez_insert_after_symbol:  SoulInsertSymbolParams,
                 "qartez_safe_delete"          => qartez_safe_delete:          SoulSafeDeleteParams,
+                "qartez_maintenance"          => qartez_maintenance:          SoulMaintenanceParams,
+                "qartez_understand"           => qartez_understand:           SoulUnderstandParams,
             }
         )
     }
@@ -414,7 +601,7 @@ impl ServerHandler for QartezServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         let result = match request.uri.as_str() {
             "qartez://overview" => {
-                let text = self.build_overview(20, 4000, None, None, false, false);
+                let text = self.build_overview(20, 4000, None, None, false, false, false);
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     text,
                     "qartez://overview",
@@ -530,18 +717,18 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_37() {
+    fn total_tool_count_is_41() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 37, "expected 37 tools, got {}", all.len());
+        assert_eq!(all.len(), 41, "expected 41 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 18, "analysis tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 19, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 7, "refactor tier");
-        assert_eq!(tiers::TIER_META.len(), 3, "meta tier");
+        assert_eq!(tiers::TIER_META.len(), 6, "meta tier");
     }
 
     #[cfg(feature = "benchmark")]

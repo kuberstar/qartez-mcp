@@ -109,6 +109,21 @@ impl QartezServer {
             if let Some(cc) = sym.complexity {
                 let body = sym.line_end.saturating_sub(sym.line_start) + 1;
                 if cc >= min_cc && body >= min_lines {
+                    // Inherit the same flat-dispatcher classification
+                    // qartez_smells uses so health doesn't recommend
+                    // "Extract Method" on a flat match/switch table.
+                    // Dispatchers carry their CC budget in arm count, so
+                    // extracting a single arm rarely helps - the smell
+                    // emits a different recommendation, and so should
+                    // health. Using `super::smells::fetch_symbol_body`
+                    // (already `pub(super)`) plus a local arm counter
+                    // avoids duplicating the FTS query and stays in
+                    // sync with the smells classifier's CC slack /
+                    // dominant-arm rules. When the body is unavailable
+                    // (older index, language without body extraction),
+                    // we fall back to `god_function` - same downgrade
+                    // policy as qartez_smells.
+                    let (kind, arm_count) = classify_function_shape(&conn, sym.id, cc);
                     smells_by_file
                         .entry(path.clone())
                         .or_default()
@@ -117,6 +132,8 @@ impl QartezServer {
                             cc,
                             lines: body,
                             line_start: sym.line_start,
+                            kind,
+                            arm_count,
                         });
                 }
             }
@@ -288,6 +305,17 @@ enum SmellEntry {
         cc: u32,
         lines: u32,
         line_start: u32,
+        /// Sub-kind matching `qartez_smells`'s classifier output.
+        /// `"god_function"` is the default; `"flat_dispatcher"` marks a
+        /// function whose CC is dominated by a flat match/switch table
+        /// over many trivial arms. Recommendations branch on this so
+        /// the report does not advise "Extract Method" on a structure
+        /// that responds poorly to it.
+        kind: &'static str,
+        /// Detected match-arm count when `kind` is `"flat_dispatcher"`,
+        /// zero otherwise. Echoes the same field qartez_smells exposes
+        /// so the two tools speak the same vocabulary.
+        arm_count: u32,
     },
     LongParams {
         name: String,
@@ -384,10 +412,18 @@ fn format_file_block(out: &mut String, r: &FileHealthRow) {
                     cc,
                     lines,
                     line_start,
+                    kind,
+                    arm_count,
                 } => {
-                    out.push_str(&format!(
-                        "  - god_function `{name}` @ L{line_start} (CC={cc}, lines={lines})\n"
-                    ));
+                    if *kind == "flat_dispatcher" {
+                        out.push_str(&format!(
+                            "  - flat_dispatcher `{name}` @ L{line_start} (CC={cc}, lines={lines}, arms={arm_count})\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  - god_function `{name}` @ L{line_start} (CC={cc}, lines={lines})\n"
+                        ));
+                    }
                 }
                 SmellEntry::LongParams {
                     name,
@@ -410,15 +446,33 @@ fn format_file_block(out: &mut String, r: &FileHealthRow) {
 
 fn recommendations(r: &FileHealthRow) -> Vec<String> {
     let mut recs = Vec::new();
-    let has_god = r.smells.iter().any(|s| matches!(s, SmellEntry::God { .. }));
+    let has_god_plain = r
+        .smells
+        .iter()
+        .any(|s| matches!(s, SmellEntry::God { kind, .. } if *kind != "flat_dispatcher"));
+    let has_dispatcher = r
+        .smells
+        .iter()
+        .any(|s| matches!(s, SmellEntry::God { kind, .. } if *kind == "flat_dispatcher"));
     let has_long = r
         .smells
         .iter()
         .any(|s| matches!(s, SmellEntry::LongParams { .. }));
 
-    if has_god {
+    if has_god_plain {
         recs.push(
             "Extract Method on the largest branches of the god function - each extracted branch typically drops parent CC by 1-4.".to_string(),
+        );
+    }
+    if has_dispatcher {
+        // Mirrors the flat_dispatcher note `qartez_smells` already
+        // emits below its god-function table. CC of a flat dispatch
+        // table grows linearly with arm count, so "Extract Method"
+        // rarely helps - the actionable refactor is to split the
+        // table by variant into purpose-built handlers, not to
+        // pull one arm into its own function.
+        recs.push(
+            "Flat dispatcher: avoid Extract Method on individual arms - CC grows linearly with arm count. Prefer splitting the dispatch table into per-variant handlers, or accept the shape unless arms grow non-trivial.".to_string(),
         );
     }
     if has_long {
@@ -426,7 +480,7 @@ fn recommendations(r: &FileHealthRow) -> Vec<String> {
             "Introduce Parameter Object for the long param lists - groups correlated args, simplifies all call sites in one atomic change.".to_string(),
         );
     }
-    if r.severity == Severity::High && !has_god && !has_long {
+    if r.severity == Severity::High && !has_god_plain && !has_dispatcher && !has_long {
         recs.push(
             "No named smell, but high hotspot pressure. Start with `qartez_outline` to find the fattest function, then `qartez_refactor_plan` on this file.".to_string(),
         );
@@ -442,4 +496,97 @@ fn recommendations(r: &FileHealthRow) -> Vec<String> {
         );
     }
     recs
+}
+
+/// Arm-count threshold below which the flat-dispatcher classifier won't
+/// fire. Mirrors `FLAT_DISPATCHER_MIN_ARMS` in `qartez_smells` so the two
+/// tools agree on what qualifies as a dispatch table.
+const HEALTH_FLAT_DISPATCHER_MIN_ARMS: u32 = 6;
+/// Maximum slack between raw CC and arm count for the tight-dispatcher
+/// path. Mirrors `FLAT_DISPATCHER_CC_SLACK` in `qartez_smells`.
+const HEALTH_FLAT_DISPATCHER_CC_SLACK: u32 = 5;
+/// Arm count above which the looser dominant-arm path qualifies a function
+/// as a dispatcher. Mirrors `FLAT_DISPATCHER_MIN_ARMS_DOMINANT`.
+const HEALTH_FLAT_DISPATCHER_MIN_ARMS_DOMINANT: u32 = 12;
+/// Arm-fraction-of-CC threshold for the dominant-arm path. Mirrors
+/// `FLAT_DISPATCHER_ARM_FRACTION`.
+const HEALTH_FLAT_DISPATCHER_ARM_FRACTION: f64 = 0.4;
+
+/// Re-classify a god function as a flat dispatcher when its CC is
+/// dominated by a flat match/switch table. Returns the same
+/// `(kind, arm_count)` shape `qartez_smells::classify_function_shape`
+/// produces so the two tools surface identical sub-kinds for the same
+/// function. Reuses `super::smells::fetch_symbol_body` (already
+/// `pub(super)`) for the FTS lookup; the arm counter is duplicated
+/// locally rather than exposing the smells private helper, since
+/// keeping the smells module untouched is a hard constraint of this
+/// audit pass.
+fn classify_function_shape(
+    conn: &rusqlite::Connection,
+    symbol_id: i64,
+    cc: u32,
+) -> (&'static str, u32) {
+    let Some(body) = super::smells::fetch_symbol_body(conn, symbol_id) else {
+        return ("god_function", 0);
+    };
+    let arms = count_match_arms(&body);
+    if arms < HEALTH_FLAT_DISPATCHER_MIN_ARMS {
+        return ("god_function", 0);
+    }
+    if cc <= arms.saturating_add(HEALTH_FLAT_DISPATCHER_CC_SLACK) {
+        return ("flat_dispatcher", arms);
+    }
+    if arms >= HEALTH_FLAT_DISPATCHER_MIN_ARMS_DOMINANT
+        && (arms as f64) >= (cc as f64) * HEALTH_FLAT_DISPATCHER_ARM_FRACTION
+    {
+        return ("flat_dispatcher", arms);
+    }
+    ("god_function", 0)
+}
+
+/// Line-level proxy for `=>` arrow occurrences in a function body.
+/// Skips characters inside `//` line comments and string literals so
+/// in-arm doc strings don't inflate the count. Mirrors the parser used
+/// by `qartez_smells::count_match_arms` so both tools agree on arm
+/// detection.
+fn count_match_arms(body: &str) -> u32 {
+    let mut count: u32 = 0;
+    for raw_line in body.lines() {
+        let line = match raw_line.find("//") {
+            Some(i) => &raw_line[..i],
+            None => raw_line,
+        };
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut in_string = false;
+        let mut escape = false;
+        while i + 1 < bytes.len() {
+            let b = bytes[i];
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\\' if in_string => {
+                    escape = true;
+                }
+                b'"' => {
+                    in_string = !in_string;
+                }
+                b'=' if !in_string
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'>'
+                    && (i == 0 || (bytes[i - 1] != b'=' && bytes[i - 1] != b'>')) =>
+                {
+                    count = count.saturating_add(1);
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    count
 }

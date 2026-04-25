@@ -93,6 +93,18 @@ impl QartezServer {
         let concise = is_concise(&params.format);
         let use_regex = params.regex.unwrap_or(false);
         let search_bodies = params.search_bodies.unwrap_or(false);
+        // `regex=true` runs over indexed symbol names; `search_bodies=true`
+        // runs FTS over the body text index. Combining them silently routed
+        // to the FTS branch and dropped the regex - leaving the caller
+        // thinking "regex was applied" while every match was actually
+        // FTS-matched. Reject the combination so the contradiction is
+        // visible up front.
+        if use_regex && search_bodies {
+            return Err(
+                "`regex=true` and `search_bodies=true` cannot be combined: regex matches symbol NAMES via the regex engine, while search_bodies matches BODY TEXT via FTS5. Pick one. (regex over body text is a future-work scenario.)"
+                    .to_string(),
+            );
+        }
         let kind_filter = params
             .kind
             .as_deref()
@@ -103,16 +115,22 @@ impl QartezServer {
         // a bare `***` as a syntax error. A query consisting only of
         // these produced either zero rows or an opaque FTS error.
         // Warn loudly (do not reject) so the caller sees what the
-        // engine did with their input.
+        // engine did with their input. NOT shares the same FTS5
+        // semantics as AND / OR but was previously absent from the
+        // detector, so `parse NOT test` parsed as a boolean exclusion
+        // and returned zero rows without any indication that the
+        // engine had treated NOT as an operator.
         if !use_regex && !search_bodies {
             let tokens: Vec<&str> = query_string.split_whitespace().collect();
-            let has_reserved = tokens
-                .iter()
-                .any(|t| matches!(t.to_ascii_uppercase().as_str(), "AND" | "OR" | "NEAR"))
-                || query_string.contains("***");
+            let has_reserved = tokens.iter().any(|t| {
+                matches!(
+                    t.to_ascii_uppercase().as_str(),
+                    "AND" | "OR" | "NEAR" | "NOT"
+                )
+            }) || query_string.contains("***");
             if has_reserved {
                 prefix_notes.push_str(&format!(
-                    "// warning: '{query_string}' contains FTS5 reserved tokens (AND/OR/NEAR/'***'). Quote the symbol name or use regex=true for literal matching.\n",
+                    "// warning: '{query_string}' contains FTS5 reserved tokens (AND/OR/NEAR/NOT/'***'). Quote the symbol name or use regex=true for literal matching.\n",
                 ));
             }
         }
@@ -179,9 +197,39 @@ impl QartezServer {
             // zero rows, nudge them at the common failure modes so
             // they do not have to guess whether the index is empty.
             if search_bodies {
-                msg.push_str(
-                    "\n// note: body FTS returned 0 rows. If you expected matches, verify the text exists literally in function bodies (not just identifiers) and try regex=true.",
-                );
+                // Cross-check against the symbol-name FTS index. The
+                // body FTS table is rebuilt from `(file_path, symbol_id)`
+                // pairs and can diverge from the name index when an
+                // alias-prefixed row was indexed but the body
+                // rebuilder failed to resolve the absolute path. Body
+                // FTS is supposed to be a superset of name matches for
+                // any literal token; when it isn't, the caller deserves
+                // an explicit pointer at the gap rather than a flat
+                // "no matches" that contradicts a parallel name search.
+                let name_query = anchor_prefix_to_name_column(&sanitize_fts_query(&query_string));
+                let name_hits = read::search_symbols_fts(&conn, &name_query, 1).unwrap_or_default();
+                if !name_hits.is_empty() {
+                    msg.push_str(&format!(
+                        "\n// note: body FTS returned 0 rows but symbol-name FTS has {} match(es) for the same query. The body index may be stale for alias-prefixed paths; rerun with search_bodies=false or call qartez_maintenance to rebuild bodies.",
+                        name_hits.len(),
+                    ));
+                } else if !use_regex {
+                    // The "try regex=true" hint is only useful when the
+                    // caller did not already pass it. Echoing it back to
+                    // a regex caller reads as "your input was ignored"
+                    // and wastes a round trip. We rejected
+                    // `regex=true && search_bodies` earlier, so this
+                    // branch only fires for `regex=false`, but keep the
+                    // gate explicit so future routing changes do not
+                    // regress the message text.
+                    msg.push_str(
+                        "\n// note: body FTS returned 0 rows. If you expected matches, verify the text exists literally in function bodies (not just identifiers) and try regex=true.",
+                    );
+                } else {
+                    msg.push_str(
+                        "\n// note: body FTS returned 0 rows. If you expected matches, verify the text exists literally in function bodies (not just identifiers).",
+                    );
+                }
             }
             if !prefix_notes.is_empty() {
                 msg.insert_str(0, &prefix_notes);

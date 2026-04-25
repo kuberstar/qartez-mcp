@@ -256,9 +256,26 @@ impl QartezServer {
             // all of them. That is the case this block translates into
             // a caller-visible "exists but is not a function" message.
             if kind_filter.is_some() || file_filter.is_some() {
+                // Surface the function-like kinds we actually saw so a
+                // caller passing `kind=function` for a name registered
+                // as `method` (e.g. `parse_file`) sees the
+                // function/method distinction explicitly instead of a
+                // generic "drop the filter" message that hides the
+                // mismatch. Both 'function' and 'method' are valid
+                // values for the kind filter on this tool.
+                let observed_kinds: std::collections::BTreeSet<&str> = symbols
+                    .iter()
+                    .map(|(s, _)| s.kind.as_str())
+                    .filter(|k| matches!(*k, "function" | "method" | "constructor"))
+                    .collect();
+                let observed_label = if observed_kinds.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    observed_kinds.into_iter().collect::<Vec<_>>().join(", ")
+                };
                 return Err(format!(
-                    "'{}' has no function/method candidate matching kind={:?} file_path={:?}. Drop the filter to see the full candidate list.",
-                    params.name, kind_filter, file_filter,
+                    "'{}' has no function/method candidate matching kind={:?} file_path={:?}. Observed function-like kinds in the index: [{}]. qartez_calls accepts both 'function' and 'method'; pass the kind that matches the symbol's registration, or drop the filter to see the full candidate list.",
+                    params.name, kind_filter, file_filter, observed_label,
                 ));
             }
             if !include_tests
@@ -333,15 +350,6 @@ impl QartezServer {
         }
 
         let mut out = String::new();
-        // Surface the depth clamp up front as a `!warning:` line so a
-        // caller skimming the top of the output immediately sees that
-        // the graph was capped. The old trailing `note:` was easy to
-        // miss when output ran into the limit truncation footer.
-        if depth_was_clamped {
-            out.push_str(&format!(
-                "!warning: depth={requested_depth} was clamped to {MAX_CALL_DEPTH} (server-side hard cap to prevent hub-function blow-up).\n\n",
-            ));
-        }
         // Per-invocation caches. Both sets overlap heavily inside a single
         // tool call, so memoizing avoids re-running SQL.
         let mut resolve_cache: HashMap<
@@ -417,9 +425,20 @@ impl QartezServer {
             }
         }
 
-        // Depth-clamp warning is now emitted at the head of `out` above,
-        // not here - a trailing note was easy to miss when output hit
-        // the token-budget truncation footer.
+        // Depth-clamp warning lives in the response footer to match
+        // the placement convention used by qartez_refactor_plan and
+        // qartez_trend ("Ordering & safety notes" / closing notes).
+        // Footer placement keeps the body of the report focused on
+        // the resolved call graph; callers who care about the clamp
+        // will see it consistently at the tail of the response.
+        if depth_was_clamped {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "!warning: depth={requested_depth} was clamped to {MAX_CALL_DEPTH} (server-side hard cap to prevent hub-function blow-up).\n",
+            ));
+        }
 
         Ok(out)
     }
@@ -1061,16 +1080,29 @@ fn render_callee_row(
             return format!("  {qual}::{callee_name} @ {}\n", f.path);
         }
     }
-    let mut buf = format!(
-        "  {callee_name} ambiguous ({} candidates)\n",
-        func_like.len()
-    );
-    for (s, f) in &func_like {
+    /// Hard cap on the number of disambiguation candidates rendered for
+    /// a single callee row. Common identifiers like `parse_file` or
+    /// `tree_sitter_language` resolve through the index to dozens of
+    /// same-named user symbols across language bindings, and listing
+    /// every one buries the actual reasoning in 3+ MB of output. Twenty
+    /// is enough to recognise the cluster (multiple parsers, one per
+    /// language) without dwarfing the rest of the callees listing.
+    const AMBIGUOUS_CANDIDATE_LIMIT: usize = 20;
+    let total = func_like.len();
+    let shown = total.min(AMBIGUOUS_CANDIDATE_LIMIT);
+    let mut buf = format!("  {callee_name} ambiguous ({total} candidates)\n");
+    for (s, f) in func_like.iter().take(shown) {
         let label = match s.owner_type.as_deref() {
             Some(t) => format!("{t}::{callee_name}"),
             None => callee_name.to_string(),
         };
         buf.push_str(&format!("    - {label} @ {}\n", f.path));
+    }
+    if total > shown {
+        let remaining = total - shown;
+        buf.push_str(&format!(
+            "    ... +{remaining} more (cap={AMBIGUOUS_CANDIDATE_LIMIT}); narrow via `file_path` or `kind` to see them\n",
+        ));
     }
     buf
 }

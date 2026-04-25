@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-04-21
+// Rust guideline compliant 2026-04-25
 
 #![allow(unused_imports)]
 
@@ -85,6 +85,20 @@ impl QartezServer {
             ));
         }
 
+        // Reject `new_code` that consists entirely of comments, blank lines,
+        // attributes, or doc comments. The downstream introducer / identifier
+        // checks short-circuit to None when `first_real_introducer_line`
+        // finds no actual definition, which previously let comment-only input
+        // like `// just a comment` slip past every safety net and silently
+        // erase the symbol body. Treat all-prelude as the same class of
+        // destructive input as an empty string.
+        if first_real_introducer_line(new_code_sanitized.lines()).is_none() {
+            return Err(format!(
+                "Refusing to replace '{}': `new_code` contains no definition introducer (only comments, blank lines, attributes, or doc comments). This would erase the symbol body. Pass the full replacement (including the signature), or use qartez_safe_delete to remove '{}'.",
+                params.symbol, params.symbol,
+            ));
+        }
+
         let abs_path = self.safe_resolve(&source_file.path)?;
         let content = std::fs::read_to_string(&abs_path)
             .map_err(|e| format!("Cannot read {}: {e}", abs_path.display()))?;
@@ -118,7 +132,7 @@ impl QartezServer {
         // non-whitespace, non-comment content survives past the
         // definition's closing brace so an apply cannot silently paste
         // junk into the file.
-        if let Some(err) = check_trailing_content(&new_code_sanitized) {
+        if let Some(err) = check_trailing_content(&new_code_sanitized, &source_file.language) {
             return Err(err);
         }
 
@@ -989,9 +1003,20 @@ fn extract_defined_identifier(line: &str) -> Option<String> {
 /// items (`struct Foo;`, `const X: u32 = 0;`, `type T = U;`) the
 /// check instead scans for trailing non-comment tokens after the
 /// first top-level `;`.
-fn check_trailing_content(new_code: &str) -> Option<String> {
+///
+/// `language` carries the source file's language so Rust lifetimes
+/// (`'a`, `'static`, `'_`) are skipped instead of entering char-literal
+/// mode. Treating `'a` as an opening char literal made the walker scan
+/// for a closing `'` and consume every brace/semicolon in between,
+/// which silently passed inputs like
+/// `fn foo<'a>(x: &'a str) -> &'a str { x }\ntrailing();` through
+/// the trailing-content gate. Other languages keep the original
+/// char-literal logic because their `'...'` is a single-quoted string
+/// (JS/Python) or a char literal (Java/C/C++/Go) that always closes.
+fn check_trailing_content(new_code: &str, language: &str) -> Option<String> {
     let trimmed_end = new_code.trim_end_matches('\n');
     let bytes = trimmed_end.as_bytes();
+    let is_rust = language.eq_ignore_ascii_case("rust");
     // Find the first non-whitespace, non-comment character and inspect
     // the rest relative to the definition shape. Walking the whole
     // string with a state machine handles braces-in-strings and
@@ -1040,8 +1065,14 @@ fn check_trailing_content(new_code: &str) -> Option<String> {
             }
             continue;
         }
-        // Skip char literals (Rust).
+        // Skip char literals - and, in Rust, recognize lifetimes
+        // (`'a`, `'static`, `'_`) so the walker doesn't enter
+        // char-literal mode looking for a non-existent closing `'`.
         if b == b'\'' {
+            if is_rust && is_rust_lifetime_start(bytes, i) {
+                i += 1;
+                continue;
+            }
             i += 1;
             while i < n {
                 if bytes[i] == b'\\' && i + 1 < n {
@@ -1118,6 +1149,36 @@ fn check_trailing_content(new_code: &str) -> Option<String> {
     None
 }
 
+/// Return true when `bytes[i] == b'\''` introduces a Rust lifetime
+/// (`'a`, `'static`, `'_`) rather than a char literal (`'a'`, `'\n'`).
+///
+/// Rule: a char literal is `'` + (escape | single non-`'` char) + `'`,
+/// so the byte two positions past the opening `'` is the closing `'`
+/// for the simple ident-like form. A lifetime is `'` + ident-start
+/// + ident-continue\* with NO closing `'`. The branches:
+///
+///   * `i + 1 >= n` -> bare `'` at the end; treat as char-literal so
+///     the existing walker can consume the input safely.
+///   * Next byte `\\` -> escape sequence (`'\n'`, `'\u{...}'`); always
+///     a char literal.
+///   * Next byte alphabetic or `_` -> ambiguous ident-like form. If
+///     `bytes[i + 2] == b'\''` it is a single-char literal (`'a'`);
+///     otherwise it is a lifetime.
+///   * Anything else (`' '`, `';'`, `'!'`, ...) -> char literal.
+fn is_rust_lifetime_start(bytes: &[u8], i: usize) -> bool {
+    if i + 1 >= bytes.len() {
+        return false;
+    }
+    let next = bytes[i + 1];
+    if next == b'\\' {
+        return false;
+    }
+    if next.is_ascii_alphabetic() || next == b'_' {
+        return i + 2 >= bytes.len() || bytes[i + 2] != b'\'';
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1142,6 +1203,24 @@ mod tests {
             first_real_introducer_line(old.iter().copied()),
             Some("pub fn foo() {}"),
         );
+    }
+
+    #[test]
+    fn first_real_introducer_line_returns_none_for_comment_only() {
+        let lines = ["// just a comment", "", "// another"];
+        assert!(first_real_introducer_line(lines.iter().copied()).is_none());
+    }
+
+    #[test]
+    fn first_real_introducer_line_returns_none_for_empty() {
+        let lines: [&str; 0] = [];
+        assert!(first_real_introducer_line(lines.iter().copied()).is_none());
+    }
+
+    #[test]
+    fn first_real_introducer_line_returns_none_for_attribute_only() {
+        let lines = ["#[derive(Debug)]", "#[serde(rename = \"foo\")]"];
+        assert!(first_real_introducer_line(lines.iter().copied()).is_none());
     }
 
     #[test]
@@ -1221,22 +1300,79 @@ mod tests {
 
     #[test]
     fn trailing_content_accepts_single_item() {
-        assert!(check_trailing_content("fn foo() -> u32 { 0 }").is_none());
-        assert!(check_trailing_content("fn foo() -> u32 { 0 }\n").is_none());
-        assert!(check_trailing_content("pub struct Foo;").is_none());
+        assert!(check_trailing_content("fn foo() -> u32 { 0 }", "rust").is_none());
+        assert!(check_trailing_content("fn foo() -> u32 { 0 }\n", "rust").is_none());
+        assert!(check_trailing_content("pub struct Foo;", "rust").is_none());
         assert!(
-            check_trailing_content("fn foo() {\n    let s = \"}\";\n    println!(\"{}\", s);\n}")
-                .is_none(),
+            check_trailing_content(
+                "fn foo() {\n    let s = \"}\";\n    println!(\"{}\", s);\n}",
+                "rust"
+            )
+            .is_none(),
         );
         // Trailing comment only is fine.
-        assert!(check_trailing_content("fn foo() {}\n// trailing explanation only").is_none(),);
+        assert!(
+            check_trailing_content("fn foo() {}\n// trailing explanation only", "rust").is_none(),
+        );
     }
 
     #[test]
     fn trailing_content_rejects_extra_items() {
-        assert!(check_trailing_content("fn foo() { 0 }\nstuff();\ngarbage;").is_some());
-        assert!(check_trailing_content("fn foo() -> u32 { 0 } garbage").is_some());
-        assert!(check_trailing_content("struct Foo;\npub fn bar() {}").is_some());
+        assert!(check_trailing_content("fn foo() { 0 }\nstuff();\ngarbage;", "rust").is_some());
+        assert!(check_trailing_content("fn foo() -> u32 { 0 } garbage", "rust").is_some());
+        assert!(check_trailing_content("struct Foo;\npub fn bar() {}", "rust").is_some());
+    }
+
+    // Regression: Rust lifetimes (`'a`, `'static`, `'_`) used to enter
+    // char-literal mode looking for a closing `'` and consume every brace
+    // and semicolon up to the next apostrophe (or end-of-input). That
+    // silently let inputs with trailing items pass the gate. Each case
+    // here would return None before the lifetime fix.
+    #[test]
+    fn trailing_content_lifetime_does_not_swallow_braces() {
+        assert!(
+            check_trailing_content("fn foo<'a>(x: &'a str) -> &'a str { x }\nbar();", "rust")
+                .is_some(),
+        );
+        assert!(
+            check_trailing_content("fn foo() -> &'static str { \"x\" }\nbar();", "rust").is_some(),
+        );
+        assert!(check_trailing_content("fn foo(x: Foo<'_>) {}\nbar();", "rust").is_some());
+    }
+
+    #[test]
+    fn trailing_content_lifetime_no_trailing_passes() {
+        // No trailing content: must NOT be rejected even with lifetimes.
+        assert!(
+            check_trailing_content("fn foo<'a>(x: &'a str) -> &'a str { x }", "rust").is_none()
+        );
+        assert!(check_trailing_content("fn foo() -> &'static str { \"x\" }", "rust").is_none());
+        assert!(check_trailing_content("fn foo(x: Foo<'_>) {}", "rust").is_none());
+    }
+
+    #[test]
+    fn trailing_content_char_literal_still_recognised() {
+        // Char literals must still close correctly so braces inside the
+        // body stay tracked.
+        assert!(check_trailing_content("fn foo() -> char { 'a' }", "rust").is_none());
+        assert!(check_trailing_content("fn foo() -> char { '\\n' }", "rust").is_none());
+        assert!(check_trailing_content("fn foo() -> char { 'a' }\nbar();", "rust").is_some());
+    }
+
+    #[test]
+    fn trailing_content_non_rust_treats_apostrophe_as_quote() {
+        // JavaScript / Python single-quoted strings must still pair
+        // their `'` markers; the lifetime branch is Rust-only.
+        assert!(
+            check_trailing_content(
+                "function foo() { return 'hello'; }\ntrailing();",
+                "javascript"
+            )
+            .is_some(),
+        );
+        assert!(
+            check_trailing_content("function foo() { return 'hello'; }", "javascript").is_none(),
+        );
     }
 
     #[test]

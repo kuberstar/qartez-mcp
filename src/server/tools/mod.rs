@@ -22,6 +22,7 @@ mod hotspots;
 mod impact;
 mod insert;
 mod knowledge;
+mod maintenance;
 mod map;
 mod mv;
 mod outline;
@@ -36,11 +37,12 @@ mod replace;
 mod safe_delete;
 mod security;
 mod semantic;
-mod smells;
+pub(in crate::server) mod smells;
 mod stats;
-mod test_gaps;
+pub(super) mod test_gaps;
 mod tools_meta;
 mod trend;
+mod understand;
 mod unused;
 mod wiki;
 mod workspace;
@@ -49,6 +51,8 @@ impl QartezServer {
     pub(super) fn tool_router() -> ToolRouter<Self> {
         Self::qartez_map_router()
             + Self::qartez_workspace_router()
+            + Self::qartez_add_root_router()
+            + Self::qartez_list_roots_router()
             + Self::qartez_find_router()
             + Self::qartez_read_router()
             + Self::qartez_impact_router()
@@ -84,5 +88,7 @@ impl QartezServer {
             + Self::qartez_insert_before_symbol_router()
             + Self::qartez_insert_after_symbol_router()
             + Self::qartez_safe_delete_router()
+            + Self::qartez_maintenance_router()
+            + Self::qartez_understand_router()
     }
 }

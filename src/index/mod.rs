@@ -1,3 +1,4 @@
+pub mod fingerprint;
 pub mod languages;
 pub mod parser;
 pub mod symbols;
@@ -577,7 +578,17 @@ pub fn full_index_root(
     resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
 
     write::sync_fts(&tx)?;
-    write::rebuild_symbol_bodies(&tx, root)?;
+    // Per-file body FTS rebuild scoped to the files we just (re)ingested.
+    // The wholesale `rebuild_symbol_bodies(&tx, root)` we used to call here
+    // wipes the entire `symbols_body_fts` table and only repopulates files
+    // reachable from `root`, which silently destroyed primary-root bodies
+    // on every `qartez_workspace add` for a secondary root. Per-file is
+    // safe because changed files already had their body_fts rows cleared
+    // via `delete_file_data` / `clear_file_content` inside `try_ingest_file`,
+    // and unchanged files retain valid bodies untouched.
+    for entry in &indexed {
+        write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.raw_rel)?;
+    }
     write::populate_unused_exports(&tx)?;
 
     #[cfg(feature = "semantic")]
@@ -595,13 +606,32 @@ pub fn full_index_root(
 
     // Checkpoint the WAL so it doesn't grow unboundedly across indexing runs.
     // Failure is non-fatal - the next run or SQLite's auto-checkpoint will
-    // eventually flush it.
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+    // eventually flush it. Skipped when QARTEZ_DEFER_COMPACTION=1 so the MCP
+    // background indexer can hand off readiness immediately and let a
+    // separate post-index step (or qartez_maintenance checkpoint) flush
+    // the WAL off the critical path.
+    if compaction_deferred() {
+        tracing::debug!("WAL checkpoint deferred (QARTEZ_DEFER_COMPACTION=1)");
+    } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
         tracing::debug!("WAL checkpoint after full_index failed (non-fatal): {e}");
     }
 
     tracing::info!("indexing complete: {updated} updated, {skipped} skipped, {deleted} deleted");
     Ok(())
+}
+
+/// Returns true when the caller has set `QARTEZ_DEFER_COMPACTION=1` so
+/// the indexer should skip its inline WAL checkpoint.
+///
+/// The MCP-server background indexer sets this so `tools/list` can
+/// return as soon as parsing is done, then triggers
+/// `wal_checkpoint(TRUNCATE)` itself once startup has handed off. CLI
+/// and unit-test paths leave the variable unset and keep the original
+/// inline-checkpoint behaviour.
+fn compaction_deferred() -> bool {
+    std::env::var("QARTEZ_DEFER_COMPACTION")
+        .ok()
+        .is_some_and(|v| v == "1")
 }
 
 /// Second-pass reference resolution. Runs after every file has been parsed
@@ -1837,8 +1867,12 @@ pub fn incremental_index_with_prefix(
     crate::storage::verify_foreign_keys(conn)?;
 
     // Checkpoint the WAL after each incremental index to prevent unbounded
-    // growth on large codebases with an active file watcher.
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+    // growth on large codebases with an active file watcher. Skipped when
+    // QARTEZ_DEFER_COMPACTION=1 so the MCP startup path can flush the
+    // WAL once after the indexing burst finishes instead of N times.
+    if compaction_deferred() {
+        tracing::debug!("incremental WAL checkpoint deferred (QARTEZ_DEFER_COMPACTION=1)");
+    } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
         tracing::debug!("WAL checkpoint after incremental_index failed (non-fatal): {e}");
     }
 

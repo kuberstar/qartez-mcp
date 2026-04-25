@@ -54,15 +54,22 @@ fn basic_fixture() -> [(&'static str, &'static str); 3] {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unused_rejects_limit_zero() {
+fn unused_treats_limit_zero_as_no_cap() {
+    // The qartez_unused tool was previously the lone reject-on-zero
+    // hold-out in the family that already used `limit=0` for no-cap
+    // (cochange / health / hotspots / context). Aligning unused on
+    // the same convention removed a footgun where callers had to
+    // remember which tools rejected the value. This test pins the
+    // new contract so a regression to silent default-cap or hard
+    // reject re-trips here.
     let dir = TempDir::new().unwrap();
     let server = build_and_index(dir.path(), &basic_fixture());
-    let err = server
+    let result = server
         .call_tool_by_name("qartez_unused", json!({ "limit": 0 }))
-        .expect_err("limit=0 must error");
+        .expect("limit=0 must mean no-cap, not error");
     assert!(
-        err.contains("limit must be > 0") && err.contains("no-cap"),
-        "expected explicit limit=0 rejection, got: {err}"
+        !result.contains("limit must be > 0"),
+        "limit=0 must not be rejected, got: {result}"
     );
 }
 

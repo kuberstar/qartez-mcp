@@ -238,6 +238,11 @@ pub(super) struct QartezParams {
         extend("enum" = ["files", "symbols"])
     )]
     pub by: Option<String>,
+    #[schemars(
+        description = "When true, annotate each top-ranked file row with its max cyclomatic complexity (`CC=N`) and a smell tag when one fires (`god_function` / `long_params`). Same heuristics as qartez_health: CC>=15 with body>=50 lines = god_function, signature with >=5 params = long_params. Lets a single qartez_map call surface hotspot pressure on top of PageRank without a follow-up qartez_health round-trip. Default false."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub with_health: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -254,7 +259,7 @@ pub(super) struct SoulFindParams {
     )]
     pub format: Option<Format>,
     #[schemars(
-        description = "If true, interpret `name` as a regex applied to indexed symbol names (anchored match semantics: `is_match`). Default false (exact)."
+        description = "If true, interpret `name` as a regex applied to indexed symbol names. Uses `regex::Regex::is_match` (find anywhere, not anchored - prepend `^` for start-anchored, `$` for end-anchored, both for full-match). Case-insensitive by default; prepend `(?-i)` to force case-sensitive. Default false (exact name lookup)."
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub regex: Option<bool>,
@@ -701,6 +706,59 @@ pub(super) struct SoulContextParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub explain: Option<bool>,
+    #[schemars(
+        description = "When true, append a one-line blast-radius summary per input file (direct importers, transitive count, cochange partner count). Lets a single qartez_context call cover the prepare-change checklist without a follow-up qartez_impact round-trip. Default false."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_impact: Option<bool>,
+    #[schemars(
+        description = "When true, append a one-line test-coverage status per input file - either the test files that reach it through the file edge graph or `untested`. Same edge graph qartez_test_gaps `map` mode walks. Default false."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_test_gaps: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulUnderstandParams {
+    #[schemars(
+        description = "Symbol name to investigate. Accepts aliases `symbol` and `symbol_name`."
+    )]
+    #[serde(alias = "symbol", alias = "symbol_name")]
+    pub name: String,
+    #[schemars(
+        description = "Disambiguate by symbol kind when the name resolves to multiple definitions (e.g. 'function' vs 'method' vs 'struct'). Required when the name has multiple matches and `file_path` alone does not narrow to one."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Disambiguate by file when the name is defined in multiple files. Relative path. Required when the name has multiple matches and `kind` alone does not narrow to one."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "Sections to include. Defaults to all four: 'definition' (signature + body), 'calls' (depth=1 callers/callees), 'refs' (top importers), 'cochange' (top co-change partners of the defining file). Pass a subset to skip expensive sections - 'refs' and 'calls' dominate the output for hub symbols.",
+        extend("enum" = ["definition", "calls", "refs", "cochange"])
+    )]
+    #[serde(default, deserialize_with = "flexible::vec_string_opt")]
+    pub sections: Option<Vec<String>>,
+    #[schemars(
+        description = "'concise' = headers + minimal lines, 'detailed' (default) = signature, body, full call/ref tables."
+    )]
+    pub format: Option<Format>,
+    #[schemars(
+        description = "Total token budget across all sections (default: 6000). Each active section receives an equal slice of the remaining budget after the header."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
+    #[schemars(
+        description = "Per-section ref limit (default: 10). Forwarded to the embedded qartez_refs/qartez_calls calls so hub symbols stay readable. Pass 0 for no cap."
+    )]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Include test-file callers/refs in the calls/refs sections (default: false). Mirrors the `include_tests` flag on qartez_calls and qartez_refs."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub include_tests: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1068,6 +1126,36 @@ pub(super) struct SoulWorkspaceParams {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SoulAddRootParams {
+    #[schemars(
+        description = "Path to the directory to register as an additional root. Tilde (`~/`) is expanded; relative paths resolve against the primary project root."
+    )]
+    pub path: String,
+    #[schemars(
+        description = "Optional alias for the new root. When omitted, derived from the directory's basename and disambiguated with a numeric suffix on collision. Must be ASCII alphanumeric plus `-`, `_`, `.`."
+    )]
+    pub alias: Option<String>,
+    #[schemars(
+        description = "Persist the new root into `.qartez/workspace.toml` so it is reattached on the next start (default: true). Set to false for ephemeral, runtime-only registrations."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub persist: Option<bool>,
+    #[schemars(
+        description = "Attach a file watcher to the new root so incremental edits are reindexed live (default: true). Has no effect when the server was started with `--no-watch`."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub watch: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulListRootsParams {
+    #[schemars(
+        description = "'concise' = path + alias only, 'detailed' (default) = full row with source, watcher state, file count, and last-index timestamp"
+    )]
+    pub format: Option<Format>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct SoulHealthParams {
     #[schemars(
@@ -1135,4 +1223,52 @@ pub(super) struct SoulRefactorPlanParams {
         description = "'concise' = one-line-per-step, 'detailed' (default) = full step cards with technique + safety + CC impact estimate"
     )]
     pub format: Option<Format>,
+}
+
+/// Action selector for `qartez_maintenance`.
+///
+/// `Stats` is the default so a bare `qartez_maintenance({})` reports DB
+/// size and table breakdown without mutating anything. The destructive
+/// actions (`Vacuum`, `VacuumIncremental`, `ConvertIncremental`) only
+/// run when explicitly requested.
+#[derive(Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MaintenanceAction {
+    /// Default: report DB / WAL sizes, top table row counts, current
+    /// fingerprint, last full-reindex timestamp.
+    #[default]
+    Stats,
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`.
+    Checkpoint,
+    /// FTS5 segment-merge optimization on body and name FTS tables.
+    OptimizeFts,
+    /// `PRAGMA incremental_vacuum`. No-op when auto_vacuum is not
+    /// `INCREMENTAL`; `stats` reports the current setting.
+    VacuumIncremental,
+    /// Full `VACUUM`. Slow on multi-GiB databases; only run when the
+    /// operator has confirmed they want a full rewrite.
+    Vacuum,
+    /// `PRAGMA auto_vacuum=INCREMENTAL` followed by a full `VACUUM`.
+    /// Use this once on a legacy bloated DB to enable cheap incremental
+    /// page reclamation going forward. Idempotent: re-running on a DB
+    /// that already reports `auto_vacuum=INCREMENTAL` is a fast no-op
+    /// and never triggers a second multi-GiB rewrite.
+    ConvertIncremental,
+    /// Drop file rows whose root prefix is no longer in the live
+    /// project root list. Companion to fingerprint-driven reindexing.
+    PurgeStale,
+    /// Drop file rows whose canonical disk path no longer exists.
+    /// Catches ghost rows that `purge_stale` cannot reach because their
+    /// prefix is still registered but the underlying directory was
+    /// moved, deleted, or recorded under a previous working-directory
+    /// layout.
+    PurgeOrphaned,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulMaintenanceParams {
+    #[schemars(
+        description = "Maintenance action to perform. Default: 'stats' (read-only). Other values: 'checkpoint', 'optimize_fts', 'vacuum_incremental', 'vacuum', 'convert_incremental', 'purge_stale', 'purge_orphaned'. Vacuum-class actions are destructive (rewrite the DB file) and may take minutes on a multi-GiB index."
+    )]
+    pub action: Option<MaintenanceAction>,
 }

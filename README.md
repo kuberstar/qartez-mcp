@@ -197,7 +197,7 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ---
 
-## The 37 tools
+## The 39 tools
 
 Think of these as the **standard library for AI code understanding**. Each one replaces a multi-step human workflow with a single, token-efficient call the agent can reason about.
 
@@ -258,6 +258,9 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 | `qartez_project` | Auto-detects your toolchain (Cargo, npm/bun/yarn, Go, Python, Make, Gradle) and runs test/build/lint/typecheck through a single tool. |
 | `qartez_wiki` | Generates a markdown architecture wiki using Leiden community detection on the import graph. Partitions files into clusters, names each one, and emits `ARCHITECTURE.md` with inter-cluster edges. |
 | `qartez_workspace` | Add or remove workspace domains at runtime. Registers external directories under a custom alias in `.qartez/workspace.toml`, indexes them, and purges them on removal. |
+| `qartez_add_root` | Register an additional project root at runtime. Indexes the directory, refreshes pagerank/co-change, and hot-attaches a file watcher; the alias is optional (derived from the path basename) and persistence is toggleable for ephemeral roots. |
+| `qartez_list_roots` | List every project root currently tracked by the server with its alias, source (cli/config/runtime), watcher attachment state, file count, and last index timestamp. |
+| `qartez_maintenance` | Inspect and compact `.qartez/index.db`. Default action `stats` reports DB / WAL sizes, top tables, current workspace fingerprint, and last full-reindex timestamp. Other actions: `checkpoint`, `optimize_fts` (merge FTS5 segments), `vacuum_incremental`, `vacuum`, `convert_incremental` (one-shot conversion to `auto_vacuum=INCREMENTAL`), `purge_stale` (drop rows for roots no longer in the workspace). Use this on a bloated DB instead of deleting `.qartez/index.db` by hand. |
 
 ### Tier management
 

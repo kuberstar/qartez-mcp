@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::graph;
 use crate::index;
 use crate::index::languages;
+use crate::lock::RepoLock;
 
 const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
 
@@ -34,6 +35,12 @@ pub struct Watcher {
     /// root (empty in single-root mode). Without it, incremental rows in
     /// multi-root projects would orphan the original full-index rows.
     path_prefix: String,
+    /// Directory hosting the cross-process index lock file. When set,
+    /// `reindex` acquires the lock with a short deadline and skips with a
+    /// log message if another qartez process holds it. When `None`, the
+    /// watcher writes without coordination (used by tests that drive
+    /// indexing through an in-memory connection only).
+    lock_dir: Option<PathBuf>,
 }
 
 impl Watcher {
@@ -50,7 +57,16 @@ impl Watcher {
             db,
             project_root,
             path_prefix,
+            lock_dir: None,
         }
+    }
+
+    /// Set the directory hosting the cross-process index lock. The watcher
+    /// will acquire the lock briefly before each re-index and skip the
+    /// cycle if another qartez process is already writing.
+    pub fn with_lock_dir(mut self, lock_dir: PathBuf) -> Self {
+        self.lock_dir = Some(lock_dir);
+        self
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -112,6 +128,30 @@ impl Watcher {
     }
 
     fn reindex(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> anyhow::Result<()> {
+        // Acquire the cross-process lock briefly. If another qartez process
+        // is in the middle of a full index, skip this cycle rather than
+        // pile up watcher events behind a multi-second writer. The next
+        // file save will retry, and `incremental_index` is idempotent over
+        // the actual on-disk state, so missing one cycle does not lose
+        // information - it just defers the index update.
+        let _index_lock = if let Some(dir) = self.lock_dir.as_ref() {
+            match RepoLock::try_acquire_briefly(dir) {
+                Ok(Some(g)) => Some(g),
+                Ok(None) => {
+                    tracing::info!(
+                        "watcher: another qartez process is indexing; skipping this batch"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("watcher: lock IO error, proceeding without lock: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Mirror the `into_inner()` recovery already used by the ignore-cache
         // lock at start_notify_watcher: a poisoned db mutex means a prior
         // indexing operation panicked mid-way, but the Connection is still

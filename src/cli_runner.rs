@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::cli::{Command, OutputFormat};
 use crate::config::Config;
+use crate::lock::RepoLock;
 use crate::server::QartezServer;
 use crate::{git, graph, index, storage};
 
@@ -22,6 +23,15 @@ pub fn run(config: &Config, command: &Command, format: OutputFormat) -> Result<(
     let conn = storage::open_db(&config.db_path)?;
 
     if config.has_project {
+        // Acquire the cross-process index lock before any write-heavy
+        // phase. This prevents a CLI invocation from racing against an
+        // already-running qartez-mcp background indexer (or another
+        // concurrent CLI run) on the same `.qartez/index.db`. The guard
+        // is dropped at the end of the indexing block so that read-only
+        // tool dispatch below does not need to hold it.
+        let qartez_dir = lock_dir(&config.db_path);
+        let _index_lock = RepoLock::acquire(&qartez_dir)
+            .with_context(|| "could not acquire cross-process index lock")?;
         eprintln!("Indexing...");
         index::full_index_multi(
             &conn,
@@ -339,4 +349,14 @@ fn print_compact(w: &mut impl Write, output: &str) -> Result<()> {
         writeln!(w, "{stripped}")?;
     }
     Ok(())
+}
+
+/// The directory holding `index.db`. The cross-process index lock lives
+/// alongside the database so that workspace mode and single-root mode
+/// both place the lock with the data it serializes.
+fn lock_dir(db_path: &std::path::Path) -> std::path::PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }

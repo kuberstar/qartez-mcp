@@ -36,6 +36,17 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulProjectParams>,
     ) -> Result<String, String> {
+        // Reject `timeout=0` up front, regardless of `action`. The
+        // schema documents `timeout=0` as a hard reject because a
+        // zero-second budget would expire before any toolchain could
+        // start. Previously the check lived inside the run-the-command
+        // branch, so `action=info, timeout=0` was silently accepted
+        // and the contract diverged from its documentation.
+        if let Some(0) = params.timeout {
+            return Err(
+                "timeout must be >= 1 (a 0-second budget would expire before the command could start). Use a positive integer in seconds, capped at 600.".into(),
+            );
+        }
         let mut all_toolchains = toolchain::detect_all_toolchains(&self.project_root);
         // Monorepo fallback: when the repository root has its own
         // (possibly generic) Makefile but per-crate manifests live under
@@ -74,7 +85,28 @@ impl QartezServer {
             if all_toolchains.is_empty() {
                 return Err("No recognized toolchain found. Looked for: Cargo.toml, package.json, go.mod, pyproject.toml, setup.py, pubspec.yaml, Gemfile, Makefile, pom.xml, build.gradle(.kts), build.sbt".to_string());
             }
+            // Identify the "primary" toolchain: the one closest to the
+            // project root. Root-level toolchains carry `subdir == None`,
+            // so we prefer the first such entry; if every detection
+            // came from a subdirectory (no root-level manifest), the
+            // first entry in detection order is treated as primary.
+            // The dispatcher already prefers the toolchain that
+            // actually defines the requested command via `pick_by`,
+            // but the info output needs to surface that disambiguation
+            // explicitly so a caller staring at three Cargo blocks can
+            // see which one drives `qartez_project action=test`.
+            let primary_index = all_toolchains
+                .iter()
+                .position(|tc| tc.subdir.is_none())
+                .unwrap_or(0);
+            let ambiguous = all_toolchains.len() > 1;
             let mut out = String::new();
+            if ambiguous {
+                out.push_str(&format!(
+                    "# Note: {} toolchains detected; the first match per command wins. The closest-to-root toolchain is marked [primary] below.\n\n",
+                    all_toolchains.len(),
+                ));
+            }
             for (i, tc) in all_toolchains.iter().enumerate() {
                 if i > 0 {
                     out.push('\n');
@@ -90,9 +122,14 @@ impl QartezServer {
                     .as_deref()
                     .map(|s| format!(" (subdir: {s}/)"))
                     .unwrap_or_default();
+                let primary_tag = if ambiguous && i == primary_index {
+                    " [primary]"
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
-                    "# Project toolchain: {}{}{}\n\n",
-                    tc.name, subdir_tag, marker,
+                    "# Project toolchain: {}{}{}{}\n\n",
+                    tc.name, subdir_tag, primary_tag, marker,
                 ));
                 out.push_str(&format!("Build tool: {}\n", tc.build_tool));
                 if tc.test_cmd.is_empty() {
@@ -242,6 +279,48 @@ impl QartezServer {
                 return Err(format!(
                     "Filter contains unsupported character '{bad}': filter may contain only alphanumerics, '-', '_', '.', '/', ':', '=', '@', '+', and whitespace. Got: {f}",
                 ));
+            }
+        }
+
+        // Pre-flight test filter against the index: when the caller
+        // asks for `action=test filter=<pattern>` and zero indexed
+        // function names match `<pattern>` as a substring, the
+        // toolchain-driven test runner would still kick off a full
+        // build before discovering that no test matches and exiting
+        // with `0 tests run`. That wastes minutes of CPU and burns
+        // the user's timeout budget. Refuse up-front when we can
+        // prove no candidate test exists, but stay conservative:
+        // only short-circuit when the index has at least one function
+        // symbol overall (so empty / pre-index sessions still fall
+        // through to the toolchain).
+        if matches!(action, ProjectAction::Test)
+            && let Some(f) = filter
+            && !f.is_empty()
+            && let Ok(conn) = self.db.lock()
+        {
+            const ANY_FUNCTION_QUERY: &str =
+                "SELECT 1 FROM symbols WHERE kind = 'function' LIMIT 1";
+            let any_function: bool = conn
+                .query_row(ANY_FUNCTION_QUERY, [], |_| Ok(()))
+                .map(|()| true)
+                .unwrap_or(false);
+            if any_function {
+                let needle = f.to_ascii_lowercase();
+                const MATCH_QUERY: &str = "SELECT 1 FROM symbols \
+                     WHERE kind IN ('function', 'method') \
+                     AND instr(LOWER(name), ?1) > 0 \
+                     LIMIT 1";
+                let has_match: bool = conn
+                    .query_row(MATCH_QUERY, rusqlite::params![needle], |_| Ok(()))
+                    .map(|()| true)
+                    .unwrap_or(false);
+                if !has_match {
+                    return Err(format!(
+                        "No indexed function or method name contains '{f}'. Refusing to run `{}{}` because it would compile the project before discovering no test matches the filter. Use `qartez_grep query='{f}*'` (with regex=false for FTS prefix) to find the actual test name first.",
+                        cmd.join(" "),
+                        filter.map(|x| format!(" {x}")).unwrap_or_default(),
+                    ));
+                }
             }
         }
 

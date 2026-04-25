@@ -151,31 +151,73 @@ impl QartezServer {
             let cfg = suggest_boundaries(&files, &clusters, &edges);
             let toml = render_config_toml(&cfg);
 
+            // When the suggester produces zero rules, the renderer
+            // emits only a 3-line header + blank line. A blank stub
+            // is dangerous: the violation checker reads it as
+            // "0 rules, 0 violations - pristine architecture". Wrap
+            // the empty body with explanatory `#`-comments so the
+            // file on disk says, in plain language, why no rules
+            // were derived and how to recover. The inline path
+            // returns the same advice unwrapped.
+            let advice_short = "No candidate rules: the current clustering has no directory-aligned \
+                 partitions to derive rules from. Try \
+                 `qartez_wiki recompute=true resolution=2.0` (or a higher value) to \
+                 fragment clusters along directory boundaries, then rerun \
+                 `qartez_boundaries suggest=true`.";
+            if cfg.boundary.is_empty() && write_to_trimmed.is_empty() {
+                return Ok(advice_short.to_string());
+            }
+
+            let payload = if cfg.boundary.is_empty() {
+                // Build an explanatory-comment-only TOML so the file
+                // is harmless (no rules) but cannot be silently
+                // mistaken for a real config: every line is a `#`
+                // comment that names the cause and the recovery
+                // command. The boundary checker still reads this as
+                // "0 rules" but anyone opening the file sees the
+                // explanation immediately.
+                let mut s = String::new();
+                s.push_str("# Qartez architecture boundaries (placeholder).\n");
+                s.push_str("#\n");
+                s.push_str("# No candidate rules were derivable: the current clustering has\n");
+                s.push_str("# no directory-aligned partitions. Re-run with a higher\n");
+                s.push_str("# resolution to fragment clusters along directory boundaries,\n");
+                s.push_str("# then regenerate this file:\n");
+                s.push_str("#\n");
+                s.push_str("#   qartez_wiki recompute=true resolution=2.0\n");
+                s.push_str("#   qartez_boundaries suggest=true write_to=.qartez/boundaries.toml\n");
+                s.push_str("#\n");
+                s.push_str("# As-is, this file declares 0 rules so the violation checker\n");
+                s.push_str("# will report `No boundary violations` regardless of imports.\n");
+                s
+            } else {
+                toml
+            };
+
             if !write_to_trimmed.is_empty() {
                 let write_abs = resolve_write_target(self, write_to_trimmed)?;
                 if let Some(parent) = write_abs.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
                 }
-                std::fs::write(&write_abs, &toml)
+                std::fs::write(&write_abs, &payload)
                     .map_err(|e| format!("Cannot write {}: {e}", write_abs.display()))?;
+                if cfg.boundary.is_empty() {
+                    return Ok(format!(
+                        "Wrote 0-rule placeholder to {} ({} bytes). {advice_short}",
+                        write_abs.display(),
+                        payload.len(),
+                    ));
+                }
                 return Ok(format!(
                     "Wrote {} rule(s) to {} ({} bytes).",
                     cfg.boundary.len(),
                     write_abs.display(),
-                    toml.len(),
+                    payload.len(),
                 ));
             }
 
-            if cfg.boundary.is_empty() {
-                return Ok(
-                    "No candidate rules: the current clustering has no directory-aligned \
-                     partitions to derive rules from. Try `qartez_wiki recompute=true` first."
-                        .to_string(),
-                );
-            }
-
-            return Ok(toml);
+            return Ok(payload);
         }
 
         if !abs_path.exists() {

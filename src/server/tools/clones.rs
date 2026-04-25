@@ -36,6 +36,12 @@ impl QartezServer {
         &self,
         Parameters(params): Parameters<SoulClonesParams>,
     ) -> Result<String, String> {
+        // `qartez_clones` does not render Mermaid graphs; reject the
+        // shared `format=mermaid` value so the contract matches every
+        // other non-graph tool (qartez_smells, qartez_hotspots, etc).
+        // Without this guard the caller silently received the default
+        // text output and saw what looked like a no-op format change.
+        reject_mermaid(&params.format, "qartez_clones")?;
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         // `limit=0` previously coerced to 1 via `.max(1)`, which
         // silently shaped the caller's `limit=0` intent into a

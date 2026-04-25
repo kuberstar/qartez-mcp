@@ -77,7 +77,7 @@ qartez_test_gaps mode=suggest base=main # which tests should you run?
 
 ## Unlocking tools
 
-By default, all 37 tools are available. With progressive disclosure
+By default, all 39 tools are available. With progressive disclosure
 (`QARTEZ_PROGRESSIVE=1`), start with core tools and unlock more as needed:
 
 ```

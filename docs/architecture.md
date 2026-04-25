@@ -44,11 +44,20 @@ runs this sequence:
    - `compute_pagerank` — file-level importance ranking
    - `compute_symbol_pagerank` — symbol-level importance ranking
    - `analyze_cochanges` — git log mining for co-change pairs
+
+   The whole block runs under a cross-process advisory lock at
+   `.qartez/index.lock` (`src/lock.rs`) so that two qartez processes touching
+   the same repository serialize at the file-lock layer instead of racing
+   into `SQLITE_BUSY`. The lock holder writes its PID into the lock file so
+   the contention error reports `held by PID N`. MCP read-only serving is
+   not blocked because the lock is only acquired on writer paths.
 4. **MCP serve** — start listening on stdin/stdout immediately, even while
    indexing runs in the background. Tool calls before indexing completes see
    whatever the DB carried from a previous run.
 5. **File watcher** — per-root `notify`-based watcher triggers incremental
-   re-indexing on file changes
+   re-indexing on file changes. Each re-index briefly tries the cross-process
+   lock and skips with a log message if another qartez process is mid-index,
+   so watcher events do not pile up behind a long full re-index.
 
 The CLI subcommand path (`qartez map`, `qartez grep`, etc.) skips step 4 and
 runs indexing synchronously before dispatching the tool.

@@ -24,7 +24,7 @@ use crate::toolchain;
 impl QartezServer {
     #[tool(
         name = "qartez_context",
-        description = "Smart context builder: given files you plan to modify, returns the optimal set of related files to read first. Combines dependency graph, co-change history, and PageRank to prioritize what matters.",
+        description = "Smart context builder: given files you plan to modify, returns the optimal set of related files to read first. Combines dependency graph, co-change history, and PageRank to prioritize what matters. Pass `include_impact=true` to append a one-line blast-radius summary per input file (direct importers, transitive count, cochange partner count) and `include_test_gaps=true` to append a one-line test-coverage status per input file - so a single call covers the prepare-change checklist without a follow-up qartez_impact / qartez_test_gaps round-trip.",
         annotations(
             title = "Smart Context",
             read_only_hint = true,
@@ -42,6 +42,8 @@ impl QartezServer {
         let budget = params.token_budget.unwrap_or(4000) as usize;
         let concise = is_concise(&params.format);
         let explain = params.explain.unwrap_or(false);
+        let include_impact = params.include_impact.unwrap_or(false);
+        let include_test_gaps = params.include_test_gaps.unwrap_or(false);
         // `limit=0` means "no cap" - uniform across qartez query tools.
         let limit = match params.limit {
             None => 15,
@@ -154,6 +156,11 @@ impl QartezServer {
         // decomposition instead of only the final score.
         let mut scored: HashMap<String, ScoreBreakdown> = HashMap::new();
         let mut input_file_ids: Vec<i64> = Vec::new();
+        // Track the languages represented in the seed set. Used downstream
+        // to keep the `task_match` FTS scoring from crediting cross-language
+        // hits (a Rust-focused seed should not surface JS plugins or CSS
+        // files just because their FTS index has the same prefix).
+        let mut seed_languages: HashSet<String> = HashSet::new();
 
         for file_path in &files_list {
             let file = match read::get_file_by_path(&conn, file_path)
@@ -162,6 +169,9 @@ impl QartezServer {
                 Some(f) => f,
                 None => continue,
             };
+            if !file.language.trim().is_empty() && file.language != "unknown" {
+                seed_languages.insert(file.language.clone());
+            }
             input_file_ids.push(file.id);
 
             let outgoing = read::get_edges_from(&conn, file.id).unwrap_or_default();
@@ -222,6 +232,34 @@ impl QartezServer {
                 };
                 if let Ok(results) = read::search_symbols_fts(&conn, &fts, 10) {
                     for (sym, file_path) in &results {
+                        // Mirror the seed-from-task filter: reject
+                        // non-code files (CSS, lockfiles, JSON,
+                        // workflow YAML) when crediting `task_match`
+                        // signal. Without this, a task like
+                        // "parse and analyze the rust source code"
+                        // bumped opencode-plugin.ts and style.css
+                        // into the seed list because the FTS index
+                        // covers every indexed file and the score
+                        // ladder weighted that match equally with a
+                        // real Rust hit.
+                        if !is_testable_source_path(file_path) {
+                            continue;
+                        }
+                        // Cross-language guard. When the seed set has a
+                        // clear language signal, skip FTS hits in other
+                        // languages so a Rust-only seed does not pull in
+                        // JS plugins or Python helpers via shared symbol
+                        // prefixes. An empty `seed_languages` (e.g. the
+                        // task-only seed mode hit a directory whose
+                        // language detection collapsed to "unknown")
+                        // disables the filter so the legacy behavior
+                        // still applies.
+                        if !seed_languages.is_empty()
+                            && let Ok(Some(candidate)) = read::get_file_by_path(&conn, file_path)
+                            && !seed_languages.contains(&candidate.language)
+                        {
+                            continue;
+                        }
                         if !files_list.contains(file_path) {
                             scored.entry(file_path.clone()).or_default().task_match += 1.0;
                         }
@@ -241,7 +279,13 @@ impl QartezServer {
         let dropped_by_limit = total_candidates.saturating_sub(limit);
         ranked.truncate(limit);
 
-        if ranked.is_empty() {
+        // Empty-ranked early-return preserves the legacy "no related
+        // context" wording when no compound flags are set so existing
+        // callers see the same response shape. With at least one flag
+        // on, the caller is asking for the prepare-change checklist
+        // (impact / test-gaps); we keep going so those sections still
+        // render even for isolated files.
+        if ranked.is_empty() && !include_impact && !include_test_gaps {
             return Ok(
                 "No related context files found. The specified files may be isolated.".to_string(),
             );
@@ -252,10 +296,16 @@ impl QartezServer {
         } else {
             files_list.join(", ")
         };
-        let mut out = format!(
-            "# Context for: {header_subject}\n{} related file(s) found:\n",
-            ranked.len(),
-        );
+        let mut out = if ranked.is_empty() {
+            format!(
+                "# Context for: {header_subject}\nNo related files via the dependency / co-change graph; compound annotations follow.\n",
+            )
+        } else {
+            format!(
+                "# Context for: {header_subject}\n{} related file(s) found:\n",
+                ranked.len(),
+            )
+        };
         // When `task` is set and `explain=false`, surface the seed
         // count so callers know how the context list was derived
         // without flipping on full explain mode. `explain=true`
@@ -299,6 +349,100 @@ impl QartezServer {
                 break;
             }
             out.push_str(&line);
+        }
+
+        // Optional compound annotations - blast-radius and test-coverage
+        // summaries appended per input file so a single qartez_context
+        // call can answer the prepare-change checklist without a follow
+        // up qartez_impact / qartez_test_gaps round-trip.
+        // Both sections are token-budget aware: each line is checked
+        // against the same `budget` ceiling used for the ranked listing
+        // so the response stays within the caller's contract.
+        if include_impact {
+            let header = "\n## Impact (per input file)\n";
+            if estimate_tokens(&out) + estimate_tokens(header) <= budget {
+                out.push_str(header);
+                for path in &files_list {
+                    let file = match read::get_file_by_path(&conn, path) {
+                        Ok(Some(f)) => f,
+                        _ => continue,
+                    };
+                    let direct = read::get_edges_to(&conn, file.id)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let transitive = blast::blast_radius_for_file(&conn, file.id)
+                        .map(|b| b.transitive_count)
+                        .unwrap_or(0);
+                    let cochange = read::get_cochanges(&conn, file.id, 5)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let line = format!(
+                        "  {path} - direct={direct} transitive={transitive} cochange={cochange}\n",
+                    );
+                    if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+                        out.push_str("  ... (truncated by token budget)\n");
+                        break;
+                    }
+                    out.push_str(&line);
+                }
+            }
+        }
+
+        if include_test_gaps {
+            let header = "\n## Test gaps (per input file)\n";
+            if estimate_tokens(&out) + estimate_tokens(header) <= budget {
+                out.push_str(header);
+                // Delegate to the canonical coverage helper in
+                // tools::test_gaps so the answer matches what
+                // `qartez_test_gaps mode=gaps` would say. Walking
+                // direct edges alone misses Rust crate-rooted imports
+                // (`use <crate>::<module>`) and inline `#[cfg(test)]`
+                // blocks - both real coverage signals that should not
+                // be reported as gaps.
+                for path in &files_list {
+                    let cov =
+                        super::test_gaps::coverage_for_source(&conn, &self.project_root, path);
+                    let line = if !cov.is_covered() {
+                        format!("  {path} - untested\n")
+                    } else {
+                        let mut tests: Vec<String> = Vec::new();
+                        tests.extend(cov.direct_test_paths.iter().cloned());
+                        for p in &cov.stem_mentioned_in_tests {
+                            if !tests.contains(p) {
+                                tests.push(p.clone());
+                            }
+                        }
+                        let inline_tag = if cov.inline_rust_tests {
+                            " + inline tests"
+                        } else {
+                            ""
+                        };
+                        if tests.is_empty() {
+                            // Inline-only coverage: no external test
+                            // file mentions the source, but the file
+                            // declares its own #[cfg(test)] block.
+                            format!("  {path} - covered (inline tests only)\n")
+                        } else {
+                            let count = tests.len();
+                            let preview: Vec<String> = tests.iter().take(3).cloned().collect();
+                            let extra = if count > 3 {
+                                format!(" (+{} more)", count - 3)
+                            } else {
+                                String::new()
+                            };
+                            format!(
+                                "  {path} - {count} test(s): {}{extra}{inline_tag}\n",
+                                preview.join(", "),
+                            )
+                        }
+                    };
+                    if estimate_tokens(&out) + estimate_tokens(&line) > budget {
+                        out.push_str("  ... (truncated by token budget)\n");
+                        break;
+                    }
+                    out.push_str(&line);
+                }
+            }
         }
 
         if explain && (dropped_by_limit > 0 || dropped_by_budget > 0) {
