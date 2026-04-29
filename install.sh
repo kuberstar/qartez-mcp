@@ -18,7 +18,17 @@ set -e
 QARTEZ_REPO="kuberstar/qartez-mcp"
 QARTEZ_BRANCH="main"
 INSTALL_DIR="${HOME}/.local/bin"
-SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+
+# When invoked via `curl ... | sh`, $0 is the interpreter name ("sh", "bash", ...)
+# and `dirname "sh"` resolves to ".", silently anchoring SCRIPT_DIR to the user's
+# CWD. If they happen to be inside any rust project, the LOCAL_REPO check below
+# would then mistake that project for the qartez source tree and `cargo build`
+# it. Only honor $0 when it actually points at a readable script file.
+if [ -n "$0" ] && [ -f "$0" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+else
+    SCRIPT_DIR=""
+fi
 
 if [ -t 1 ]; then
     GREEN='\033[0;32m'; BLUE='\033[1;34m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -270,7 +280,12 @@ warn_path() {
 # archive first and fall through to source if anything goes wrong.
 LOCAL_REPO=0
 if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-    LOCAL_REPO=1
+    # Defense in depth: even when SCRIPT_DIR points at a real script directory,
+    # only treat it as the local source tree if its Cargo.toml is qartez-mcp's.
+    # Protects against running install.sh from a copied/renamed location.
+    if grep -q '^name *= *"qartez-mcp"' "${SCRIPT_DIR}/Cargo.toml" 2>/dev/null; then
+        LOCAL_REPO=1
+    fi
 fi
 
 if [ "$FROM_SOURCE" -eq 0 ] && [ "$LOCAL_REPO" -eq 0 ]; then

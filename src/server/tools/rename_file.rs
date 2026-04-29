@@ -12,6 +12,7 @@ use super::super::helpers::{self, *};
 use super::super::params::*;
 use super::super::tiers;
 use super::super::treesitter::*;
+use super::refactor_common;
 
 use crate::graph::blast;
 use crate::guard;
@@ -257,8 +258,14 @@ impl QartezServer {
             let updated = apply_rename_pairs(&content, &stem_pairs)?;
 
             if updated != content {
-                if let Err(e) = std::fs::write(&importer_abs, &updated) {
-                    failed_writes.push(format!("{}: {e}", importer_abs.display()));
+                // `write_atomic` writes to a sibling temp file then renames
+                // it over the importer, so a kill-9 mid-rewrite leaves the
+                // original file intact rather than a half-written one. The
+                // mv/replace/insert tools share this discipline; using
+                // plain `std::fs::write` here would give rename_file a
+                // weaker durability profile than its peers.
+                if let Err(e) = refactor_common::write_atomic(&importer_abs, &updated) {
+                    failed_writes.push(e);
                 } else {
                     updated_count += 1;
                 }
@@ -278,8 +285,8 @@ impl QartezServer {
             if let Ok(content) = std::fs::read_to_string(&parent_abs) {
                 let rewritten = rewrite_mod_decl(&content, &old_rel_stem, &new_rel_stem);
                 if rewritten != content {
-                    if let Err(e) = std::fs::write(&parent_abs, &rewritten) {
-                        failed_writes.push(format!("{}: {e}", parent_abs.display()));
+                    if let Err(e) = refactor_common::write_atomic(&parent_abs, &rewritten) {
+                        failed_writes.push(e);
                     } else {
                         mod_rewrite_note =
                             format!(", parent mod decl updated in {}", parent_rel.display(),);

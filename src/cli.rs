@@ -275,4 +275,10 @@ pub enum Command {
         /// The path to the project directory (required for 'add')
         path: Option<String>,
     },
+
+    /// Local web dashboard (Project Pulse, live impact preview)
+    Dashboard {
+        #[command(subcommand)]
+        action: qartez_dashboard::DashboardCommand,
+    },
 }

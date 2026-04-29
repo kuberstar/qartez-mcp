@@ -1,0 +1,55 @@
+[package]
+name = "qartez-dashboard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local web dashboard for Qartez code intelligence"
+license-file = "../LICENSE"
+publish = false
+
+[lib]
+name = "qartez_dashboard"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+ignore = { workspace = true }
+thiserror = { workspace = true }
+
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+http = "1.3"
+hyper = { version = "1", features = ["http1"] }
+directories = "6"
+rand = "0.9"
+hex = "0.4"
+clap = { version = "4.6", features = ["derive"] }
+url = "2"
+tracing-appender = "0.2"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["user", "signal"] }
+
+[build-dependencies]
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"

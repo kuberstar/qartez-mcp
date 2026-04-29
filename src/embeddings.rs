@@ -44,6 +44,12 @@ pub struct EmbeddingModel {
     // workloads are sequential. A session pool would allow parallelism.
     session: Arc<Mutex<Session>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
+    // Some recent re-exports of `jina-embeddings-v2-base-code` drop the
+    // optional `token_type_ids` input from the ONNX graph. Feeding an input
+    // the graph does not declare aborts inference with `Invalid input name`,
+    // so we capture the declared input set at load time and only feed
+    // `token_type_ids` when the model actually accepts it.
+    accepts_token_type_ids: bool,
 }
 
 impl std::fmt::Debug for EmbeddingModel {
@@ -85,12 +91,18 @@ impl EmbeddingModel {
             .commit_from_file(&model_path)
             .map_err(|e| anyhow::anyhow!("failed to load ONNX model: {e}"))?;
 
+        let accepts_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
             tokenizer: Arc::new(tokenizer),
+            accepts_token_type_ids,
         })
     }
 
@@ -139,10 +151,15 @@ impl EmbeddingModel {
             .max()
             .unwrap_or(0);
 
-        // Build padded input tensors: input_ids, attention_mask, token_type_ids.
+        // Build padded input tensors. `token_type_ids` is only allocated and
+        // built when the loaded ONNX graph actually declares that input.
         let mut input_ids = vec![0i64; batch_size * max_len];
         let mut attention_mask = vec![0i64; batch_size * max_len];
-        let mut token_type_ids = vec![0i64; batch_size * max_len];
+        let mut token_type_ids = if self.accepts_token_type_ids {
+            vec![0i64; batch_size * max_len]
+        } else {
+            Vec::new()
+        };
 
         for (i, enc) in encodings.iter().enumerate() {
             let ids = enc.get_ids();
@@ -153,7 +170,9 @@ impl EmbeddingModel {
             for j in 0..seq_len {
                 input_ids[i * max_len + j] = ids[j] as i64;
                 attention_mask[i * max_len + j] = mask[j] as i64;
-                token_type_ids[i * max_len + j] = type_ids[j] as i64;
+                if self.accepts_token_type_ids {
+                    token_type_ids[i * max_len + j] = type_ids[j] as i64;
+                }
             }
         }
 
@@ -167,19 +186,26 @@ impl EmbeddingModel {
             .map_err(|e| anyhow::anyhow!("tensor creation: {e}"))?;
         let mask_tensor = ort::value::Tensor::from_array((shape.clone(), attention_mask))
             .map_err(|e| anyhow::anyhow!("tensor creation: {e}"))?;
-        let type_tensor = ort::value::Tensor::from_array((shape, token_type_ids))
-            .map_err(|e| anyhow::anyhow!("tensor creation: {e}"))?;
+
+        let mut inputs = ort::inputs![
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+        ];
+        if self.accepts_token_type_ids {
+            let type_tensor = ort::value::Tensor::from_array((shape, token_type_ids))
+                .map_err(|e| anyhow::anyhow!("tensor creation: {e}"))?;
+            inputs.push((
+                std::borrow::Cow::Borrowed("token_type_ids"),
+                ort::session::SessionInputValue::from(type_tensor),
+            ));
+        }
 
         let mut session = self
             .session
             .lock()
             .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?;
         let outputs = session
-            .run(ort::inputs![
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => type_tensor,
-            ])
+            .run(inputs)
             .map_err(|e| anyhow::anyhow!("ONNX inference: {e}"))?;
 
         // The model outputs a tensor of shape [batch, seq_len, hidden_dim].

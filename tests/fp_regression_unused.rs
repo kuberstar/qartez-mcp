@@ -1,21 +1,27 @@
-// Rust guideline compliant 2026-04-22
+// Rust guideline compliant 2026-04-26
 //
-// Regression coverage for the plugin / extension entry-point filter added
-// to `qartez_unused`. External runtimes (OpenCode plugin host, VS Code
-// extension API, CLI script loaders) resolve exports by string name, so
-// the static reference graph never records an edge to those symbols.
-// Without the filter, the tool reports them as dead and hides real
-// positives behind noise. The filter keys on:
+// Regression coverage for the framework-convention entry-point filter
+// added to `qartez_unused`. External runtimes (OpenCode plugin host,
+// VS Code extension API, CLI script loaders, SvelteKit's route + hooks
+// dispatcher) resolve exports by string name, so the static reference
+// graph never records an edge to those symbols. Without the filter, the
+// tool reports them as dead and hides real positives behind noise. The
+// filter keys on:
 //
 //   1. directory prefix - `scripts/`, `plugins/`, `extensions/`
-//   2. file basename    - `plugin.*`, `extension.*`, `*-plugin.*`,
+//   2. plugin basename  - `plugin.*`, `extension.*`, `*-plugin.*`,
 //                         `*-extension.*`
+//   3. SvelteKit route  - `+page.*`, `+page.server.*`, `+layout.*`,
+//                         `+layout.server.*`, `+server.*`, `+error.*`,
+//                         `hooks.server.*`, `hooks.client.*`
+//   4. framework config - `svelte.config.*`, `vite.config.*`,
+//                         `playwright.config.*`
 //
-// Fixture A exercises the path-prefix branch with a realistic OpenCode-
-// style `scripts/*-plugin.ts` entry-point export and asserts the tool
-// does NOT flag it. Fixture B exercises the truly-dead case - an
-// exported function in `src/` that no one calls - and asserts the tool
-// DOES still flag it, protecting the tool's core detection signal.
+// Fixture A exercises the path-prefix and basename branches with
+// realistic OpenCode-style and SvelteKit-style entry points and asserts
+// the tool does NOT flag them. Fixture B exercises the truly-dead case
+// - an exported function in `src/` that no one calls - and asserts the
+// tool DOES still flag it, protecting the tool's core detection signal.
 
 use std::fs;
 use std::path::Path;
@@ -142,6 +148,94 @@ fn qartez_unused_skips_dash_plugin_basename_anywhere() {
     assert!(
         !out.contains("src/runtime-plugin.ts"),
         "file matching the *-plugin.* basename pattern must be filtered: got {out}"
+    );
+}
+
+#[test]
+fn qartez_unused_skips_sveltekit_layout_module_exports() {
+    // SvelteKit reads `ssr`, `prerender`, `trailingSlash`, etc. by name
+    // from `+layout.ts`. Without the framework-convention filter, the
+    // tool would mark every one of those as a dead export.
+    let dir = TempDir::new().unwrap();
+    let layout_ts = r#"export const ssr = false;
+export const prerender = true;
+export const trailingSlash = "always";
+"#;
+    let server = build_and_index(dir.path(), &[("web/src/routes/+layout.ts", layout_ts)]);
+
+    let out = server
+        .call_tool_by_name("qartez_unused", json!({ "limit": 100 }))
+        .expect("qartez_unused should succeed");
+
+    assert!(
+        !out.contains("+layout.ts"),
+        "SvelteKit `+layout.ts` exports must not be flagged as dead: got {out}"
+    );
+}
+
+#[test]
+fn qartez_unused_skips_sveltekit_page_server_actions() {
+    // `+page.server.ts` exports `load` and `actions` for SvelteKit form
+    // handling. These are resolved by name from the route table.
+    let dir = TempDir::new().unwrap();
+    let page_server_ts = r#"export const load = async () => ({ user: null });
+export const actions = { default: async () => ({}) };
+"#;
+    let server = build_and_index(
+        dir.path(),
+        &[("web/src/routes/login/+page.server.ts", page_server_ts)],
+    );
+
+    let out = server
+        .call_tool_by_name("qartez_unused", json!({ "limit": 100 }))
+        .expect("qartez_unused should succeed");
+
+    assert!(
+        !out.contains("+page.server.ts"),
+        "SvelteKit `+page.server.ts` exports must not be flagged as dead: got {out}"
+    );
+}
+
+#[test]
+fn qartez_unused_skips_sveltekit_server_endpoint_handlers() {
+    // `+server.ts` exports `GET` / `POST` / `PUT` / etc. as HTTP handlers.
+    // SvelteKit's router dispatches by method name.
+    let dir = TempDir::new().unwrap();
+    let server_ts = r#"export const GET = async () => new Response("ok");
+export const POST = async () => new Response("created", { status: 201 });
+"#;
+    let server = build_and_index(
+        dir.path(),
+        &[("web/src/routes/api/health/+server.ts", server_ts)],
+    );
+
+    let out = server
+        .call_tool_by_name("qartez_unused", json!({ "limit": 100 }))
+        .expect("qartez_unused should succeed");
+
+    assert!(
+        !out.contains("+server.ts"),
+        "SvelteKit `+server.ts` HTTP handler exports must not be flagged as dead: got {out}"
+    );
+}
+
+#[test]
+fn qartez_unused_skips_sveltekit_hooks_server() {
+    // `hooks.server.ts` exports `handle`, `handleError`, `handleFetch`
+    // that SvelteKit invokes by name from the request lifecycle.
+    let dir = TempDir::new().unwrap();
+    let hooks_ts = r#"export const handle = async ({ event, resolve }) => resolve(event);
+export const handleError = ({ error }) => ({ message: String(error) });
+"#;
+    let server = build_and_index(dir.path(), &[("web/src/hooks.server.ts", hooks_ts)]);
+
+    let out = server
+        .call_tool_by_name("qartez_unused", json!({ "limit": 100 }))
+        .expect("qartez_unused should succeed");
+
+    assert!(
+        !out.contains("hooks.server.ts"),
+        "SvelteKit `hooks.server.ts` exports must not be flagged as dead: got {out}"
     );
 }
 

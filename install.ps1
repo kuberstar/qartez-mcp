@@ -196,16 +196,23 @@ function Install-FromPrebuilt {
 }
 
 function Resolve-SourceDirectory {
-    # Repo mode: script sits next to Cargo.toml
+    # Repo mode: script sits next to Cargo.toml. When invoked via
+    # `iwr ... | iex`, $PSCommandPath is $null, so a fallback to (Get-Location)
+    # would silently anchor $repoDir to the user's CWD - and any random rust
+    # project they happened to be inside would then be mistaken for the qartez
+    # source tree. Skip the fallback and download the source archive instead.
     $repoDir = if ($PSCommandPath) {
         Split-Path -Parent $PSCommandPath
     }
     else {
-        (Get-Location).Path
+        $null
     }
-    $cargoToml = Join-Path $repoDir 'Cargo.toml'
-    if (Test-Path -Path $cargoToml -PathType Leaf) {
-        return $repoDir
+    if ($repoDir) {
+        $cargoToml = Join-Path $repoDir 'Cargo.toml'
+        if ((Test-Path -Path $cargoToml -PathType Leaf) -and `
+            (Select-String -Path $cargoToml -Pattern '^name *= *"qartez-mcp"' -Quiet)) {
+            return $repoDir
+        }
     }
 
     # Download source archive from GitHub and extract
@@ -320,15 +327,21 @@ function Install-FromSource {
 # Running from a checked-out repo always builds from source - that matches the
 # dev workflow and avoids shadowing local changes. For remote installs, try
 # pre-built first and fall through to source on any failure.
+#
+# When invoked via `iwr ... | iex`, $PSCommandPath is $null. Falling back to
+# (Get-Location) would silently anchor $repoCandidate to the user's CWD, and
+# a Cargo.toml in any unrelated rust project would flip $LocalRepo to true -
+# exactly the bug reported in qartez-mcp#31 for the POSIX installer. Only
+# treat the script directory as the local source tree when (a) we actually
+# know the script's path, and (b) its Cargo.toml belongs to qartez-mcp.
 $LocalRepo = $false
-$repoCandidate = if ($PSCommandPath) {
-    Split-Path -Parent $PSCommandPath
-}
-else {
-    (Get-Location).Path
-}
-if (Test-Path -Path (Join-Path $repoCandidate 'Cargo.toml') -PathType Leaf) {
-    $LocalRepo = $true
+if ($PSCommandPath) {
+    $repoCandidate = Split-Path -Parent $PSCommandPath
+    $cargoToml = Join-Path $repoCandidate 'Cargo.toml'
+    if ((Test-Path -Path $cargoToml -PathType Leaf) -and `
+        (Select-String -Path $cargoToml -Pattern '^name *= *"qartez-mcp"' -Quiet)) {
+        $LocalRepo = $true
+    }
 }
 
 Write-Info 'Installing qartez (Windows native)...'

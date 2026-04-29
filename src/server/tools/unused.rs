@@ -59,10 +59,46 @@ fn plugin_entry_basename_patterns() -> &'static RegexSet {
     })
 }
 
-/// Return `true` when `path` looks like a plugin or extension entry-point
-/// file. The check is a cheap path-prefix scan followed by a single
-/// `RegexSet::is_match` on the basename, so the cost is constant per row.
-fn is_plugin_entry_point_path(path: &str) -> bool {
+/// Filename patterns for SvelteKit and adjacent meta-framework convention
+/// entry-points. SvelteKit discovers route handlers, layouts, hooks, and
+/// build configuration by filename, then loads exports (`load`, `actions`,
+/// `ssr`, `prerender`, `GET`, `POST`, ...) by string name. The static
+/// reference graph cannot observe the dynamic caller, so the symbols would
+/// otherwise be reported as dead. The basename anchors keep the match
+/// tight: a stray file called `+page.bak` is rejected, while `+page.ts`,
+/// `+page.svelte`, `+page.server.ts`, `+layout.ts`, `+server.ts`,
+/// `hooks.client.ts`, `hooks.server.ts`, `svelte.config.js`, etc. all hit.
+static FRAMEWORK_CONVENTION_BASENAME_PATTERNS: OnceLock<RegexSet> = OnceLock::new();
+
+fn framework_convention_basename_patterns() -> &'static RegexSet {
+    FRAMEWORK_CONVENTION_BASENAME_PATTERNS.get_or_init(|| {
+        RegexSet::new([
+            // SvelteKit route conventions - the leading `+` is unique to
+            // SvelteKit so we accept any single trailing extension or the
+            // `.server.<ext>` / `.client.<ext>` shape.
+            r"^\+page\.[^.]+$",
+            r"^\+page\.(server|client)\.[^.]+$",
+            r"^\+layout\.[^.]+$",
+            r"^\+layout\.(server|client)\.[^.]+$",
+            r"^\+server\.[^.]+$",
+            r"^\+error\.[^.]+$",
+            // Hooks are conventionally at the project root; SvelteKit
+            // resolves them by filename.
+            r"^hooks\.(server|client)\.[^.]+$",
+            // Build / framework configs picked up by tooling at startup.
+            r"^svelte\.config\.[^.]+$",
+            r"^vite\.config\.[^.]+$",
+            r"^playwright\.config\.[^.]+$",
+        ])
+        .expect("framework convention basename patterns must compile")
+    })
+}
+
+/// Return `true` when `path` looks like a plugin, extension, or
+/// meta-framework convention entry-point file. The check is a cheap
+/// path-prefix scan followed by two `RegexSet::is_match` calls on the
+/// basename, so the cost is constant per row.
+fn is_framework_runtime_entry_path(path: &str) -> bool {
     if PLUGIN_ENTRY_DIR_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -71,6 +107,7 @@ fn is_plugin_entry_point_path(path: &str) -> bool {
     }
     let basename = path.rsplit('/').next().unwrap_or(path);
     plugin_entry_basename_patterns().is_match(basename)
+        || framework_convention_basename_patterns().is_match(basename)
 }
 
 #[tool_router(router = qartez_unused_router, vis = "pub(super)")]
@@ -110,16 +147,17 @@ impl QartezServer {
             return Ok("No unused exported symbols detected.".to_string());
         }
 
-        // Plugin / extension entry-point files are loaded by external
+        // Framework-convention entry-point files are loaded by external
         // runtimes via string lookup (e.g. OpenCode `Plugin` exports,
-        // VS Code `activate` handlers, CLI script hooks). The static
-        // reference graph cannot observe those callers, so the row
-        // survives `NOT EXISTS (... symbol_refs ...)` and gets reported
-        // as unused even when it is a live entry point. Over-sample
-        // from the DB and drop those rows here so the caller-visible
-        // page is always `limit` post-filter rows (unless the DB is
-        // exhausted). Before oversampling, a page that happened to
-        // contain a plugin entry produced off-by-one counters like
+        // VS Code `activate` handlers, CLI script hooks, SvelteKit
+        // `+page.ts` / `+server.ts` / `hooks.server.ts` route handlers).
+        // The static reference graph cannot observe those callers, so the
+        // row survives `NOT EXISTS (... symbol_refs ...)` and gets
+        // reported as unused even when it is a live entry point. Over-
+        // sample from the DB and drop those rows here so the caller-
+        // visible page is always `limit` post-filter rows (unless the DB
+        // is exhausted). Before oversampling, a page that happened to
+        // contain a framework entry produced off-by-one counters like
         // "10 unused; showing 9" or "limit=5 returns 4" that looked
         // like a pagination bug.
         const FETCH_PAGE_SIZE: i64 = 64;
@@ -156,7 +194,7 @@ impl QartezServer {
             let batch_len = batch.len() as i64;
             fetch_offset += batch_len;
             for row in batch {
-                if is_plugin_entry_point_path(&row.1.path) {
+                if is_framework_runtime_entry_path(&row.1.path) {
                     plugin_filtered += 1;
                     consumed_offset += 1;
                     continue;
@@ -176,12 +214,12 @@ impl QartezServer {
 
         if page.is_empty() {
             return Ok(format!(
-                "No unused exports in page (total={total}, offset={offset}; {plugin_filtered} plugin-manifest entries hidden - they're intentional)."
+                "No unused exports in page (total={total}, offset={offset}; {plugin_filtered} framework-convention entries hidden - they're intentional)."
             ));
         }
 
         let shown = page.len() as i64;
-        // `N plugin-manifest entries hidden - they're intentional`
+        // `N framework-convention entries hidden - they're intentional`
         // replaces the bare `plugin_entries_skipped=N` counter used
         // before. The old key/value pair looked like a pagination
         // bug to callers ("why is this counter non-zero? what did I
@@ -193,7 +231,7 @@ impl QartezServer {
         let mut out = if !db_exhausted && next_offset < total {
             if plugin_filtered > 0 {
                 format!(
-                    "{total} unused export(s); showing {shown} from offset {offset} (next: offset={next_offset}; {plugin_filtered} plugin-manifest entries hidden - they're intentional).\n",
+                    "{total} unused export(s); showing {shown} from offset {offset} (next: offset={next_offset}; {plugin_filtered} framework-convention entries hidden - they're intentional).\n",
                 )
             } else {
                 format!(
@@ -202,7 +240,7 @@ impl QartezServer {
             }
         } else if plugin_filtered > 0 {
             format!(
-                "{total} unused export(s); showing {shown} of {total} ({plugin_filtered} plugin-manifest entries hidden - they're intentional).\n",
+                "{total} unused export(s); showing {shown} of {total} ({plugin_filtered} framework-convention entries hidden - they're intentional).\n",
             )
         } else {
             format!("{total} unused export(s).\n")

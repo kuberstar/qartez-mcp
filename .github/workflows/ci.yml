@@ -48,6 +48,19 @@ jobs:
       - name: Cache cargo registry / git / target
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
+      # Node + pnpm are required so the qartez-dashboard build script can
+      # compile the SvelteKit bundle that is rust-embedded into the binary.
+      # Without `web/build/` populated, the `RustEmbed` derive on `embed::Web`
+      # produces a struct with no `get` method and clippy fails to compile.
+      - name: Setup Node.js (for dashboard frontend build)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        shell: bash
+        run: npm install -g pnpm@10.33.0
+
       - name: cargo fmt --check
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -129,6 +142,14 @@ jobs:
 
       - name: Cache cargo registry / git / target
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Setup Node.js (for dashboard frontend build)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.33.0
 
       - name: cargo build --release
         run: cargo build --locked --release

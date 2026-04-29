@@ -5839,6 +5839,50 @@ fn test_write_atomic_tmp_path_unique_across_concurrent_writes() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn test_write_atomic_preserves_unix_file_permissions() {
+    use qartez_mcp::server::QartezServer;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let target = src.join("lib.rs");
+    fs::write(&target, "pub fn foo() {}\n").unwrap();
+
+    // Set restrictive permissions before the refactor. A previous version
+    // of `write_atomic` replaced the inode without copying mode bits, so
+    // running `qartez_replace_symbol` would silently downgrade the file
+    // to the umask default.
+    let restrictive = std::fs::Permissions::from_mode(0o600);
+    fs::set_permissions(&target, restrictive).unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+    let server = Arc::new(QartezServer::new(conn, root.to_path_buf(), 300));
+
+    let result = server.call_tool_by_name(
+        "qartez_replace_symbol",
+        json!({
+            "symbol": "foo",
+            "new_code": "pub fn foo() { let _ = 1; }",
+            "apply": true,
+        }),
+    );
+    assert!(result.is_ok(), "replace must succeed: {:?}", result.err());
+
+    let perms_after = fs::metadata(&target).unwrap().permissions();
+    let mode_after = perms_after.mode() & 0o777;
+    assert_eq!(
+        mode_after, 0o600,
+        "write_atomic must preserve the original 0o600 mode after rename, got 0o{mode_after:o}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end: qartez_health + qartez_refactor_plan on a real indexed crate.
 //

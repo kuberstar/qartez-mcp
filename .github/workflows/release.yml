@@ -78,6 +78,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
+      # Node + pnpm are required so the qartez-dashboard build script can
+      # compile the SvelteKit bundle that is rust-embedded into the binary.
+      - name: Setup Node.js (for dashboard frontend build)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        shell: bash
+        run: npm install -g pnpm@10.33.0
+
       - name: Resolve version
         id: version
         shell: bash

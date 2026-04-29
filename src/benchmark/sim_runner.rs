@@ -54,13 +54,6 @@ pub struct Options<'a> {
     pub exclude_globs: &'a [&'a str],
 }
 
-/// Run the non-MCP step sequence with no profile-level excludes. Used
-/// by existing call sites that do not thread a profile through (e.g.
-/// warm-up loops that care only about side-effects).
-pub fn run(project_root: &Path, steps: &[SimStep]) -> Result<String, SimError> {
-    run_with(project_root, steps, &Options::default())
-}
-
 pub fn run_with(
     project_root: &Path,
     steps: &[SimStep],

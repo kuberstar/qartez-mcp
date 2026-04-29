@@ -291,6 +291,10 @@ fn build_tool_call(command: &Command) -> (String, serde_json::Value) {
             });
             ("qartez_workspace".into(), args)
         }
+
+        Command::Dashboard { .. } => {
+            unreachable!("dashboard subcommand is dispatched directly in main.rs")
+        }
     }
 }
 

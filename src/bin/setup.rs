@@ -2889,12 +2889,16 @@ fn run() -> anyhow::Result<()> {
     }
 
     // Download the semantic search model when compiled with the feature.
+    // Failure must propagate into `any_error` so the final summary doesn't
+    // claim success after a download 404 - users read "Setup complete!"
+    // as confirmation that all assets are in place.
     #[cfg(feature = "semantic")]
     if let Err(e) = download_semantic_model() {
         eprintln!(
             "  {} Failed to download semantic model: {e:#}",
             style("[!]").yellow()
         );
+        any_error = true;
     }
 
     eprintln!();
@@ -2941,20 +2945,23 @@ fn download_semantic_model() -> anyhow::Result<()> {
 
     let base_url = "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/main";
 
-    let files = [
-        ("model.onnx", &model_path),
-        ("tokenizer.json", &tokenizer_path),
+    // model.onnx now lives under `onnx/` after the upstream HF repo restructure;
+    // tokenizer.json stays at the repo root. Each entry maps the local on-disk
+    // basename to the remote path under `base_url`.
+    let files: [(&str, &PathBuf, &str); 2] = [
+        ("model.onnx", &model_path, "onnx/model.onnx"),
+        ("tokenizer.json", &tokenizer_path, "tokenizer.json"),
     ];
 
-    for (filename, dest) in &files {
+    for (filename, dest, remote_path) in &files {
         if dest.exists() {
             continue;
         }
-        let url = format!("{base_url}/{filename}");
+        let url = format!("{base_url}/{remote_path}");
         eprintln!("  {} Downloading {filename}...", style("[>]").cyan(),);
-        // No injection surface: base_url is a hardcoded literal, filename
-        // comes from the local hardcoded `files` table, and dest is a path
-        // under ~/.qartez/models. Each value is passed as a separate argv
+        // No injection surface: base_url and remote_path are hardcoded literals,
+        // filename comes from the local hardcoded `files` table, and dest is a
+        // path under ~/.qartez/models. Each value is passed as a separate argv
         // entry to curl - no shell, no word-splitting.
         let status = Command::new("curl")
             .args(["-fSL", "--progress-bar", "-o"])

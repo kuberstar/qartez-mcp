@@ -17,6 +17,30 @@ async fn main() -> anyhow::Result<()> {
 
     schedule_update_check();
 
+    // Dashboard subcommand short-circuits the rest of the qartez startup
+    // sequence: it does not need the full Config, the indexer, or the MCP
+    // server. It only needs the project root and runs as a long-lived
+    // axum server (or, for stop/status/open, exits quickly).
+    if let Some(cli::Command::Dashboard { action }) = &cli.command {
+        let root = cli.root.first().cloned();
+        let incremental: qartez_dashboard::indexer::IncrementalIndexer = std::sync::Arc::new(
+            |root: &std::path::Path,
+             changed: &[std::path::PathBuf],
+             deleted: &[std::path::PathBuf]|
+             -> anyhow::Result<qartez_dashboard::indexer::IndexResult> {
+                let db_path = root.join(".qartez").join("index.db");
+                let conn = rusqlite::Connection::open(&db_path)?;
+                index::incremental_index(&conn, root, changed, deleted)
+                    .map_err(|e| anyhow::anyhow!("incremental_index: {e}"))?;
+                Ok(qartez_dashboard::indexer::IndexResult {
+                    changed: changed.len(),
+                    deleted: deleted.len(),
+                })
+            },
+        );
+        return qartez_dashboard::run(action.clone(), root, incremental).await;
+    }
+
     let config = config::Config::from_cli(&cli)?;
 
     // CLI subcommand path: index synchronously, run tool, exit.

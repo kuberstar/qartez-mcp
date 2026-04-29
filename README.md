@@ -56,29 +56,26 @@ The fix isn't a smarter model. It's a smarter index.
 
 ### Install (recommended)
 
+Pick the one-liner for your operating system. Both commands do the same thing: download a pre-built binary, verify its SHA-256 against the release's `SHA256SUMS`, install the three binaries (`qartez`, `qartez-guard`, `qartez-setup`), and launch `qartez-setup` in non-interactive mode to configure every MCP-capable IDE it detects (including the modification-guard hooks for Claude Code).
+
+**macOS / Linux / WSL 2** - bash installer, binaries land in `~/.local/bin/`:
+
 ```bash
 curl -sSfL https://qartez.dev/install | sh
 ```
 
-The installer downloads a pre-built binary for your platform (under 10 seconds), verifies the SHA-256 checksum against the release's `SHA256SUMS`, installs the three binaries (`qartez`, `qartez-guard`, `qartez-setup`) to `~/.local/bin/`, and launches `qartez-setup` in non-interactive mode. Unsupported platforms fall back to a local `cargo build` automatically; pass `--from-source` (`-FromSource` on Windows) to force that path. The setup wizard auto-detects every MCP-capable IDE on your machine and configures them all in one pass, including the modification-guard hooks for Claude Code.
-
-Windows (native PowerShell):
+**Windows (native PowerShell 5.1+/7+)** - PowerShell installer, binaries land in `%LOCALAPPDATA%\Programs\qartez\`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1 -useb | iex"
 ```
 
+Unsupported platforms (e.g. `linux-musl` arm64 without a published artifact) fall back to a local `cargo build` automatically; pass `--from-source` (bash) or `-FromSource` (PowerShell) to force that path. Rust MSRV **1.88** is only required for that fallback.
+
 Open any project in your IDE - Qartez indexes it automatically on session start. No manual step needed. The file watcher keeps the index fresh as you edit.
 
-### Install via Cargo
-
-```bash
-cargo install qartez-mcp
-qartez-setup        # then run the IDE wizard manually
-```
-
 <details>
-<summary>Alternative: install from source</summary>
+<summary>Alternative: install from source (all platforms)</summary>
 
 ```bash
 git clone https://github.com/kuberstar/qartez-mcp.git
@@ -86,7 +83,7 @@ cd qartez-mcp
 make deploy
 ```
 
-Want to inspect the install script before piping it into `sh`? Read it on GitHub: [`install.sh`](install.sh).
+Want to inspect the install script before piping it into `sh`? Read it on GitHub: [`install.sh`](install.sh) (bash) or [`install.ps1`](install.ps1) (PowerShell).
 </details>
 
 <details>

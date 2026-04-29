@@ -607,95 +607,6 @@ pub struct CloneGroup {
     pub symbols: Vec<(SymbolRow, FileRow)>,
 }
 
-/// Return every clone group unpaginated, ordered by group size desc with
-/// a deterministic tiebreaker derived from the first member's
-/// `(file.path, symbol.line_start, shape_hash)`. Intended for callers
-/// that need to apply their own in-memory filter (e.g. dropping
-/// test-only groups) before paging, since SQL-level pagination becomes
-/// unstable once rows are filtered out post-query.
-///
-/// Applies the same `(file_id, line_start, line_end)` dedup rule as
-/// [`count_clone_groups`]: multi-indexed symbols at the same physical
-/// span count once, and groups that collapse below the 2-member
-/// threshold are dropped.
-pub fn clones_get_all_ordered_groups(conn: &Connection, min_lines: u32) -> Result<Vec<CloneGroup>> {
-    let mut hash_stmt = conn.prepare(
-        "SELECT shape_hash,
-                COUNT(DISTINCT file_id || ':' || line_start || ':' || line_end) as cnt
-         FROM symbols
-         WHERE shape_hash IS NOT NULL
-           AND (line_end - line_start + 1) >= ?1
-         GROUP BY shape_hash
-         HAVING cnt >= 2",
-    )?;
-
-    let hashes: Vec<(String, i64)> = hash_stmt
-        .query_map(rusqlite::params![min_lines], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let members_sql = format!(
-        "SELECT {SYMBOL_FILE_JOIN_COLS}
-         FROM symbols s
-         JOIN files f ON f.id = s.file_id
-         WHERE s.shape_hash = ?1
-         ORDER BY f.path, s.line_start"
-    );
-    let mut members_stmt = conn.prepare(&members_sql)?;
-
-    let mut groups = Vec::<(i64, CloneGroup)>::with_capacity(hashes.len());
-    for (hash, cnt) in &hashes {
-        let raw: Vec<(SymbolRow, FileRow)> = members_stmt
-            .query_map([hash], |row| {
-                Ok((row_to_symbol(row)?, row_to_file_joined(row)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        let mut seen: std::collections::HashSet<(i64, u32, u32)> = std::collections::HashSet::new();
-        let syms: Vec<(SymbolRow, FileRow)> = raw
-            .into_iter()
-            .filter(|(sym, _)| seen.insert((sym.file_id, sym.line_start, sym.line_end)))
-            .collect();
-        groups.push((
-            *cnt,
-            CloneGroup {
-                shape_hash: hash.clone(),
-                symbols: syms,
-            },
-        ));
-    }
-
-    // Stable sort: size desc, then first member's (path, line_start) asc,
-    // then shape_hash asc so two groups with identical tiebreakers still
-    // produce a deterministic ordering.
-    groups.sort_by(|a, b| {
-        let (cnt_a, ga) = a;
-        let (cnt_b, gb) = b;
-        cnt_b
-            .cmp(cnt_a)
-            .then_with(|| {
-                let (first_a_path, first_a_line) = ga
-                    .symbols
-                    .first()
-                    .map(|(s, f)| (f.path.as_str(), s.line_start))
-                    .unwrap_or(("", 0));
-                let (first_b_path, first_b_line) = gb
-                    .symbols
-                    .first()
-                    .map(|(s, f)| (f.path.as_str(), s.line_start))
-                    .unwrap_or(("", 0));
-                first_a_path
-                    .cmp(first_b_path)
-                    .then_with(|| first_a_line.cmp(&first_b_line))
-            })
-            .then_with(|| ga.shape_hash.cmp(&gb.shape_hash))
-    });
-
-    Ok(groups.into_iter().map(|(_, g)| g).collect())
-}
-
 /// Return clone groups ordered by group size (largest first), with pagination.
 ///
 /// Applies the same `(file_id, line_start, line_end)` dedup rule as
@@ -1386,27 +1297,6 @@ pub fn boundaries_edge_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
 /// Returns every file row, used by `qartez_boundaries suggest=true`.
 pub fn boundaries_all_files(conn: &Connection) -> Result<Vec<FileRow>> {
     get_all_files(conn)
-}
-
-/// Returns direct subtypes (implementors / extenders) of `name`.
-///
-/// Exposed so `qartez_hierarchy` can short-circuit the "max_depth=0"
-/// path without reaching into the generic reader. Callers that want the
-/// transitive closure should still use [`get_subtypes`] plus their own
-/// BFS bound.
-pub fn hierarchy_direct_subtypes(
-    conn: &Connection,
-    name: &str,
-) -> Result<Vec<(crate::storage::models::TypeHierarchyRow, FileRow)>> {
-    get_subtypes(conn, name)
-}
-
-/// Returns direct supertypes (traits / interfaces / parents) of `name`.
-pub fn hierarchy_direct_supertypes(
-    conn: &Connection,
-    name: &str,
-) -> Result<Vec<(crate::storage::models::TypeHierarchyRow, FileRow)>> {
-    get_supertypes(conn, name)
 }
 
 #[cfg(test)]

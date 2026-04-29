@@ -1,9 +1,9 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use ignore::gitignore::Gitignore;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use rusqlite::Connection;
@@ -15,6 +15,7 @@ use crate::index::languages;
 use crate::lock::RepoLock;
 
 const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
+const GITIGNORE_FILENAME: &str = ".gitignore";
 
 /// Debounce window: events arriving within this interval after the first
 /// event in a batch are folded into the same re-index cycle.
@@ -179,42 +180,148 @@ impl Watcher {
     }
 }
 
-fn load_qartezignore(root: &Path) -> Gitignore {
-    let ignore_path = root.join(QARTEZIGNORE_FILENAME);
-    if ignore_path.exists() {
-        let (gi, err) = Gitignore::new(&ignore_path);
-        if let Some(e) = err {
-            tracing::warn!(path = %ignore_path.display(), error = %e, "partial parse of .qartezignore");
-        }
-        gi
-    } else {
-        Gitignore::empty()
-    }
+/// Local ignore-source paths whose mtimes are tracked for hot-reload. The
+/// XDG-global gitignore and `core.excludesfile` are not tracked because they
+/// rarely change during a watcher session and rebuilding `Gitignore::global()`
+/// on every event would dominate the cost of small batches.
+fn local_ignore_sources(root: &Path) -> [PathBuf; 3] {
+    [
+        root.join(QARTEZIGNORE_FILENAME),
+        root.join(GITIGNORE_FILENAME),
+        root.join(".git").join("info").join("exclude"),
+    ]
 }
 
-/// Hot-reload wrapper for `.qartezignore`. Holds the parsed matcher together
-/// with the mtime that was observed when it was loaded, so the closure can
-/// refresh the cache after the user edits the ignore file during a live
-/// watcher session (rather than requiring a full restart).
+/// Resolve the global ignore file path. Prefers `core.excludesfile`, falls
+/// back to `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`), which
+/// matches what `git` itself reads.
+fn global_ignore_path() -> Option<PathBuf> {
+    if let Some(p) = excludesfile_from_git_config() {
+        return Some(p);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let candidate = PathBuf::from(xdg).join("git").join("ignore");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("ignore");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build the combined matcher from `.gitignore`, `.git/info/exclude`,
+/// `.qartezignore`, and the resolved global ignore file. All sources are
+/// added through one `GitignoreBuilder` rooted at the project root, so
+/// `matched_path_or_any_parents` works on every path under the project
+/// regardless of where the project lives on disk. Mirrors the dashboard
+/// watcher's `IgnoreFilter::for_root` so the MCP and dashboard event streams
+/// stay consistent with the indexer's initial walker scan.
+fn build_local_ignore(root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+    for path in local_ignore_sources(root) {
+        if let Some(e) = builder.add(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "partial parse of ignore file");
+        }
+    }
+    if let Some(path) = global_ignore_path()
+        && let Some(e) = builder.add(&path)
+    {
+        tracing::warn!(path = %path.display(), error = %e, "partial parse of global ignore file");
+    }
+    builder.build().unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "failed to build combined gitignore matcher; falling back to empty");
+        Gitignore::empty()
+    })
+}
+
+/// Hot-reload wrapper for the combined ignore matcher. Holds the matcher
+/// together with the mtimes that were observed when it was built, so the
+/// closure can refresh the cache after the user edits any local ignore file
+/// during a live watcher session (rather than requiring a full restart).
 struct QartezIgnoreCache {
-    gi: Gitignore,
-    mtime: Option<SystemTime>,
+    /// Combined matcher built from every source resolved by
+    /// `build_local_ignore`, all rooted at the project root.
+    matcher: Gitignore,
+    /// Mtimes of every path returned by `local_ignore_sources`, in the same
+    /// order. `None` means the file did not exist when last observed. The
+    /// global ignore file is not tracked because it rarely changes during a
+    /// watcher session.
+    mtimes: [Option<SystemTime>; 3],
 }
 
 impl QartezIgnoreCache {
     fn new(root: &Path) -> Self {
+        let sources = local_ignore_sources(root);
+        let mtimes = [
+            fs_mtime(&sources[0]),
+            fs_mtime(&sources[1]),
+            fs_mtime(&sources[2]),
+        ];
         Self {
-            gi: load_qartezignore(root),
-            mtime: fs_mtime(&root.join(QARTEZIGNORE_FILENAME)),
+            matcher: build_local_ignore(root),
+            mtimes,
         }
     }
 
     fn refresh_if_changed(&mut self, root: &Path) {
-        let current = fs_mtime(&root.join(QARTEZIGNORE_FILENAME));
-        if current != self.mtime {
-            self.gi = load_qartezignore(root);
-            self.mtime = current;
+        let sources = local_ignore_sources(root);
+        let current = [
+            fs_mtime(&sources[0]),
+            fs_mtime(&sources[1]),
+            fs_mtime(&sources[2]),
+        ];
+        if current != self.mtimes {
+            self.matcher = build_local_ignore(root);
+            self.mtimes = current;
         }
+    }
+
+    /// True if the path is excluded by any ignore source, or lives inside a
+    /// hard-skip directory (`.git`, `.qartez`). The hard-skip mirrors
+    /// `walker::walk_source_files`'s `filter_entry` so the watcher cannot
+    /// resurrect tool-cache rows the indexer already excludes.
+    fn is_ignored(&self, path: &Path) -> bool {
+        for component in path.components() {
+            if let Component::Normal(name) = component
+                && matches!(name.to_str(), Some(".git") | Some(".qartez"))
+            {
+                return true;
+            }
+        }
+        self.matcher
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore()
+    }
+}
+
+/// Resolve `core.excludesfile` from the user's git config. Expanding `~/`
+/// makes the path usable by `GitignoreBuilder::add`, which opens it directly
+/// without going through a shell.
+fn excludesfile_from_git_config() -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--global", "core.excludesfile"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
+    } else {
+        Some(PathBuf::from(trimmed))
     }
 }
 
@@ -288,12 +395,7 @@ fn start_notify_watcher(
                 .filter(|p| {
                     is_indexable_path(p, &supported_ext, &supported_names, &supported_prefixes)
                 })
-                .filter(|p| {
-                    !guard
-                        .gi
-                        .matched_path_or_any_parents(p, p.is_dir())
-                        .is_ignore()
-                })
+                .filter(|p| !guard.is_ignored(p))
                 .cloned()
                 .collect();
             drop(guard);
@@ -447,18 +549,12 @@ mod tests {
 
         let target_before = root.join("generated/file.rs");
         assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target_before, false)
-                .is_ignore(),
+            cache.is_ignored(&target_before),
             "initial ignore pattern should block generated/"
         );
         let target_other = root.join("other/file.rs");
         assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target_other, false)
-                .is_ignore(),
+            !cache.is_ignored(&target_other),
             "non-matching path should not be ignored initially"
         );
 
@@ -469,17 +565,11 @@ mod tests {
 
         cache.refresh_if_changed(root);
         assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target_other, false)
-                .is_ignore(),
+            cache.is_ignored(&target_other),
             "cache must have reloaded and now ignore other/"
         );
         assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target_before, false)
-                .is_ignore(),
+            !cache.is_ignored(&target_before),
             "old pattern (generated/) must be dropped after reload"
         );
     }
@@ -488,15 +578,9 @@ mod tests {
     fn qartezignore_cache_starts_empty_when_file_absent() {
         let tmp = TempDir::new().unwrap();
         let cache = QartezIgnoreCache::new(tmp.path());
-        assert!(cache.mtime.is_none());
+        assert!(cache.mtimes.iter().all(Option::is_none));
         let any_path = tmp.path().join("anything");
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&any_path, false)
-                .is_ignore(),
-            "empty cache matches nothing"
-        );
+        assert!(!cache.is_ignored(&any_path), "empty cache matches nothing");
     }
 
     #[test]
@@ -506,22 +590,37 @@ mod tests {
         let mut cache = QartezIgnoreCache::new(root);
         let target = root.join("vendor/dep.rs");
 
-        assert!(
-            !cache
-                .gi
-                .matched_path_or_any_parents(&target, false)
-                .is_ignore()
-        );
+        assert!(!cache.is_ignored(&target));
 
         std::fs::write(root.join(QARTEZIGNORE_FILENAME), "vendor/\n").unwrap();
         cache.refresh_if_changed(root);
 
         assert!(
-            cache
-                .gi
-                .matched_path_or_any_parents(&target, false)
-                .is_ignore(),
+            cache.is_ignored(&target),
             "cache must notice a freshly-written .qartezignore"
         );
+    }
+
+    #[test]
+    fn qartezignore_cache_honors_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(GITIGNORE_FILENAME), "build/\n").unwrap();
+        let cache = QartezIgnoreCache::new(root);
+        let inside = root.join("build/artifact.rs");
+        assert!(
+            cache.is_ignored(&inside),
+            ".gitignore patterns must be honored by the watcher"
+        );
+    }
+
+    #[test]
+    fn qartezignore_cache_hard_skips_dot_git_and_dot_qartez() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let cache = QartezIgnoreCache::new(root);
+        assert!(cache.is_ignored(&root.join(".git/config")));
+        assert!(cache.is_ignored(&root.join(".qartez/index.db")));
+        assert!(cache.is_ignored(&root.join("nested/.git/HEAD")));
     }
 }

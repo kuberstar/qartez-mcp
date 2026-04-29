@@ -130,6 +130,16 @@ pub(super) fn validate_range<'a>(
 /// never land on the same tmp path. A shared tmp name would let one
 /// call's `rename()` consume the other call's bytes before its own
 /// `rename()` ran, yielding `ENOENT` on the second call.
+///
+/// When `abs_path` already exists, its permissions are copied onto the tmp
+/// file before the rename. The rename replaces the inode, so without this
+/// step a file `chmod 600` would silently downgrade to the umask default
+/// (typically `0644`) after a refactor write, and an executable script
+/// (`0755`) would lose its `+x` bit. The copy is best-effort: a permission
+/// read or apply failure is logged but does not abort the write, since
+/// proceeding with default permissions is still better than losing the
+/// edit. New files (no prior `abs_path`) take whatever permissions the
+/// process umask grants the tmp file, matching pre-fix behaviour.
 pub(super) fn write_atomic(abs_path: &std::path::Path, new_content: &str) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -143,8 +153,22 @@ pub(super) fn write_atomic(abs_path: &std::path::Path, new_content: &str) -> Res
         .unwrap_or("tmp");
     let tmp_name = format!("{ext}.qartez_edit_{pid}_{tid_clean}_{nonce}.tmp");
     let tmp_path = abs_path.with_extension(tmp_name);
+
+    let original_perms = std::fs::metadata(abs_path).map(|m| m.permissions()).ok();
+
     std::fs::write(&tmp_path, new_content)
         .map_err(|e| format!("Cannot write {}: {e}", tmp_path.display()))?;
+
+    if let Some(perms) = original_perms
+        && let Err(e) = std::fs::set_permissions(&tmp_path, perms)
+    {
+        tracing::warn!(
+            path = %tmp_path.display(),
+            error = %e,
+            "could not copy original file permissions to temp file; proceeding with umask defaults",
+        );
+    }
+
     std::fs::rename(&tmp_path, abs_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         format!("Cannot rename temp file to {}: {e}", abs_path.display())

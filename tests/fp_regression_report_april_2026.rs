@@ -43,13 +43,14 @@ fn build_server() -> QartezServer {
 // --------------------------------------------------------------------------
 // P0 qartez_refs: call-site dedup per symbol definition
 //
-// Reported FP: symbol=`run` returned 5 definitions (sim_runner, cli_runner,
-// guard, setup, watch::Watcher), each with the SAME 39 call sites. A call
-// to watch::Watcher::run was attributed to sim_runner::run as well.
+// Reported FP: symbol=`run` returned multiple same-named definitions
+// (cli_runner, guard, setup, watch::Watcher, ...), each with the SAME 39
+// call sites. The blanket-union bug attributed every caller of every `run`
+// to every definition.
 //
 // After fix: each symbol's call-site block contains only paths that either
 // (a) match its own defining file, or (b) appear as an edge-resolved
-// importer of THAT specific symbol. We assert that the 5 blocks are
+// importer of THAT specific symbol. We assert that the blocks are
 // NOT identical byte-for-byte, which is the simplest proxy that the
 // blanket-union bug is gone.
 // --------------------------------------------------------------------------
@@ -114,20 +115,6 @@ fn selftest_refs_run_call_sites_are_disjoint_across_definitions() {
                 "`{def_a}` and `{def_b}` produced identical call-site blocks; pre-fix dedup regression. Block:\n{block_a}"
             );
         }
-    }
-
-    // Specifically, sim_runner::run has zero direct callers in the repo
-    // (run_with is used everywhere instead). Its call-site list must not
-    // contain the 39-entry blanket union that included cli_integration.rs.
-    let sim = sections
-        .iter()
-        .find(|(def, _)| def.ends_with("sim_runner.rs"));
-    if let Some((_, block)) = sim {
-        let n_lines = block.lines().filter(|l| !l.is_empty()).count();
-        assert!(
-            n_lines < 10,
-            "sim_runner::run must have a small call-site set after fix (no `cached_calls` of watch::Watcher::run etc.); got {n_lines} lines:\n{block}"
-        );
     }
 }
 
