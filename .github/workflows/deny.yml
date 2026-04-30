@@ -8,7 +8,13 @@ on:
       - "deny.toml"
       - ".github/workflows/deny.yml"
   push:
-    branches: [main]
+    # `release/*` mirrors the branch-first release gate in ci.yml so
+    # cargo-deny failures (license, wildcards, advisories) surface on
+    # the release branch BEFORE the tag is pushed. Tags themselves are
+    # also covered so a manual tag push without a release branch still
+    # gets gated.
+    branches: [main, 'release/*']
+    tags: ['v*']
   schedule:
     - cron: "0 10 * * 1"
   workflow_dispatch:

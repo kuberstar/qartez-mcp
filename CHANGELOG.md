@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.9] - 2026-04-30
+
+### Fixed
+
+- **`cargo-deny` red on `release: v0.9.8`** - the v0.9.8 push to `main` red-flagged the `cargo-deny` workflow with two errors that nobody saw on the release branch because `deny.yml` only triggered on push to `main`, not on `release/*`. (1) `error[unlicensed]: qartez-dashboard = 0.1.0 is unlicensed` - the `qartez-dashboard` workspace member declared `license-file = "../LICENSE"` for the proprietary `LicenseRef-Qartez-Small-Team`, but `deny.toml` only had a `[[licenses.clarify]]` for `qartez-mcp`; cargo-deny fell back to a low-confidence text match (score=0.35 < threshold 0.93) and rejected the crate. A matching `[[licenses.clarify]]` + `[[licenses.exceptions]]` for `qartez-dashboard` (with `path = "../LICENSE"`) is now in place. (2) `error[wildcard]: found 1 wildcard dependency for crate 'qartez-mcp'` - the workspace dep `qartez-dashboard = { path = "qartez-dashboard" }` had no `version = ` field, which cargo-deny treats as a wildcard, and `[bans] wildcards = "deny"` rejects. The dep now pins `version = "0.1.0"` alongside the path.
+
+### Changed
+
+- **`deny.yml` now gates `release/*` and tag pushes, not just `main`** - the workflow's `on.push.branches` is widened from `[main]` to `[main, 'release/*']` and `tags: ['v*']` is added. Combined with the script changes below, this means a license / wildcard / advisory regression caught by `cargo-deny` now blocks the release at branch-push time, before the tag is cut and before any artefact is built.
+- **`scripts/release.sh` and `scripts/release-gate.sh` poll `deny.yml` alongside `ci.yml`** - both scripts previously waited only for the `CI` workflow run on the release / gate branch. The release branch v0.9.8 was tagged because `cargo-deny` was running in parallel and the script never noticed it was red. Both scripts are refactored to a `wait_for_workflow` / `gate_workflow` helper that polls each required workflow in turn; a red `deny.yml` now aborts the release the same way a red `ci.yml` would (release branch is deleted, tag is never created).
+- **`make ci` parity target** - new top-level Make target that runs `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo-deny check advisories bans licenses sources`, `cargo build --locked --release`, `cargo test --locked --release --no-fail-fast`, and `cargo doc --locked --no-deps -D warnings` in sequence. Mirrors `.github/workflows/{ci,deny}.yml` so a release prep run can be reproduced locally with one command. Also exposes `make ci-fmt` / `ci-clippy` / `ci-deny` / `ci-build` / `ci-test` / `ci-doc` for selective re-runs.
+
 ## [0.9.8] - 2026-04-29
 
 ### Added

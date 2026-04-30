@@ -31,8 +31,19 @@ license-files = [
     { path = "LICENSE", hash = 0x94e84f36 },
 ]
 
+[[licenses.clarify]]
+name = "qartez-dashboard"
+expression = "LicenseRef-Qartez-Small-Team"
+license-files = [
+    { path = "../LICENSE", hash = 0x94e84f36 },
+]
+
 [[licenses.exceptions]]
 name = "qartez-mcp"
+allow = ["LicenseRef-Qartez-Small-Team"]
+
+[[licenses.exceptions]]
+name = "qartez-dashboard"
 allow = ["LicenseRef-Qartez-Small-Team"]
 
 [[licenses.exceptions]]

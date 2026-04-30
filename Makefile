@@ -6,7 +6,8 @@ BENCH_LANGS := rust typescript python go java
 
 .PHONY: help test test-install build install deploy setup uninstall clean \
         deploy-windows install-windows setup-windows \
-        bench bench-all bench-fixtures
+        bench bench-all bench-fixtures \
+        ci ci-fmt ci-clippy ci-test ci-build ci-deny ci-doc
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -59,6 +60,38 @@ uninstall: ## Remove qartez from all IDEs and uninstall binaries
 
 clean: ## Remove build artifacts
 	$(CARGO) clean
+
+# --- Pre-release CI parity ---
+# Run locally before tagging. Mirrors .github/workflows/{ci,deny}.yml so a
+# release branch never ships with a check that only red-flags after the tag
+# is already pushed (see v0.9.8: cargo-deny failed because deny.yml did not
+# trigger on release/* branches and the dashboard subcrate had a wildcard
+# path dep + missing license clarify).
+
+ci: ci-fmt ci-clippy ci-deny ci-build ci-test ci-doc ## Run the full CI suite locally (matches GitHub Actions)
+	@echo "\033[0;32m[+]\033[0m All CI checks passed locally"
+
+ci-fmt: ## cargo fmt --check (matches ci.yml)
+	$(CARGO) fmt --all -- --check
+
+ci-clippy: ## cargo clippy with -D warnings (matches ci.yml default-features gate)
+	$(CARGO) clippy --locked --all-targets -- -D warnings
+
+ci-deny: ## cargo-deny advisories/bans/licenses/sources (matches deny.yml)
+	@command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "\033[1;31m[!]\033[0m cargo-deny not installed. Run: cargo install --locked cargo-deny"; \
+		exit 1; \
+	}
+	cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories bans licenses sources
+
+ci-build: ## cargo build --locked --release (matches ci.yml)
+	$(CARGO) build --locked --release
+
+ci-test: ## cargo test --locked --release --no-fail-fast (matches ci.yml)
+	$(CARGO) test --locked --release --no-fail-fast
+
+ci-doc: ## cargo doc with -D warnings (matches ci.yml)
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --locked --no-deps
 
 # --- Benchmarks ---
 
