@@ -80,14 +80,15 @@ jobs:
 
       # Node + pnpm are required so the qartez-dashboard build script can
       # compile the SvelteKit bundle that is rust-embedded into the binary.
+      - name: Install pnpm
+        uses: pnpm/action-setup@903f9c1a6ebcba6cf41d87230be49611ac97822e  # v6.0.3
+        with:
+          version: 10.33.0
+
       - name: Setup Node.js (for dashboard frontend build)
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '20'
-
-      - name: Install pnpm
-        shell: bash
-        run: npm install -g pnpm@10.33.0
 
       - name: Resolve version
         id: version

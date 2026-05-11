@@ -299,6 +299,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let server_db_path = if config.has_project {
+        Some(config.db_path.clone())
+    } else {
+        None
+    };
 
     let server = server::QartezServer::with_roots_and_sources(
         conn,
@@ -309,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         config.git_depth,
         watch_enabled,
         server_lock_dir,
+        server_db_path,
     );
 
     if watch_enabled {

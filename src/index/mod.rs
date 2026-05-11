@@ -1854,7 +1854,10 @@ pub fn incremental_index_with_prefix(
         write::insert_fts_for_file(&tx, entry.file_id)?;
         write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.rel_path)?;
     }
-    write::populate_unused_exports(&tx)?;
+    // Mark unused_exports stale instead of paying the full DELETE+INSERT
+    // scan on every save. The next read through count_unused_exports or
+    // get_unused_exports_page rematerializes lazily.
+    write::mark_unused_exports_dirty(&tx)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1866,13 +1869,17 @@ pub fn incremental_index_with_prefix(
     tx.commit()?;
     crate::storage::verify_foreign_keys(conn)?;
 
-    // Checkpoint the WAL after each incremental index to prevent unbounded
-    // growth on large codebases with an active file watcher. Skipped when
-    // QARTEZ_DEFER_COMPACTION=1 so the MCP startup path can flush the
-    // WAL once after the indexing burst finishes instead of N times.
+    // Flush the WAL with a non-blocking PASSIVE checkpoint after each
+    // incremental index. PASSIVE merges WAL pages into the main file
+    // without waiting for readers/writers and without the fsync+truncate
+    // pass that makes TRUNCATE expensive on Windows under NTFS + Defender.
+    // The watcher path runs a periodic TRUNCATE on its own cadence so the
+    // WAL file still shrinks. Skipped entirely when QARTEZ_DEFER_COMPACTION=1
+    // so the MCP startup path can flush the WAL once after the indexing
+    // burst finishes instead of N times.
     if compaction_deferred() {
         tracing::debug!("incremental WAL checkpoint deferred (QARTEZ_DEFER_COMPACTION=1)");
-    } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+    } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
         tracing::debug!("WAL checkpoint after incremental_index failed (non-fatal): {e}");
     }
 

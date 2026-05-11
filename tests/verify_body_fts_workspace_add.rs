@@ -243,6 +243,7 @@ fn startup_self_heal_fires_when_bodies_wiped() {
         0,
         false,
         None,
+        None,
     );
 
     // Reach back into the DB through a fresh connection on the same in-memory
@@ -306,6 +307,7 @@ fn startup_self_heal_fires_for_one_symbol_zero_bodies() {
         0,
         false,
         None,
+        None,
     );
 
     let post_count = _server
@@ -341,6 +343,7 @@ fn startup_self_heal_skips_when_healthy() {
         std::collections::HashMap::new(),
         0,
         false,
+        None,
         None,
     );
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.10] - 2026-05-11
+
+### Fixed
+
+- **macOS watcher swallowed `Remove(File)` events (issue #34)** - `notify-debouncer-full` collapses a delete on macOS into a trailing `Modify(Metadata)` / `Modify(Data)` pair without forwarding the `Remove(File)` event. The watcher's catch-all branch routed those to `changed`, so deletes never propagated to the index and stale rows for vanished files were left behind. The catch-all now does an existence check on the path and treats nonexistent paths as deletes; covers the macOS FSEvents quirk and any other backend that emits ambiguous events on delete. Caught by a new live-OS-watcher smoke test in `tests/watcher_live_smoke.rs` (3 tests: file modify, new file, delete).
+- **Cookie transitive vuln (GHSA-pxg6-pf52-xh8x)** - `@sveltejs/kit` pulled `cookie@0.6.0` into the `qartez-dashboard` web bundle, which falls under GHSA-pxg6-pf52-xh8x. A `pnpm-workspace` override pins `cookie >= 1.0.2`; the lockfile now resolves it to 1.1.1. Closes the only open Dependabot alert.
+- **OpenSSF Scorecard `Pinned-Dependencies` findings** - `npm install -g pnpm@10.33.0` in `ci.yml` (x3) and `release.yml` is replaced with `pnpm/action-setup@903f9c1a` (v6.0.3), so the pnpm install step is pinned by action hash. Closes the three open code-scanning findings.
+- **Ignore-cache throttle off-by-one (watcher)** - `WatcherCadence::tick` used `<=` for the ignore-cache window, off-by-one against the `>=` "due" check elsewhere in the cadence. Switched to `<` so the boundary semantics match.
+
+### Changed
+
+- **Watcher perf rewrite on large repos (issue #34)** - cuts per-save watcher latency, especially on Windows where NTFS fsync and AV file filters dominate every checkpoint. (1) `notify-debouncer-full` now coalesces `ReadDirectoryChangesW` / inotify / FSEvents bursts at the OS layer; editors no longer fire the callback 3-4 times per logical save. (2) PageRank is debounced: recompute runs every 30 s or every 32 batches instead of on every save. The two full-graph passes (`compute_pagerank` + `compute_symbol_pagerank`) were the single largest contributor to per-save latency. (3) Per-batch `wal_checkpoint(TRUNCATE)` is replaced with a non-blocking `PASSIVE` checkpoint; a `TRUNCATE` pass runs at most once per 60 s on the watcher's own cadence to recover disk space. (4) Ignore-cache mtime stats are throttled to once per 2 s; bursts of 1k events no longer trigger 3k metadata syscalls.
+- **Dedicated writer connection for the watcher** - `attach_watcher` now opens its own `rusqlite::Connection` from `db_path` when available, so the watcher's incremental index no longer queues behind tool dispatch on the shared `Mutex<Connection>`. SQLite WAL coordinates the two connections at the file level; tools see the watcher's last committed snapshot.
+- **Lazy unused-exports materialization** - the per-incremental `DELETE` + `INSERT...SELECT` (with two `NOT EXISTS` scans) is replaced with a dirty flag stored in `meta`. `count_unused_exports` and `get_unused_exports_page` rematerialize lazily on the next read, so a save-heavy editor session no longer pays the unused-exports cost on every batch.
+- **`PRAGMA mmap_size=256 MiB` + `PRAGMA temp_store=MEMORY`** - the mmap is a Windows-specific win: SQLite serves reads without crossing the AV file filter on every `pread`. Temp B-trees and sort runs are kept in RAM. Applied at every `open_db` call. New storage tests assert both pragmas are actually applied and that two `open_db` connections see each other's commits via WAL.
+- **`prepare_cached` for the hot read paths** - `get_all_symbols_with_path` and `get_all_files` now route through `prepare_cached` so the regex paths in `qartez_find` / `qartez_grep` / `qartez_smells` / `qartez_test_gaps` / `qartez_security` re-use a compiled statement.
+- **Incremental indexer default checkpoint is `PASSIVE`** - the inline checkpoint used to be `TRUNCATE` (blocking, fsync). The watcher cadence now owns the periodic `TRUNCATE`; the inline path is non-blocking.
+- **`WatcherCadence::tick` extracted as a pure decision function** - the pagerank / truncate gating moved out of `watcher_loop` into a synchronous, side-effect-free helper that takes the current `Instant` and batch count and returns whether each cadence is due. Lets the cadence be unit-tested against a synthetic timeline without spinning up a real watcher. 9 new unit tests cover first / consecutive / time-gate / batch-backstop / saturating-counter cases, plus 2 ignore-cache throttle tests. 7 dirty-flag tests in `tests/business_logic.rs` and 5 integration tests in `tests/watcher_perf_integration.rs` lock the incremental + checkpoint + dedicated-connection + pagerank-deferral contracts in place.
+- **`openssl` bumped from 0.10.78 to 0.10.79** - routine dependency refresh. Picks up upstream's fix for the AES key-wrap-with-padding output-buffer overflow, the OCSP responder URL UTF-8 check, and the verify/PSK callback abort after `SSL_CTX` swap. No qartez API changes.
+
 ## [0.9.9] - 2026-04-30
 
 ### Fixed

@@ -1728,6 +1728,205 @@ fn test_populate_unused_exports_skips_config_languages() {
 }
 
 // ===========================================================================
+// 47b-perf. unused_exports dirty flag
+//
+// Issue #34 perf fix: incremental_index_with_prefix used to run the full
+// `populate_unused_exports` DELETE+INSERT scan on every save. The watcher
+// now marks the table dirty via META_KEY_UNUSED_EXPORTS_DIRTY, and
+// `count_unused_exports` / `get_unused_exports_page` rematerialize lazily
+// on the next read. These tests cover the flag contract.
+// ===========================================================================
+
+#[test]
+fn dirty_flag_set_by_mark_unused_exports_dirty() {
+    let conn = setup();
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(stored.is_none(), "fresh DB must not have the dirty flag");
+
+    write::mark_unused_exports_dirty(&conn).unwrap();
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some("1"),
+        "mark_unused_exports_dirty must write '1' to the meta table"
+    );
+}
+
+#[test]
+fn dirty_flag_cleared_by_populate_unused_exports() {
+    let conn = setup();
+    write::mark_unused_exports_dirty(&conn).unwrap();
+    write::populate_unused_exports(&conn).unwrap();
+
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(
+        stored.is_none(),
+        "populate_unused_exports must clear the dirty flag, got {stored:?}"
+    );
+}
+
+#[test]
+fn materialize_if_dirty_no_op_when_clean() {
+    let conn = setup();
+    let f = insert_file(&conn, "src/a.rs");
+    write::insert_symbols(&conn, f, &[sym("alpha", "function", 1, 5, true)]).unwrap();
+
+    // Clean state: no dirty flag → materialize should leave the table empty.
+    write::materialize_unused_exports_if_dirty(&conn).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unused_exports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "materialize_if_dirty must NOT populate when the flag is clear"
+    );
+}
+
+#[test]
+fn materialize_if_dirty_populates_when_flag_set() {
+    let conn = setup();
+    let f = insert_file(&conn, "src/a.rs");
+    write::insert_symbols(&conn, f, &[sym("alpha", "function", 1, 5, true)]).unwrap();
+
+    write::mark_unused_exports_dirty(&conn).unwrap();
+    write::materialize_unused_exports_if_dirty(&conn).unwrap();
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unused_exports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "materialize_if_dirty must populate when dirty");
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(stored.is_none(), "flag must be cleared after materialize");
+}
+
+#[test]
+fn count_unused_exports_materializes_lazily_after_dirty() {
+    let conn = setup();
+    let f1 = insert_file(&conn, "src/a.rs");
+    let f2 = insert_file(&conn, "src/b.rs");
+    write::insert_symbols(&conn, f1, &[sym("used", "function", 1, 5, true)]).unwrap();
+    write::insert_symbols(&conn, f2, &[sym("unused", "function", 1, 5, true)]).unwrap();
+    write::insert_edge(&conn, f2, f1, "import", None).unwrap();
+
+    // Materialize then mark dirty (simulating an incremental batch).
+    write::populate_unused_exports(&conn).unwrap();
+    let before = read::count_unused_exports(&conn).unwrap();
+    assert_eq!(before, 1, "baseline materialized count");
+
+    write::mark_unused_exports_dirty(&conn).unwrap();
+
+    // Reader call must rematerialize first - count returns the freshly
+    // computed value, not whatever was sitting in the table.
+    let after = read::count_unused_exports(&conn).unwrap();
+    assert_eq!(
+        after, 1,
+        "count after dirty must still return the live value"
+    );
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(
+        stored.is_none(),
+        "count_unused_exports must clear the dirty flag via the lazy materialize"
+    );
+}
+
+#[test]
+fn get_unused_exports_page_materializes_lazily_after_dirty() {
+    let conn = setup();
+    let f1 = insert_file(&conn, "src/a.rs");
+    let f2 = insert_file(&conn, "src/b.rs");
+    write::insert_symbols(&conn, f1, &[sym("used", "function", 1, 5, true)]).unwrap();
+    write::insert_symbols(&conn, f2, &[sym("unused", "function", 1, 5, true)]).unwrap();
+    write::insert_edge(&conn, f2, f1, "import", None).unwrap();
+
+    write::populate_unused_exports(&conn).unwrap();
+    write::mark_unused_exports_dirty(&conn).unwrap();
+
+    let page = read::get_unused_exports_page(&conn, i64::MAX, 0).unwrap();
+    assert_eq!(page.len(), 1, "page after dirty must materialize");
+    let names: Vec<&str> = page.iter().map(|(s, _)| s.name.as_str()).collect();
+    assert_eq!(names, vec!["unused"], "must return the right unused symbol");
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(
+        stored.is_none(),
+        "get_unused_exports_page must clear the dirty flag"
+    );
+}
+
+#[test]
+fn dirty_flag_reflects_graph_changes_between_reads() {
+    // Mirrors the live watcher scenario: an incremental batch added a new
+    // edge that makes a previously-unused export reachable. The next
+    // qartez_unused read must reflect the change, not the stale materialized
+    // value.
+    let conn = setup();
+    let f1 = insert_file(&conn, "src/a.rs");
+    let f2 = insert_file(&conn, "src/b.rs");
+    write::insert_symbols(&conn, f1, &[sym("alpha", "function", 1, 5, true)]).unwrap();
+    write::insert_symbols(&conn, f2, &[sym("beta", "function", 1, 5, true)]).unwrap();
+
+    // No edges yet - both look unused.
+    write::populate_unused_exports(&conn).unwrap();
+    assert_eq!(read::count_unused_exports(&conn).unwrap(), 2);
+
+    // Simulate incremental batch: add an edge AND mark dirty (the new
+    // incremental_index_with_prefix path).
+    write::insert_edge(&conn, f2, f1, "import", None).unwrap();
+    write::mark_unused_exports_dirty(&conn).unwrap();
+
+    // The next read picks up the new edge through the lazy materialize.
+    assert_eq!(
+        read::count_unused_exports(&conn).unwrap(),
+        1,
+        "lazy materialize must reflect the new edge"
+    );
+}
+
+#[test]
+fn dirty_flag_set_by_incremental_index() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    // End-to-end: full_index then incremental_index. The incremental call
+    // must leave the dirty flag set so the next reader rematerializes.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"t\"\nversion=\"0.0.0\"\nedition=\"2024\"\n",
+    )
+    .unwrap();
+
+    let conn = setup();
+    index::full_index(&conn, root, false).unwrap();
+
+    // full_index calls populate_unused_exports at the tail, so the flag
+    // is clear immediately after.
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(stored.is_none(), "full_index must leave the flag clear");
+
+    // Edit a file and run incremental_index - the new path marks dirty.
+    fs::write(root.join("src/lib.rs"), "pub fn beta() {}\n").unwrap();
+    index::incremental_index(&conn, root, &[root.join("src/lib.rs")], &[]).unwrap();
+
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some("1"),
+        "incremental_index must set the dirty flag instead of repopulating"
+    );
+
+    // First read after incremental materializes and clears the flag.
+    let _ = read::count_unused_exports(&conn).unwrap();
+    let stored = read::get_meta(&conn, write::META_KEY_UNUSED_EXPORTS_DIRTY).unwrap();
+    assert!(
+        stored.is_none(),
+        "first qartez_unused after incremental must materialize and clear the flag"
+    );
+}
+
+// ===========================================================================
 // 47c. count_unused_exports fallback also respects the language filter
 //
 // Regression: count_unused_exports has a separate fallback SQL path that

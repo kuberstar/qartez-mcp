@@ -91,6 +91,14 @@ pub struct QartezServer {
     /// reindex briefly tries the same lock the background indexer holds,
     /// avoiding `SQLITE_BUSY` when both fire on the same repo.
     lock_dir: Option<PathBuf>,
+    /// On-disk path to the SQLite index, when running against a real
+    /// project. Spawned watchers open their own writer connection from
+    /// this path so they don't queue behind tool dispatch on the shared
+    /// `db` mutex. SQLite's WAL mode keeps the two connections coherent
+    /// at the file level (last committed snapshot is what readers see).
+    /// `None` when the server is constructed for tests against an
+    /// in-memory connection.
+    db_path: Option<PathBuf>,
     git_depth: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -130,6 +138,7 @@ impl QartezServer {
             git_depth,
             false,
             None,
+            None,
         )
     }
 
@@ -139,6 +148,10 @@ impl QartezServer {
     /// `main.rs` uses this so `qartez_list_roots` can render `cli` vs.
     /// `config` for the initial roots and `runtime` for the ones added
     /// later through `qartez_add_root`.
+    ///
+    /// `db_path` enables the watcher to open its own writer connection
+    /// instead of sharing the tool-dispatch mutex - omit it (or pass
+    /// `None`) for in-memory test fixtures.
     #[allow(clippy::too_many_arguments)]
     pub fn with_roots_and_sources(
         conn: Connection,
@@ -149,6 +162,7 @@ impl QartezServer {
         git_depth: u32,
         watch_enabled: bool,
         lock_dir: Option<PathBuf>,
+        db_path: Option<PathBuf>,
     ) -> Self {
         Self::build(
             conn,
@@ -159,6 +173,7 @@ impl QartezServer {
             git_depth,
             watch_enabled,
             lock_dir,
+            db_path,
         )
     }
 
@@ -172,6 +187,7 @@ impl QartezServer {
         git_depth: u32,
         watch_enabled: bool,
         lock_dir: Option<PathBuf>,
+        db_path: Option<PathBuf>,
     ) -> Self {
         // Self-heal the body FTS index. Existing `.qartez/index.db` files
         // built before the schema-migration fix have an empty
@@ -223,6 +239,7 @@ impl QartezServer {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             watch_enabled,
             lock_dir,
+            db_path,
             git_depth,
             tool_router: router,
             parse_cache: Arc::new(Mutex::new(ParseCache::default())),
@@ -247,7 +264,19 @@ impl QartezServer {
     /// every file row with `<alias>/`; single-root mode passes an
     /// empty prefix. Mismatch here orphans incremental rows.
     pub fn attach_watcher(&self, root: PathBuf, path_prefix: String) -> anyhow::Result<()> {
-        let db = self.db_arc();
+        // When the server has a known db_path, give the watcher its own
+        // writer connection so its incremental index does not queue
+        // behind tool dispatch on the shared `db` mutex. SQLite's WAL
+        // mode coordinates the two connections at the file level - tools
+        // see the watcher's last committed snapshot without blocking.
+        // In-memory test fixtures fall back to the shared connection.
+        let db = match self.db_path.as_ref() {
+            Some(path) => {
+                let conn = crate::storage::open_db(path)?;
+                Arc::new(Mutex::new(conn))
+            }
+            None => self.db_arc(),
+        };
         let mut watcher = crate::watch::Watcher::with_prefix(db, root.clone(), path_prefix);
         if let Some(ref lock_dir) = self.lock_dir {
             watcher = watcher.with_lock_dir(lock_dir.clone());

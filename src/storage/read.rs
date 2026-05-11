@@ -150,7 +150,7 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<Option<FileRow>
 }
 
 pub fn get_all_files(conn: &Connection) -> Result<Vec<FileRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, path, mtime_ns, size_bytes, language, line_count, pagerank, indexed_at, change_count
          FROM files ORDER BY path",
     )?;
@@ -195,7 +195,7 @@ pub fn get_all_symbols_with_path(conn: &Connection) -> Result<Vec<(SymbolRow, St
          JOIN files f ON s.file_id = f.id
          ORDER BY f.path, s.line_start"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([], |row| {
         Ok((row_to_symbol(row)?, row.get::<_, String>("f_path")?))
     })?;
@@ -492,6 +492,11 @@ pub fn get_cochanges(
 /// of trait-impl methods and macro-invocation spans). Used by `qartez_unused`
 /// to report the full count even when a paginated window is returned.
 pub fn count_unused_exports(conn: &Connection) -> Result<i64> {
+    // Settle a deferred recompute once before reading so the count
+    // reflects the latest incremental batches. Cheap when not dirty
+    // (single meta lookup) and amortizes the heavy DELETE+INSERT scan
+    // across all reads that follow a save burst.
+    crate::storage::write::materialize_unused_exports_if_dirty(conn)?;
     // Fall back to the on-the-fly query when the materialized table is empty
     // (e.g. running against an index written by an older binary that didn't
     // populate `unused_exports`). The fallback is slow but keeps the tool
@@ -524,6 +529,9 @@ pub fn get_unused_exports_page(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<(SymbolRow, FileRow)>> {
+    // Settle a deferred recompute once before reading so paginated
+    // windows reflect the latest incremental batches.
+    crate::storage::write::materialize_unused_exports_if_dirty(conn)?;
     let sql = format!(
         "SELECT {SYMBOL_FILE_JOIN_COLS}
          FROM unused_exports ue

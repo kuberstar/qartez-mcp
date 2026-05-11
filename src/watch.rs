@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{EventKind, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 
@@ -17,9 +18,44 @@ use crate::lock::RepoLock;
 const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
 const GITIGNORE_FILENAME: &str = ".gitignore";
 
-/// Debounce window: events arriving within this interval after the first
-/// event in a batch are folded into the same re-index cycle.
-const DEBOUNCE_MS: u64 = 500;
+/// Inner debounce window for `notify-debouncer-full`. Coalesces the burst
+/// of `ReadDirectoryChangesW` / `inotify` / FSEvents events that every
+/// editor emits per save (metadata + content + close, plus the macOS
+/// coalesced rename pair) so the callback fires once per logical save
+/// instead of three or four times. Mirrors the dashboard watcher.
+const DEBOUNCE_MS: u64 = 200;
+
+/// Outer batch drain window. After a debounced batch arrives, this loop
+/// keeps draining additional batches that land inside the same window so
+/// a multi-file save (formatter, codemod) collapses into a single
+/// re-index cycle.
+const BATCH_DRAIN_MS: u64 = 500;
+
+/// Minimum interval between PageRank recomputes inside the watcher.
+/// PageRank iterates the full edge graph and is the main contributor to
+/// per-save latency on large repos. Skipping it temporarily only leaves
+/// the ranks slightly stale - readers see the last published values
+/// until the next eligible recompute.
+const PAGERANK_MIN_INTERVAL_MS: u64 = 30_000;
+
+/// Backstop on the number of consecutive incremental batches that may
+/// skip the PageRank refresh. Caps staleness during long bursts of saves
+/// where the time-based gate never fires alone.
+const PAGERANK_MAX_BATCHES: u64 = 32;
+
+/// Minimum interval between full `wal_checkpoint(TRUNCATE)` calls in the
+/// watcher path. Per-save TRUNCATE on Windows hits NTFS fsync + Defender
+/// and dominates the re-index time; the per-batch path runs a non-blocking
+/// PASSIVE checkpoint instead and lets the periodic TRUNCATE here recover
+/// disk space.
+const WAL_TRUNCATE_MIN_INTERVAL_MS: u64 = 60_000;
+
+/// How often the ignore-cache rechecks the mtimes of the local ignore
+/// files. NTFS stat is slow under AV, so checking on every event
+/// dominates the cost of small batches. Hot-reload stays responsive
+/// because user edits to `.gitignore` arrive within seconds of the next
+/// save anyway.
+const IGNORE_REFRESH_MIN_INTERVAL_MS: u64 = 2_000;
 
 /// A batch of filesystem events, separated into changed (created/modified)
 /// and deleted paths so the incremental indexer can handle them differently.
@@ -42,6 +78,67 @@ pub struct Watcher {
     /// watcher writes without coordination (used by tests that drive
     /// indexing through an in-memory connection only).
     lock_dir: Option<PathBuf>,
+    /// Cadence state for the debounced PageRank refresh and the periodic
+    /// `wal_checkpoint(TRUNCATE)`. Shared between calls so successive
+    /// re-indexes coordinate even though `reindex` itself is `&self`.
+    cadence: Mutex<WatcherCadence>,
+}
+
+struct WatcherCadence {
+    last_pagerank: Option<Instant>,
+    batches_since_pagerank: u64,
+    last_wal_truncate: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CadenceDecision {
+    run_pagerank: bool,
+    run_truncate: bool,
+}
+
+impl WatcherCadence {
+    fn new() -> Self {
+        Self {
+            last_pagerank: None,
+            batches_since_pagerank: 0,
+            last_wal_truncate: None,
+        }
+    }
+
+    /// Decide whether this batch should run PageRank and/or a TRUNCATE
+    /// checkpoint, then update the state. Pure with respect to `now`,
+    /// which lets the unit tests drive synthetic timelines.
+    fn tick(
+        &mut self,
+        now: Instant,
+        pagerank_interval_ms: u64,
+        pagerank_max_batches: u64,
+        truncate_interval_ms: u64,
+    ) -> CadenceDecision {
+        self.batches_since_pagerank = self.batches_since_pagerank.saturating_add(1);
+
+        let due_by_time = self
+            .last_pagerank
+            .is_none_or(|t| now.duration_since(t).as_millis() as u64 >= pagerank_interval_ms);
+        let due_by_batches = self.batches_since_pagerank >= pagerank_max_batches;
+        let run_pagerank = due_by_time || due_by_batches;
+        if run_pagerank {
+            self.last_pagerank = Some(now);
+            self.batches_since_pagerank = 0;
+        }
+
+        let run_truncate = self
+            .last_wal_truncate
+            .is_none_or(|t| now.duration_since(t).as_millis() as u64 >= truncate_interval_ms);
+        if run_truncate {
+            self.last_wal_truncate = Some(now);
+        }
+
+        CadenceDecision {
+            run_pagerank,
+            run_truncate,
+        }
+    }
 }
 
 impl Watcher {
@@ -59,6 +156,7 @@ impl Watcher {
             project_root,
             path_prefix,
             lock_dir: None,
+            cadence: Mutex::new(WatcherCadence::new()),
         }
     }
 
@@ -97,9 +195,13 @@ impl Watcher {
             let mut changed = batch.changed;
             let mut deleted = batch.deleted;
 
-            // Debounce: drain any additional events that arrive within the window.
+            // The OS-side debouncer already collapses per-save bursts.
+            // A short outer drain still folds successive batches that
+            // arrive while a multi-file save (formatter, codemod) is
+            // landing, so the re-index runs once per logical unit of
+            // work instead of once per debounced event.
             while let Ok(Some(more)) =
-                tokio::time::timeout(Duration::from_millis(DEBOUNCE_MS), rx.recv()).await
+                tokio::time::timeout(Duration::from_millis(BATCH_DRAIN_MS), rx.recv()).await
             {
                 changed.extend(more.changed);
                 deleted.extend(more.deleted);
@@ -174,8 +276,45 @@ impl Watcher {
             changed,
             deleted,
         )?;
-        graph::pagerank::compute_pagerank(&conn, &Default::default())?;
-        graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
+
+        let now = Instant::now();
+        let decision = {
+            let mut cadence = match self.cadence.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cadence.tick(
+                now,
+                PAGERANK_MIN_INTERVAL_MS,
+                PAGERANK_MAX_BATCHES,
+                WAL_TRUNCATE_MIN_INTERVAL_MS,
+            )
+        };
+
+        if decision.run_pagerank {
+            graph::pagerank::compute_pagerank(&conn, &Default::default())?;
+            graph::pagerank::compute_symbol_pagerank(&conn, &Default::default())?;
+        } else {
+            tracing::debug!(
+                "watcher: PageRank deferred; will recompute after {PAGERANK_MIN_INTERVAL_MS}ms or {PAGERANK_MAX_BATCHES} batches"
+            );
+        }
+
+        // We pay the TRUNCATE cost at most once per `WAL_TRUNCATE_MIN_INTERVAL_MS`
+        // here, falling back to a non-blocking PASSIVE checkpoint in between
+        // to keep the WAL from drifting unbounded. `incremental_index_with_prefix`
+        // also runs a PASSIVE itself; the back-to-back call is idempotent and
+        // dominated by the disk-side work it skipped relative to the previous
+        // TRUNCATE every save.
+        let checkpoint_sql = if decision.run_truncate {
+            "PRAGMA wal_checkpoint(TRUNCATE);"
+        } else {
+            "PRAGMA wal_checkpoint(PASSIVE);"
+        };
+        if let Err(e) = conn.execute_batch(checkpoint_sql) {
+            tracing::debug!("watcher WAL checkpoint failed (non-fatal): {e}");
+        }
+
         Ok(())
     }
 }
@@ -255,6 +394,11 @@ struct QartezIgnoreCache {
     /// global ignore file is not tracked because it rarely changes during a
     /// watcher session.
     mtimes: [Option<SystemTime>; 3],
+    /// Last time the cache stat'd the ignore sources. The refresh is
+    /// throttled because `std::fs::metadata` is expensive on Windows
+    /// under Defender and a 1k-event burst would otherwise cost 3k
+    /// syscalls.
+    last_check: Option<Instant>,
 }
 
 impl QartezIgnoreCache {
@@ -268,10 +412,19 @@ impl QartezIgnoreCache {
         Self {
             matcher: build_local_ignore(root),
             mtimes,
+            last_check: None,
         }
     }
 
     fn refresh_if_changed(&mut self, root: &Path) {
+        let now = Instant::now();
+        if let Some(last) = self.last_check
+            && (now.duration_since(last).as_millis() as u64) < IGNORE_REFRESH_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_check = Some(now);
+
         let sources = local_ignore_sources(root);
         let current = [
             fs_mtime(&sources[0]),
@@ -361,27 +514,23 @@ fn start_notify_watcher(
     supported_names: HashSet<&'static str>,
     supported_prefixes: Vec<&'static str>,
     tx: mpsc::Sender<WatchBatch>,
-) -> anyhow::Result<RecommendedWatcher> {
+) -> anyhow::Result<Debouncer<notify::RecommendedWatcher, RecommendedCache>> {
     let ignore_cache = Arc::new(Mutex::new(QartezIgnoreCache::new(&root)));
     let ignore_root = root.clone();
 
-    let mut watcher =
-        notify::recommended_watcher(move |result: std::result::Result<Event, notify::Error>| {
-            let event = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("watch error: {e}");
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(DEBOUNCE_MS),
+        None,
+        move |result: DebounceEventResult| {
+            let events = match result {
+                Ok(events) => events,
+                Err(errors) => {
+                    for error in errors {
+                        tracing::warn!("watch error: {error}");
+                    }
                     return;
                 }
             };
-
-            let dominated = matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            );
-            if !dominated {
-                return;
-            }
 
             let mut guard = match ignore_cache.lock() {
                 Ok(g) => g,
@@ -389,65 +538,94 @@ fn start_notify_watcher(
             };
             guard.refresh_if_changed(&ignore_root);
 
-            let filtered: Vec<PathBuf> = event
-                .paths
-                .iter()
-                .filter(|p| {
-                    is_indexable_path(p, &supported_ext, &supported_names, &supported_prefixes)
-                })
-                .filter(|p| !guard.is_ignored(p))
-                .cloned()
-                .collect();
-            drop(guard);
+            let mut all_changed: Vec<PathBuf> = Vec::new();
+            let mut all_deleted: Vec<PathBuf> = Vec::new();
 
-            if filtered.is_empty() {
-                return;
-            }
-
-            // Translate rename events into a remove+create pair. On platforms
-            // where `notify` emits `Modify(Name::Both)` the event carries both
-            // the old and new path; on platforms that split into
-            // `Modify(Name::From)` + `Modify(Name::To)` each side arrives as a
-            // separate event. `RenameMode::Any` is the fallback used by some
-            // backends - we split by existence on disk at observation time.
-            let (changed, deleted) = match event.kind {
-                EventKind::Remove(_) => (Vec::new(), filtered),
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => (Vec::new(), filtered),
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => (filtered, Vec::new()),
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if filtered.len() == 2 => {
-                    // `notify` emits exactly two paths for a `Both` rename:
-                    // `[from, to]`. Anything else is backend noise, not a
-                    // real rename, so fall through to the existence-check
-                    // branch instead of treating every non-first entry as
-                    // a new destination.
-                    let from = filtered[0].clone();
-                    let to = filtered[1].clone();
-                    (vec![to], vec![from])
+            for debounced in events {
+                let event = &debounced.event;
+                let dominated = matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                );
+                if !dominated {
+                    continue;
                 }
-                EventKind::Modify(ModifyKind::Name(_)) => {
-                    let mut changed = Vec::new();
-                    let mut deleted = Vec::new();
-                    for p in filtered {
-                        if p.exists() {
-                            changed.push(p);
-                        } else {
-                            deleted.push(p);
+
+                let filtered: Vec<PathBuf> = event
+                    .paths
+                    .iter()
+                    .filter(|p| {
+                        is_indexable_path(p, &supported_ext, &supported_names, &supported_prefixes)
+                    })
+                    .filter(|p| !guard.is_ignored(p))
+                    .cloned()
+                    .collect();
+
+                if filtered.is_empty() {
+                    continue;
+                }
+
+                // Translate rename events into a remove+create pair. On
+                // platforms where `notify` emits `Modify(Name::Both)` the
+                // event carries both the old and new path; on platforms
+                // that split into `Modify(Name::From)` + `Modify(Name::To)`
+                // each side arrives as a separate event. `RenameMode::Any`
+                // is the fallback used by some backends - we split by
+                // existence on disk at observation time.
+                //
+                // For the catch-all branch we ALSO existence-check the
+                // path. macOS FSEvents under `notify-debouncer-full`
+                // sometimes coalesces a `Remove(File)` into the trailing
+                // `Modify(Metadata)` / `Modify(Data)` events; the file is
+                // gone from disk but the surviving event is `Modify`, not
+                // `Remove`. Without the existence check the watcher would
+                // reindex a missing file instead of dropping it.
+                match event.kind {
+                    EventKind::Remove(_) => all_deleted.extend(filtered),
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                        all_deleted.extend(filtered)
+                    }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                        all_changed.extend(filtered)
+                    }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                        if filtered.len() == 2 =>
+                    {
+                        // `notify` emits exactly two paths for a `Both`
+                        // rename: `[from, to]`. Anything else is backend
+                        // noise, not a real rename, so fall through to the
+                        // existence-check branch instead of treating every
+                        // non-first entry as a new destination.
+                        all_deleted.push(filtered[0].clone());
+                        all_changed.push(filtered[1].clone());
+                    }
+                    _ => {
+                        for p in filtered {
+                            if p.exists() {
+                                all_changed.push(p);
+                            } else {
+                                all_deleted.push(p);
+                            }
                         }
                     }
-                    (changed, deleted)
                 }
-                _ => (filtered, Vec::new()),
-            };
+            }
 
-            if changed.is_empty() && deleted.is_empty() {
+            drop(guard);
+
+            if all_changed.is_empty() && all_deleted.is_empty() {
                 return;
             }
 
-            let _ = tx.blocking_send(WatchBatch { changed, deleted });
-        })?;
+            let _ = tx.blocking_send(WatchBatch {
+                changed: all_changed,
+                deleted: all_deleted,
+            });
+        },
+    )?;
 
-    watcher.watch(&root, RecursiveMode::Recursive)?;
-    Ok(watcher)
+    debouncer.watch(&root, RecursiveMode::Recursive)?;
+    Ok(debouncer)
 }
 
 #[cfg(test)]
@@ -622,5 +800,178 @@ mod tests {
         assert!(cache.is_ignored(&root.join(".git/config")));
         assert!(cache.is_ignored(&root.join(".qartez/index.db")));
         assert!(cache.is_ignored(&root.join("nested/.git/HEAD")));
+    }
+
+    #[test]
+    fn cadence_first_tick_runs_pagerank_and_truncate() {
+        let mut cadence = WatcherCadence::new();
+        let now = Instant::now();
+        let decision = cadence.tick(now, 30_000, 32, 60_000);
+        assert!(
+            decision.run_pagerank,
+            "first tick must run PageRank (last_pagerank is None)"
+        );
+        assert!(
+            decision.run_truncate,
+            "first tick must run TRUNCATE (last_wal_truncate is None)"
+        );
+        assert_eq!(cadence.batches_since_pagerank, 0);
+        assert!(cadence.last_pagerank.is_some());
+        assert!(cadence.last_wal_truncate.is_some());
+    }
+
+    #[test]
+    fn cadence_consecutive_ticks_inside_window_skip_both() {
+        let mut cadence = WatcherCadence::new();
+        let t0 = Instant::now();
+        cadence.tick(t0, 30_000, 32, 60_000);
+
+        let t1 = t0 + Duration::from_millis(100);
+        let decision = cadence.tick(t1, 30_000, 32, 60_000);
+        assert!(
+            !decision.run_pagerank,
+            "tick 100ms after first must skip PageRank"
+        );
+        assert!(
+            !decision.run_truncate,
+            "tick 100ms after first must skip TRUNCATE"
+        );
+        assert_eq!(
+            cadence.batches_since_pagerank, 1,
+            "batch counter must increment when PageRank skipped"
+        );
+    }
+
+    #[test]
+    fn cadence_time_gate_fires_after_pagerank_interval() {
+        let mut cadence = WatcherCadence::new();
+        let t0 = Instant::now();
+        cadence.tick(t0, 30_000, 32, 60_000);
+
+        let t1 = t0 + Duration::from_millis(30_001);
+        let decision = cadence.tick(t1, 30_000, 32, 60_000);
+        assert!(
+            decision.run_pagerank,
+            "PageRank must fire once the time interval elapses"
+        );
+        assert_eq!(
+            cadence.batches_since_pagerank, 0,
+            "counter must reset after PageRank fires"
+        );
+    }
+
+    #[test]
+    fn cadence_batch_backstop_fires_before_time_gate() {
+        let mut cadence = WatcherCadence::new();
+        let t0 = Instant::now();
+        cadence.tick(t0, 30_000, 4, 60_000);
+
+        let mut last = None;
+        for i in 1..=4 {
+            let t = t0 + Duration::from_millis(i * 100);
+            last = Some(cadence.tick(t, 30_000, 4, 60_000));
+        }
+        let decision = last.unwrap();
+        assert!(
+            decision.run_pagerank,
+            "PageRank must fire after PAGERANK_MAX_BATCHES even when time gate not met"
+        );
+    }
+
+    #[test]
+    fn cadence_truncate_skipped_inside_window() {
+        let mut cadence = WatcherCadence::new();
+        let t0 = Instant::now();
+        cadence.tick(t0, 30_000, 32, 60_000);
+
+        let t1 = t0 + Duration::from_millis(45_000);
+        let decision = cadence.tick(t1, 30_000, 32, 60_000);
+        assert!(
+            decision.run_pagerank,
+            "PageRank should fire after 45s (>30s)"
+        );
+        assert!(
+            !decision.run_truncate,
+            "TRUNCATE must wait the full 60s window"
+        );
+    }
+
+    #[test]
+    fn cadence_truncate_fires_after_truncate_interval() {
+        let mut cadence = WatcherCadence::new();
+        let t0 = Instant::now();
+        cadence.tick(t0, 30_000, 32, 60_000);
+
+        let t1 = t0 + Duration::from_millis(60_001);
+        let decision = cadence.tick(t1, 30_000, 32, 60_000);
+        assert!(
+            decision.run_truncate,
+            "TRUNCATE must fire once its interval elapses"
+        );
+    }
+
+    #[test]
+    fn cadence_saturating_counter_does_not_overflow() {
+        let mut cadence = WatcherCadence::new();
+        cadence.batches_since_pagerank = u64::MAX;
+        let t = Instant::now();
+        // Should not panic even with saturated counter.
+        let decision = cadence.tick(t, 30_000, 32, 60_000);
+        assert!(decision.run_pagerank);
+    }
+
+    #[test]
+    fn ignore_cache_throttle_no_op_within_window() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let ignore_path = root.join(QARTEZIGNORE_FILENAME);
+
+        std::fs::write(&ignore_path, "first/\n").unwrap();
+        let mut cache = QartezIgnoreCache::new(root);
+        assert!(cache.is_ignored(&root.join("first/file.rs")));
+
+        // First refresh: marks `last_check`.
+        cache.refresh_if_changed(root);
+
+        // Sleep past mtime resolution but inside the throttle window.
+        thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&ignore_path, "second/\n").unwrap();
+
+        // Second refresh: throttled, must NOT pick up the change.
+        cache.refresh_if_changed(root);
+        assert!(
+            cache.is_ignored(&root.join("first/file.rs")),
+            "throttle window must keep the old matcher in place"
+        );
+        assert!(
+            !cache.is_ignored(&root.join("second/file.rs")),
+            "throttle window must NOT pick up the new pattern yet"
+        );
+    }
+
+    #[test]
+    fn ignore_cache_throttle_fires_after_window() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let ignore_path = root.join(QARTEZIGNORE_FILENAME);
+
+        std::fs::write(&ignore_path, "first/\n").unwrap();
+        let mut cache = QartezIgnoreCache::new(root);
+        cache.refresh_if_changed(root);
+
+        thread::sleep(std::time::Duration::from_millis(
+            IGNORE_REFRESH_MIN_INTERVAL_MS + 200,
+        ));
+        std::fs::write(&ignore_path, "second/\n").unwrap();
+
+        cache.refresh_if_changed(root);
+        assert!(
+            cache.is_ignored(&root.join("second/file.rs")),
+            "after the throttle window expires, the cache must reload"
+        );
+        assert!(
+            !cache.is_ignored(&root.join("first/file.rs")),
+            "old pattern must be replaced after reload"
+        );
     }
 }

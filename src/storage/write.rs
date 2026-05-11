@@ -408,6 +408,12 @@ pub fn rebuild_symbol_bodies_for_file(
     Ok(())
 }
 
+/// Meta key tracking whether `unused_exports` needs to be rematerialized.
+/// Set to "1" by incremental index batches that touched the graph, cleared
+/// when `populate_unused_exports` runs. The flag lets readers materialize
+/// lazily instead of paying the full DELETE+INSERT cost on every save.
+pub const META_KEY_UNUSED_EXPORTS_DIRTY: &str = "unused_exports_dirty";
+
 /// Rebuild the `unused_exports` materialized table from the current
 /// `symbols` / `edges` state. Must be called at the tail of the indexing
 /// pipeline - after `full_index` has written every file's imports and the
@@ -435,6 +441,30 @@ pub fn populate_unused_exports(conn: &Connection) -> Result<()> {
         crate::storage::read::languages_without_export_semantics_sql_list()
     );
     conn.execute_batch(&sql)?;
+    clear_meta(conn, META_KEY_UNUSED_EXPORTS_DIRTY)?;
+    Ok(())
+}
+
+/// Mark `unused_exports` stale without paying the recompute cost. The
+/// next reader call to `materialize_unused_exports_if_dirty` will run
+/// `populate_unused_exports` exactly once.
+pub fn mark_unused_exports_dirty(conn: &Connection) -> Result<()> {
+    set_meta(conn, META_KEY_UNUSED_EXPORTS_DIRTY, "1")
+}
+
+/// Rematerialize `unused_exports` only when the dirty flag is set.
+/// Safe to call from any reader path under the connection mutex - the
+/// work is idempotent and amortizes across N incremental batches.
+pub fn materialize_unused_exports_if_dirty(conn: &Connection) -> Result<()> {
+    let dirty = crate::storage::read::get_meta(conn, META_KEY_UNUSED_EXPORTS_DIRTY)?;
+    if dirty.as_deref() == Some("1") {
+        populate_unused_exports(conn)?;
+    }
+    Ok(())
+}
+
+fn clear_meta(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", rusqlite::params![key])?;
     Ok(())
 }
 
