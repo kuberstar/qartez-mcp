@@ -16,7 +16,7 @@ ignore = "0.4.25"
 
 [package]
 name = "qartez-mcp"
-version = "0.9.10"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 description = "MCP server for codebase intelligence - tree-sitter indexing, PageRank, blast radius"

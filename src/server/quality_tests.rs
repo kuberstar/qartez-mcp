@@ -2422,6 +2422,152 @@ fn budget_sweep_qartez_outline() {
     }
 }
 
+#[test]
+fn qartez_impact_budget_truncates_transitive_list() {
+    let (server, _dir) = setup_scale(100);
+    // A small budget truncates the (unbounded) transitive blast-radius list
+    // and emits the uniform marker; a generous budget shows strictly more.
+    let tight = server
+        .qartez_impact(Parameters(SoulImpactParams {
+            file_path: "src/hub.rs".into(),
+            token_budget: Some(300),
+            ..Default::default()
+        }))
+        .unwrap();
+    let wide = server
+        .qartez_impact(Parameters(SoulImpactParams {
+            file_path: "src/hub.rs".into(),
+            token_budget: Some(20_000),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        tight.contains("raise token_budget="),
+        "small budget must truncate the transitive list:\n{tight}"
+    );
+    assert!(
+        !wide.contains("raise token_budget="),
+        "a generous budget shows the whole list with no marker"
+    );
+    assert!(
+        tight.len() < wide.len(),
+        "smaller budget must yield a smaller report (tight={}, wide={})",
+        tight.len(),
+        wide.len()
+    );
+}
+
+#[test]
+fn qartez_calls_orders_and_budget_keeps_high_pagerank_callers() {
+    // Three files all call `target()`, but with distinct file PageRanks.
+    // qartez_calls must (1) list callers high-PageRank-first and (2) when a
+    // tiny token_budget truncates, keep the high-rank callers and drop the
+    // low-rank ones. This is the PR #13 caller-ranking contract.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let conn = setup_db();
+
+    fs::write(src.join("target.rs"), "pub fn target() {}\n").unwrap();
+    let t = write::upsert_file(&conn, "src/target.rs", 1000, 10, "rust", 1).unwrap();
+    write::insert_symbols(
+        &conn,
+        t,
+        &[SymbolInsert {
+            name: "target".into(),
+            kind: "function".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: Some("pub fn target()".into()),
+            is_exported: true,
+            shape_hash: None,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+            owner_type: None,
+        }],
+    )
+    .unwrap();
+
+    // Ascending PageRank: lo < mid < hi.
+    for (i, tag) in ["lo", "mid", "hi"].iter().enumerate() {
+        let fname = format!("caller_{tag}.rs");
+        fs::write(
+            src.join(&fname),
+            format!("use crate::target::target;\npub fn call_{tag}() {{ target(); }}\n"),
+        )
+        .unwrap();
+        let path = format!("src/{fname}");
+        let fid = write::upsert_file(&conn, &path, 1000, 10, "rust", 1).unwrap();
+        write::insert_symbols(
+            &conn,
+            fid,
+            &[SymbolInsert {
+                name: format!("call_{tag}"),
+                kind: "function".into(),
+                line_start: 2,
+                line_end: 2,
+                signature: Some(format!("pub fn call_{tag}()")),
+                is_exported: true,
+                shape_hash: None,
+                parent_idx: None,
+                unused_excluded: false,
+                complexity: None,
+                owner_type: None,
+            }],
+        )
+        .unwrap();
+        write::insert_edge(&conn, fid, t, "import", Some("target")).unwrap();
+        conn.execute(
+            "UPDATE files SET pagerank = ?1 WHERE id = ?2",
+            rusqlite::params![0.1 * (i as f64 + 1.0), fid],
+        )
+        .unwrap();
+    }
+
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+
+    // (1) Ordering at a generous budget: hi before mid before lo.
+    let full = server
+        .qartez_calls(Parameters(SoulCallsParams {
+            name: "target".into(),
+            direction: Some(CallDirection::Callers),
+            ..Default::default()
+        }))
+        .unwrap();
+    let hi = full.find("caller_hi.rs").expect("hi caller present");
+    let mid = full.find("caller_mid.rs").expect("mid caller present");
+    let lo = full.find("caller_lo.rs").expect("lo caller present");
+    assert!(
+        hi < mid && mid < lo,
+        "callers must be ordered by file PageRank (desc); got hi={hi} mid={mid} lo={lo}\n{full}"
+    );
+
+    // (2) A tiny budget keeps the high-rank caller and drops the low-rank
+    // one, then emits the uniform marker.
+    let tight = server
+        .qartez_calls(Parameters(SoulCallsParams {
+            name: "target".into(),
+            direction: Some(CallDirection::Callers),
+            token_budget: Some(30),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        tight.contains("caller_hi.rs"),
+        "highest-PageRank caller must survive the budget cut:\n{tight}"
+    );
+    assert!(
+        !tight.contains("caller_lo.rs"),
+        "lowest-PageRank caller must be dropped first:\n{tight}"
+    );
+    assert!(
+        tight.contains("raise token_budget="),
+        "truncation must emit the uniform marker:\n{tight}"
+    );
+}
+
 // =========================================================================
 // Section 19: Scale Tests - Unbounded Tool Output Limits
 // =========================================================================
@@ -4040,6 +4186,7 @@ fn qartez_clones_finds_duplicates() {
     let (server, _dir) = setup_with_clones();
     let out = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(10),
             offset: None,
             min_lines: Some(5),
@@ -4065,6 +4212,7 @@ fn qartez_clones_concise_smaller() {
     let (server, _dir) = setup_with_clones();
     let detailed = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(10),
             offset: None,
             min_lines: Some(5),
@@ -4074,6 +4222,7 @@ fn qartez_clones_concise_smaller() {
         .unwrap();
     let concise = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(10),
             offset: None,
             min_lines: Some(5),
@@ -4097,6 +4246,7 @@ fn qartez_clones_no_clones_message() {
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 300);
     let out = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(10),
             offset: None,
             min_lines: Some(5),
@@ -4115,6 +4265,7 @@ fn qartez_clones_pagination() {
     let (server, _dir) = setup_with_clones();
     let page1 = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(1),
             offset: Some(0),
             min_lines: Some(5),
@@ -4224,6 +4375,7 @@ fn qartez_clones_ignores_same_range_multi_indexed_symbols() {
 
     let out = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -4333,6 +4485,7 @@ fn qartez_clones_mixed_same_range_plus_distinct_duplicates() {
 
     let out = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -4441,6 +4594,7 @@ fn qartez_clones_representative_picked_stably() {
 
     let first = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -4450,6 +4604,7 @@ fn qartez_clones_representative_picked_stably() {
         .unwrap();
     let second = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -4598,6 +4753,7 @@ mod tests {
     // filtered out, only the two prod clones survive.
     let out_default = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(4),
@@ -4617,6 +4773,7 @@ mod tests {
     // include_tests=true: the cfg(test) fixture must reappear.
     let out_with_tests = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(4),
@@ -4682,6 +4839,7 @@ fn qartez_clones_excludes_test_path_files_by_default() {
 
     let out_default = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -4700,6 +4858,7 @@ fn qartez_clones_excludes_test_path_files_by_default() {
 
     let out_with_tests = server
         .qartez_clones(Parameters(SoulClonesParams {
+            token_budget: None,
             limit: Some(50),
             offset: None,
             min_lines: Some(5),
@@ -6155,6 +6314,90 @@ fn qartez_diff_impact_risk_highest_risk_has_reason() {
 }
 
 // =========================================================================
+// qartez_blame
+// =========================================================================
+
+#[test]
+fn qartez_blame_no_git_depth_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup_db();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
+    let result = server.qartez_blame(Parameters(SoulBlameParams {
+        symbol_name: "anything".into(),
+        file_path: None,
+        mode: None,
+    }));
+    assert!(result.is_err(), "should error when git_depth is 0");
+    assert!(result.unwrap_err().contains("git history"));
+}
+
+#[test]
+fn qartez_blame_unknown_symbol_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let conn = setup_db();
+    let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
+    let result = server.qartez_blame(Parameters(SoulBlameParams {
+        symbol_name: "does_not_exist".into(),
+        file_path: None,
+        mode: None,
+    }));
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+}
+
+#[test]
+fn qartez_blame_resolves_symbol_and_renders_hunk_and_aggregate() {
+    use git2::{Repository, Signature};
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n",
+    )
+    .unwrap();
+
+    // Commit the file so blame has history to read.
+    let repo = Repository::init(root).unwrap();
+    let mut idx = repo.index().unwrap();
+    idx.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+    idx.write().unwrap();
+    let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+    let sig = Signature::now("Dev Eloper", "dev@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    // Index so `beta` resolves to its file and line range.
+    let conn = setup_db();
+    crate::index::full_index(&conn, root, false).unwrap();
+    let server = QartezServer::new(conn, root.to_path_buf(), 100);
+
+    let hunk = server
+        .qartez_blame(Parameters(SoulBlameParams {
+            symbol_name: "beta".into(),
+            file_path: None,
+            mode: None,
+        }))
+        .unwrap();
+    assert!(hunk.contains("beta"), "header names the symbol: {hunk}");
+    assert!(hunk.contains("Dev Eloper"), "hunk lists the author: {hunk}");
+
+    let agg = server
+        .qartez_blame(Parameters(SoulBlameParams {
+            symbol_name: "beta".into(),
+            file_path: None,
+            mode: Some(BlameMode::Aggregate),
+        }))
+        .unwrap();
+    assert!(agg.contains("Dev Eloper"));
+    assert!(
+        agg.contains("Latest commit"),
+        "aggregate has the rollup header: {agg}"
+    );
+}
+
+// =========================================================================
 // qartez_knowledge
 // =========================================================================
 
@@ -6165,6 +6408,7 @@ fn qartez_knowledge_no_git_depth_returns_error() {
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 0);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: None,
         author: None,
@@ -6182,6 +6426,7 @@ fn qartez_knowledge_empty_db_returns_no_files() {
     let conn = setup_db();
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: None,
         author: None,
@@ -6225,6 +6470,7 @@ fn qartez_knowledge_file_level_with_repo() {
 
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: None,
         author: None,
@@ -6263,6 +6509,7 @@ fn qartez_knowledge_module_level() {
 
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: Some(KnowledgeLevel::Module),
         author: None,
@@ -6298,6 +6545,7 @@ fn qartez_knowledge_concise_format() {
 
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: None,
         author: None,
@@ -6339,6 +6587,7 @@ fn qartez_knowledge_output_format_detailed_validated() {
 
     let server = QartezServer::new(conn, dir.path().to_path_buf(), 100);
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: None,
         level: None,
         author: None,
@@ -6409,6 +6658,7 @@ fn qartez_knowledge_file_path_prefix_filter() {
 
     // Only src/ files
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: Some("src/".into()),
         level: None,
         author: None,
@@ -6421,6 +6671,7 @@ fn qartez_knowledge_file_path_prefix_filter() {
 
     // Non-matching prefix
     let result = server.qartez_knowledge(Parameters(SoulKnowledgeParams {
+        token_budget: None,
         file_path: Some("nonexistent/".into()),
         level: None,
         author: None,

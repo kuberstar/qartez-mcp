@@ -324,6 +324,9 @@ pub(super) struct SoulImpactParams {
     #[schemars(description = "Include test files in the transitive blast radius (default: false)")]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_tests: Option<bool>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -348,6 +351,9 @@ pub(super) struct SoulDiffImpactParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub ack: Option<bool>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -785,6 +791,9 @@ pub(super) struct SoulHotspotsParams {
     )]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub threshold: Option<u32>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -815,6 +824,9 @@ pub(super) struct SoulClonesParams {
         description = "'concise' = compact list, 'detailed' (default) = grouped output with file paths and line ranges"
     )]
     pub format: Option<Format>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -855,6 +867,9 @@ pub(super) struct SoulSmellsParams {
         description = "'concise' = compact one-line-per-smell, 'detailed' (default) = grouped output with context"
     )]
     pub format: Option<Format>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -889,6 +904,9 @@ pub(super) struct SoulTestGapsParams {
     )]
     #[serde(default, deserialize_with = "flexible::bool_opt")]
     pub include_symbols: Option<bool>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1003,6 +1021,9 @@ pub(super) struct SoulHierarchyParams {
         description = "'concise' = names only, 'detailed' (default) = full info with file paths and line numbers, 'mermaid' = inheritance graph as a Mermaid diagram (use only when the user asks for a visual)"
     )]
     pub format: Option<Format>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1040,6 +1061,9 @@ pub(super) struct SoulSecurityParams {
         description = "'concise' = compact table, 'detailed' (default) = full table with snippets."
     )]
     pub format: Option<Format>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1093,6 +1117,37 @@ pub(super) struct SoulKnowledgeParams {
         description = "'concise' = compact one-line-per-entry, 'detailed' (default) = full table with author percentages"
     )]
     pub format: Option<Format>,
+    #[schemars(description = "Approximate token budget for output (default: 4000)")]
+    #[serde(default, deserialize_with = "flexible::u32_opt")]
+    pub token_budget: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum BlameMode {
+    /// Per-hunk blame lines: commit, author, and line range (default).
+    #[default]
+    Hunk,
+    /// Per-author rollup with line counts and each author's latest commit.
+    Aggregate,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(super) struct SoulBlameParams {
+    #[schemars(
+        description = "Symbol name (function, type, method) to blame. Its file and line range are resolved from the index, then only those lines are blamed."
+    )]
+    #[serde(alias = "symbol", alias = "name")]
+    pub symbol_name: String,
+    #[schemars(
+        description = "File path to disambiguate when the symbol name is defined in more than one file (relative to project root)."
+    )]
+    #[serde(alias = "file", alias = "path")]
+    pub file_path: Option<String>,
+    #[schemars(
+        description = "'hunk' (default) = per-hunk commits/authors; 'aggregate' = per-author rollup with each author's latest commit."
+    )]
+    pub mode: Option<BlameMode>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

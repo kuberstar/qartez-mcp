@@ -44,6 +44,7 @@ impl QartezServer {
         let concise = is_concise(&params.format);
         let direction = params.direction.as_deref().unwrap_or("sub").to_lowercase();
         let transitive = params.transitive.unwrap_or(false);
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
         const DEFAULT_MAX_DEPTH: u32 = 20;
         // Hard ceiling matches `qartez_calls` MAX_CALL_DEPTH: hierarchy
         // walks fan out through `type_hierarchy` rows, so an unbounded
@@ -129,19 +130,23 @@ impl QartezServer {
                     params.symbol,
                     rows.len()
                 ));
-                for (rel, file) in &rows {
-                    if concise {
-                        out.push_str(&format!(
-                            "{} {} {} ({}:L{})\n",
-                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "  {} {} {}\n    {} [L{}]\n",
-                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                        ));
-                    }
-                }
+                let direct_rows: Vec<String> = rows
+                    .iter()
+                    .map(|(rel, file)| {
+                        if concise {
+                            format!(
+                                "{} {} {} ({}:L{})\n",
+                                rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            )
+                        } else {
+                            format!(
+                                "  {} {} {}\n    {} [L{}]\n",
+                                rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            )
+                        }
+                    })
+                    .collect();
+                budget_render(&mut out, &direct_rows, token_budget);
 
                 if transitive {
                     let mut visited: HashSet<String> = HashSet::new();
@@ -170,12 +175,21 @@ impl QartezServer {
                             "\n  Transitive subtypes ({}):\n",
                             transitive_rows.len()
                         ));
-                        for (rel, file, depth) in &transitive_rows {
-                            out.push_str(&format!(
-                                "    [depth {}] {} {} {} ({}:L{})\n",
-                                depth, rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                            ));
-                        }
+                        let trans_rows: Vec<String> = transitive_rows
+                            .iter()
+                            .map(|(rel, file, depth)| {
+                                format!(
+                                    "    [depth {}] {} {} {} ({}:L{})\n",
+                                    depth,
+                                    rel.sub_name,
+                                    rel.kind,
+                                    rel.super_name,
+                                    file.path,
+                                    rel.line
+                                )
+                            })
+                            .collect();
+                        budget_render(&mut out, &trans_rows, token_budget);
                     } else if max_depth == 1 {
                         // For trait `impl`-edges the direct
                         // implementors are the complete "what
@@ -203,19 +217,23 @@ impl QartezServer {
                     params.symbol,
                     rows.len()
                 ));
-                for (rel, file) in &rows {
-                    if concise {
-                        out.push_str(&format!(
-                            "{} {} {} ({}:L{})\n",
-                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "  {} {} {}\n    {} [L{}]\n",
-                            rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                        ));
-                    }
-                }
+                let direct_rows: Vec<String> = rows
+                    .iter()
+                    .map(|(rel, file)| {
+                        if concise {
+                            format!(
+                                "{} {} {} ({}:L{})\n",
+                                rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            )
+                        } else {
+                            format!(
+                                "  {} {} {}\n    {} [L{}]\n",
+                                rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
+                            )
+                        }
+                    })
+                    .collect();
+                budget_render(&mut out, &direct_rows, token_budget);
 
                 if transitive {
                     let mut visited: HashSet<String> = HashSet::new();
@@ -244,12 +262,21 @@ impl QartezServer {
                             "\n  Transitive supertypes ({}):\n",
                             transitive_rows.len()
                         ));
-                        for (rel, file, depth) in &transitive_rows {
-                            out.push_str(&format!(
-                                "    [depth {}] {} {} {} ({}:L{})\n",
-                                depth, rel.sub_name, rel.kind, rel.super_name, file.path, rel.line
-                            ));
-                        }
+                        let trans_rows: Vec<String> = transitive_rows
+                            .iter()
+                            .map(|(rel, file, depth)| {
+                                format!(
+                                    "    [depth {}] {} {} {} ({}:L{})\n",
+                                    depth,
+                                    rel.sub_name,
+                                    rel.kind,
+                                    rel.super_name,
+                                    file.path,
+                                    rel.line
+                                )
+                            })
+                            .collect();
+                        budget_render(&mut out, &trans_rows, token_budget);
                     }
                 }
             }

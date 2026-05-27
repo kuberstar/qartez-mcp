@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# qartez on-disk index
+.qartez/
+
+# Node.js / pnpm (qartez-dashboard frontend; regenerated at build time)
+node_modules/
+.svelte-kit/
+.turbo/
+.cache/
+dist/
+build/
+out/
+*.tsbuildinfo
+.eslintcache
+
+# Logs
+*.log
+
+# Env files
+.env
+.env.*
+!.env.example
+!.env.test
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*~

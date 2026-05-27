@@ -131,11 +131,53 @@ pub(super) fn truncate_path(path: &str, max_len: usize) -> String {
     }
 }
 
+/// Default output token budget for the analysis tools when the caller omits
+/// `token_budget`. Matches the 4000-token default used by qartez_map,
+/// qartez_calls, qartez_grep, and the other budget-aware tools so every tool
+/// truncates at the same ceiling unless explicitly overridden.
+pub(super) const DEFAULT_OUTPUT_TOKEN_BUDGET: u32 = 4000;
+
 // Approximate Claude token count: ~3 characters per token for code.
 // Uses char count (not byte length) so multibyte Unicode does not inflate
 // the estimate. This is a soft budget hint, not a hard limit.
 pub(super) fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 3
+}
+
+/// Append pre-rendered `rows` to `out` in priority order until emitting the
+/// next row would push the estimated token count past `token_budget`, then
+/// emit one uniform truncation marker naming how many rows were dropped.
+/// Returns the number of rows actually written.
+///
+/// Callers must sort `rows` most-important-first (e.g. by PageRank or risk
+/// score) so the rows that survive a budget cut are the ones worth keeping.
+/// Each element is one complete, already-formatted item block and may span
+/// multiple lines; the budget is enforced at item boundaries so a block is
+/// never split in half.
+///
+/// The budget is a soft hint, not a hard cap: any text already in `out` (a
+/// section header, or earlier sections rendered into the same buffer) counts
+/// against it, so successive calls against one `out` share the remaining
+/// budget. The marker line itself is allowed to spill one short line past the
+/// budget. This mirrors the inline per-row check `qartez_calls::append_callers`
+/// uses, so every analysis tool prints the identical `raise token_budget=`
+/// hint.
+pub(super) fn budget_render(out: &mut String, rows: &[String], token_budget: usize) -> usize {
+    // Seed the running total from whatever the caller already wrote so the
+    // budget is shared across every budget_render call against the same `out`
+    // and we avoid re-scanning `out` on each row (O(rows) instead of O(rows^2)).
+    let mut used = estimate_tokens(out);
+    for (idx, row) in rows.iter().enumerate() {
+        let row_tokens = estimate_tokens(row);
+        if used + row_tokens > token_budget {
+            let dropped = rows.len() - idx;
+            out.push_str(&format!("  ... +{dropped} more, raise token_budget=\n"));
+            return idx;
+        }
+        out.push_str(row);
+        used += row_tokens;
+    }
+    rows.len()
 }
 
 pub(super) fn human_bytes(bytes: i64) -> String {
@@ -397,7 +439,97 @@ pub(super) fn mermaid_label(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_whole_word;
+    use super::{budget_render, estimate_tokens, replace_whole_word};
+
+    #[test]
+    fn budget_render_empty_rows_writes_nothing() {
+        let rows: Vec<String> = Vec::new();
+        let mut out = String::from("header\n");
+        let written = budget_render(&mut out, &rows, 4000);
+        assert_eq!(written, 0);
+        assert_eq!(out, "header\n", "no rows means no marker and no change");
+    }
+
+    #[test]
+    fn budget_render_zero_budget_drops_every_row() {
+        let rows: Vec<String> = (0..3).map(|i| format!("r{i}\n")).collect();
+        let mut out = String::new();
+        let written = budget_render(&mut out, &rows, 0);
+        assert_eq!(written, 0, "a zero budget admits no rows");
+        assert!(
+            out.contains("+3 more"),
+            "marker names all dropped rows: {out}"
+        );
+        assert!(out.contains("raise token_budget="));
+    }
+
+    #[test]
+    fn budget_render_marks_even_when_first_row_alone_exceeds_budget() {
+        // A single row larger than the whole budget is dropped rather than
+        // forced through, and the marker still fires. Guards against an
+        // off-by-one that would emit one oversized row regardless of budget.
+        let rows = vec![format!("{}\n", "x".repeat(900))]; // ~300 tokens
+        let mut out = String::new();
+        let written = budget_render(&mut out, &rows, 50);
+        assert_eq!(written, 0);
+        assert!(out.contains("+1 more"), "exactly one row dropped: {out}");
+    }
+
+    #[test]
+    fn budget_render_emits_all_rows_under_budget() {
+        let rows: Vec<String> = (0..5).map(|i| format!("row {i}\n")).collect();
+        let mut out = String::new();
+        let written = budget_render(&mut out, &rows, 10_000);
+        assert_eq!(written, 5, "all rows fit under a generous budget");
+        assert!(
+            !out.contains("raise token_budget="),
+            "no marker when nothing is dropped"
+        );
+        assert!(out.contains("row 4"));
+    }
+
+    #[test]
+    fn budget_render_truncates_and_marks_when_budget_exhausted() {
+        // Each row is 31 chars (~10 tokens). A 100-token budget admits ten
+        // rows, then the per-row check stops before the eleventh.
+        let rows: Vec<String> = (0..50).map(|_| format!("{}\n", "x".repeat(30))).collect();
+        let mut out = String::new();
+        let written = budget_render(&mut out, &rows, 100);
+        assert!(written < rows.len(), "budget must drop at least one row");
+        let dropped = rows.len() - written;
+        assert!(
+            out.contains("raise token_budget="),
+            "truncation must emit the uniform marker; got: {out}"
+        );
+        assert!(
+            out.contains(&format!("+{dropped} more")),
+            "marker must name the dropped count {dropped}; got: {out}"
+        );
+        // Stays within the BUDGET_TOLERANCE=1.5 envelope the quality-test
+        // budget sweeps enforce against every budget-aware tool.
+        assert!(estimate_tokens(&out) <= (100.0 * 1.5) as usize);
+    }
+
+    #[test]
+    fn budget_render_shares_budget_across_calls_on_one_buffer() {
+        // Two sections rendered into the same buffer share one budget: once
+        // the first call fills it, the second emits only its marker. This is
+        // what keeps multi-section tools (e.g. qartez_smells) bounded overall.
+        let first: Vec<String> = (0..10).map(|i| format!("first {i}\n")).collect();
+        let second: Vec<String> = (0..10).map(|i| format!("second {i}\n")).collect();
+        let mut out = String::new();
+        budget_render(&mut out, &first, 20);
+        let after_first = out.len();
+        let written_second = budget_render(&mut out, &second, 20);
+        assert_eq!(
+            written_second, 0,
+            "second section starves once the shared budget is spent"
+        );
+        assert!(
+            out.len() > after_first,
+            "second call still appends its truncation marker"
+        );
+    }
 
     #[test]
     fn replace_empty_text_returns_empty() {

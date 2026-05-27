@@ -13,25 +13,25 @@ Canonical built-in → qartez routing map and tool catalog for this skill.
 
 ## Core navigation & reading
 
-- `qartez_map` — structural overview, ranked by importance
-- `qartez_find` — exact symbol definition lookup
-- `qartez_grep` — indexed symbol/body search
-- `qartez_read` — semantic symbol/file reads
-- `qartez_outline` — file symbol inventory
-- `qartez_stats` — repository metrics
+- `qartez_map` - structural overview, ranked by importance
+- `qartez_find` - exact symbol definition lookup
+- `qartez_grep` - indexed symbol/body search
+- `qartez_read` - semantic symbol/file reads
+- `qartez_outline` - file symbol inventory
+- `qartez_stats` - repository metrics
 
 ## Analysis & risk
 
-- `qartez_impact` — blast radius and risk ack trigger
-- `qartez_deps` — importers/imports graph view
-- `qartez_refs` — usages/references
-- `qartez_calls` — caller/callee hierarchy
-- `qartez_cochange` — historical co-change partners
-- `qartez_context` — smart related-file context set
-- `qartez_unused` — candidate dead exports
-- `qartez_hotspots` — complexity × coupling × churn
-- `qartez_clones` — structural duplication
-- `qartez_boundaries` — architecture-boundary checks
+- `qartez_impact` - blast radius and risk ack trigger
+- `qartez_deps` - importers/imports graph view
+- `qartez_refs` - usages/references
+- `qartez_calls` - caller/callee hierarchy
+- `qartez_cochange` - historical co-change partners
+- `qartez_context` - smart related-file context set
+- `qartez_unused` - candidate dead exports
+- `qartez_hotspots` - complexity × coupling × churn
+- `qartez_clones` - structural duplication
+- `qartez_boundaries` - architecture-boundary checks
 
 ## Refactor operations
 
@@ -41,11 +41,11 @@ Canonical built-in → qartez routing map and tool catalog for this skill.
 
 ## Project/meta
 
-- `qartez_project` — build/test/lint detection and execution
-- `qartez_wiki` — architecture document generation
-- `qartez_diff_impact` — pre-merge diff risk
-- `qartez_trend` — metric trends from git history
-- `qartez_hierarchy` — type/module hierarchy exploration
+- `qartez_project` - build/test/lint detection and execution
+- `qartez_wiki` - architecture document generation
+- `qartez_diff_impact` - pre-merge diff risk
+- `qartez_trend` - metric trends from git history
+- `qartez_hierarchy` - type/module hierarchy exploration
 
 ## Confidence reminders
 

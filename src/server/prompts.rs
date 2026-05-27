@@ -52,6 +52,13 @@ pub struct SoulPreMergeArgs {
     pub files: String,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SoulArchReviewArgs {
+    /// Optional area to bias the audit toward (e.g., "auth", "data pipeline").
+    pub focus: Option<String>,
+}
+
 fn user_text(text: String) -> Vec<PromptMessage> {
     vec![PromptMessage::new_text(PromptMessageRole::User, text)]
 }
@@ -278,5 +285,66 @@ impl QartezServer {
         };
         GetPromptResult::new(user_text(text))
             .with_description("Qartez pre-merge safety-check workflow".to_string())
+    }
+
+    /// Architecture risk audit: orchestrates map / stats / security / hotspots /
+    /// boundaries / deps / calls into a single structural-risk writeup.
+    #[prompt(
+        name = "qartez_arch_review",
+        description = "Architecture risk audit: orchestrates Qartez tools to surface structural risks (fragile hubs, tangled boundaries, security surface, complexity debt). Optional argument: `focus`."
+    )]
+    pub fn qartez_arch_review_prompt(
+        &self,
+        Parameters(args): Parameters<SoulArchReviewArgs>,
+    ) -> GetPromptResult {
+        let focus = args
+            .focus
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (map_step, scope_note) = match focus {
+            Some(f) => (
+                format!(
+                    "1. Call `qartez_map` with `boost_terms=[\"{f}\"]`, `top_n=20`, and `format=\"detailed\"` (parallel) - PageRank-ranked files biased toward `{f}`."
+                ),
+                format!("focused on `{f}`"),
+            ),
+            None => (
+                "1. Call `qartez_map` with `top_n=20` and `format=\"detailed\"` (parallel) - the PageRank-ranked core files."
+                    .to_string(),
+                "across the whole codebase".to_string(),
+            ),
+        };
+        let text = format!(
+            "Run an architecture risk audit {scope_note} using Qartez.\n\
+             \n\
+             Gather evidence. Steps 1-3 are independent - run them in parallel:\n\
+             \n\
+             {map_step}\n\
+             2. Call `qartez_stats` (no arguments, parallel) for scale context: languages, LOC, symbol counts.\n\
+             3. Call `qartez_security` (parallel) to map the security surface - untrusted entry points and taint sources.\n\
+             \n\
+             The remaining steps depend on the graph, so run them in order after 1-3:\n\
+             \n\
+             4. Call `qartez_hotspots` to rank files by complexity x coupling x churn.\n\
+             5. Call `qartez_wiki` first to populate the module clusters, then `qartez_boundaries` with `suggest=true` for the Leiden-derived module structure. Boundaries returns `No cluster assignment found` until `qartez_wiki` has run, so do not skip the first call.\n\
+             6. Call `qartez_deps` on the top 3 hotspots from step 4 to read their fan-in / fan-out.\n\
+             7. Call `qartez_calls` with `direction=\"both\"` from the network-facing entry points named in step 3 to trace the reachable call chains.\n\
+             \n\
+             Then synthesise findings across these architectural risk categories:\n\
+             - fragile hubs (high PageRank + high churn + high fan-in)\n\
+             - tangled boundaries (clusters that leak across module lines)\n\
+             - security surface (untrusted entry points with deep reach)\n\
+             - coupling hotspots (files that co-change and fan out widely)\n\
+             - complexity debt (top hotspots by cyclomatic complexity)\n\
+             - layering violations (dependency edges pointing the wrong way)\n\
+             \n\
+             Report findings as a markdown table (risk | evidence | affected files | severity), then a short health summary. Only report findings you have evidence for in the tool output; if an area looks clean, say so briefly and move on."
+        );
+        let description = match focus {
+            Some(f) => format!("Qartez architecture risk audit focused on {f}"),
+            None => "Qartez architecture risk audit workflow".to_string(),
+        };
+        GetPromptResult::new(user_text(text)).with_description(description)
     }
 }
