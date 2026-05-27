@@ -306,6 +306,13 @@ fn resolve_and_write_import_edges(
     go_module: Option<&str>,
     dart_packages: &HashMap<String, String>,
 ) -> Result<HashMap<i64, HashSet<i64>>> {
+    // C/C++ includes resolve against a basename index built once here, not
+    // per-import, so `-I include` style lookups stay O(1). See resolve_c_import.
+    let c_headers = CHeaderIndex::build(known_paths);
+    // Python absolute imports resolve against the project's import roots,
+    // derived once from the indexed `__init__.py` set. See
+    // discover_python_import_roots.
+    let python_roots = discover_python_import_roots(known_paths);
     let mut imports_by_file: HashMap<i64, HashSet<i64>> = HashMap::new();
     for entry in indexed {
         let targets_for_entry = imports_by_file.entry(entry.file_id).or_default();
@@ -318,6 +325,8 @@ fn resolve_and_write_import_edges(
                 known_paths,
                 go_module,
                 Some(dart_packages),
+                &c_headers,
+                &python_roots,
             );
             for target_rel in &targets {
                 if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
@@ -1038,6 +1047,7 @@ fn resolve_symbol_references(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_targets(
     language: &str,
     rel_path: &str,
@@ -1046,16 +1056,26 @@ fn resolve_targets(
     known_files: &HashSet<String>,
     go_module: Option<&str>,
     dart_packages: Option<&HashMap<String, String>>,
+    c_headers: &CHeaderIndex,
+    python_roots: &[String],
 ) -> Vec<String> {
     match language {
         "rust" => resolve_rust_import(rel_path, specifier, known_files)
             .into_iter()
             .collect(),
-        "python" => resolve_python_import(rel_path, specifier, known_files)
+        "python" => resolve_python_import(rel_path, specifier, known_files, python_roots)
             .into_iter()
             .collect(),
         "go" => resolve_go_import(specifier, known_files, go_module),
         "dart" => resolve_dart_import(rel_path, specifier, root, known_files, dart_packages),
+        // C/C++ quoted includes are file references, not dot-anchored module
+        // specifiers, so they need their own resolver (see `resolve_c_import`).
+        "c" | "cpp" => {
+            let importing_file = root.join(rel_path);
+            resolve_c_import(&importing_file, specifier, root, known_files, c_headers)
+                .into_iter()
+                .collect()
+        }
         _ => {
             let importing_file = root.join(rel_path);
             resolve_import(&importing_file, specifier, root, known_files)
@@ -1063,6 +1083,130 @@ fn resolve_targets(
                 .collect()
         }
     }
+}
+
+// --- C / C++ ---
+
+/// File extensions claimed by the C and C++ parsers, kept in sync with
+/// `c_lang::CSupport` and `cpp::CppSupport`. A quoted `#include` may target any
+/// of them: headers in the overwhelming majority of cases, sources only in rare
+/// inline-include setups.
+const C_FAMILY_EXTENSIONS: [&str; 8] = ["c", "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx"];
+
+/// Index of C/C++ files keyed by basename (the final path component).
+///
+/// Built once per indexing pass so that `resolve_c_import`'s `-I include` style
+/// lookup is an O(1) hash hit instead of a full scan of every known path for
+/// each `#include`. Non-C projects yield an empty index and never reach
+/// `resolve_c_import`, so they pay only for the single pass that builds it.
+struct CHeaderIndex {
+    by_basename: HashMap<String, Vec<String>>,
+}
+
+impl CHeaderIndex {
+    /// Build the basename index from the indexed file set, retaining only
+    /// C/C++ files so an include never resolves to a same-named file in
+    /// another language.
+    fn build(known_paths: &HashSet<String>) -> Self {
+        let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
+        for path in known_paths {
+            if !is_c_family_path(path) {
+                continue;
+            }
+            if let Some(base) = path.rsplit('/').next() {
+                by_basename
+                    .entry(base.to_string())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+        Self { by_basename }
+    }
+
+    /// Return the single indexed file whose path equals `spec` or ends with
+    /// `/<spec>`.
+    ///
+    /// Returns `None` when zero or more than one file matches, so an ambiguous
+    /// `#include "util.h"` present under two directories is left unresolved
+    /// rather than wired to an arbitrary target.
+    fn unique_suffix_match(&self, spec: &str) -> Option<String> {
+        let base = spec.rsplit('/').next()?;
+        let candidates = self.by_basename.get(base)?;
+        let mut hit: Option<&String> = None;
+        for cand in candidates {
+            // Exact match, or `spec` is a trailing path segment of `cand`. The
+            // `/` boundary check stops `bar.h` from matching `foobar.h`.
+            let is_match = cand.as_str() == spec
+                || cand
+                    .strip_suffix(spec)
+                    .is_some_and(|prefix| prefix.ends_with('/'));
+            if is_match {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some(cand);
+            }
+        }
+        hit.cloned()
+    }
+}
+
+/// Whether `path` (a forward-slash, root-relative index key) names a C or C++
+/// source or header file.
+fn is_c_family_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| C_FAMILY_EXTENSIONS.contains(&ext))
+}
+
+/// Resolve a C/C++ quoted `#include "..."` specifier to an indexed file path.
+///
+/// Unlike JS/TS module specifiers, C include paths are not dot-anchored:
+/// `#include "db.h"` and `#include "net/socket.h"` are the common forms and must
+/// resolve even though they begin with neither `.` nor `/`. We approximate the
+/// compiler's quoted-include search order - without the build system's `-I`
+/// flags - by trying, in order:
+///
+/// 1. relative to the including file's own directory (same-directory includes
+///    and `../inc/foo.h` parent-relative ones);
+/// 2. relative to the project root (`-I .` style include roots);
+/// 3. a unique basename/suffix match across indexed C/C++ files (`-I include`
+///    style roots, where `"db.h"` lives at `include/db.h`).
+///
+/// Returns `None` when nothing resolves or the suffix match is ambiguous.
+fn resolve_c_import(
+    importing_file: &Path,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+    c_headers: &CHeaderIndex,
+) -> Option<String> {
+    // Index keys are always forward-slash; a Windows include may use `\`.
+    let spec = specifier.replace('\\', "/");
+
+    // 1. Relative to the including file's own directory.
+    if let Some(base_dir) = importing_file.parent() {
+        let candidate = normalize_path(&base_dir.join(&spec));
+        if let Ok(rel) = candidate.strip_prefix(root) {
+            let rel = to_forward_slash(rel.to_string_lossy().into_owned());
+            if known_files.contains(&rel) {
+                return Some(rel);
+            }
+        }
+    }
+
+    // 2. Relative to the project root.
+    let root_candidate = normalize_path(&root.join(&spec));
+    if let Ok(rel) = root_candidate.strip_prefix(root) {
+        let rel = to_forward_slash(rel.to_string_lossy().into_owned());
+        if known_files.contains(&rel) {
+            return Some(rel);
+        }
+    }
+
+    // 3. Unique suffix match against the indexed C/C++ file set.
+    c_headers.unique_suffix_match(&spec)
 }
 
 // --- TypeScript / JavaScript ---
@@ -1260,9 +1404,15 @@ fn resolve_python_import(
     rel_path: &str,
     specifier: &str,
     known_files: &HashSet<String>,
+    import_roots: &[String],
 ) -> Option<String> {
+    // Absolute imports (`from pkg.mod import x`, `import pkg.mod`) do not begin
+    // with a dot. Resolve them against the discovered import roots - the
+    // directories that sit on the interpreter's `sys.path` for in-repo code
+    // (repo root for a flat layout, `src` for a src-layout, and so on). See
+    // `discover_python_import_roots`.
     if !specifier.starts_with('.') {
-        return None;
+        return resolve_python_absolute(specifier, known_files, import_roots);
     }
 
     let dot_count = specifier.chars().take_while(|&c| c == '.').count();
@@ -1295,6 +1445,65 @@ fn resolve_python_import(
     }
 
     None
+}
+
+/// Resolve a non-relative Python import (`pkg.sub.mod`) to an indexed file by
+/// trying each import root in turn. Returns the first
+/// `<root>/pkg/sub/mod.py` or `<root>/pkg/sub/mod/__init__.py` present in the
+/// index. Returns `None` for standard-library and third-party imports, since
+/// those modules live outside the indexed tree.
+fn resolve_python_absolute(
+    specifier: &str,
+    known_files: &HashSet<String>,
+    import_roots: &[String],
+) -> Option<String> {
+    let module_path = specifier.replace('.', "/");
+    for root in import_roots {
+        let base = if root.is_empty() {
+            module_path.clone()
+        } else {
+            format!("{root}/{module_path}")
+        };
+        for suffix in [".py", "/__init__.py"] {
+            let candidate = format!("{base}{suffix}");
+            if known_files.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Discover the Python import roots for a project: the directories from which
+/// absolute imports resolve (the interpreter's in-repo `sys.path` entries).
+///
+/// We derive them from the indexed `__init__.py` files rather than parsing
+/// every build backend's config. A package directory is one that contains
+/// `__init__.py`; an import root is the parent of a *top-level* package (one
+/// whose parent directory is not itself a package). A flat layout yields `""`
+/// (repo root), a `src/` layout yields `"src"`, and a monorepo yields one root
+/// per project. Namespace packages without `__init__.py` are not discovered -
+/// those projects would need explicit build-config parsing.
+fn discover_python_import_roots(known_paths: &HashSet<String>) -> Vec<String> {
+    let package_dirs: HashSet<&str> = known_paths
+        .iter()
+        .filter_map(|p| p.strip_suffix("/__init__.py"))
+        .collect();
+
+    let mut roots: HashSet<String> = HashSet::new();
+    for dir in &package_dirs {
+        // Parent of this package directory ("" when it sits at the repo root).
+        let parent = dir.rsplit_once('/').map_or("", |(head, _)| head);
+        // Only a top-level package contributes an import root; a nested
+        // package shares the root of its ancestor.
+        if !package_dirs.contains(parent) {
+            roots.insert(parent.to_string());
+        }
+    }
+
+    let mut roots: Vec<String> = roots.into_iter().collect();
+    roots.sort(); // deterministic resolution order across runs
+    roots
 }
 
 // --- Go ---
@@ -2153,6 +2362,135 @@ mod tests {
         assert_eq!(result, Some("src/Button.tsx".to_string()));
     }
 
+    // --- C / C++ resolver ---
+
+    fn c_index(paths: &[&str]) -> (HashSet<String>, CHeaderIndex) {
+        let known: HashSet<String> = paths.iter().map(|&p| p.to_string()).collect();
+        let headers = CHeaderIndex::build(&known);
+        (known, headers)
+    }
+
+    #[test]
+    fn test_resolve_c_import_same_directory() {
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/util/util.c");
+        let (known, headers) = c_index(&["src/util/util.h"]);
+
+        let result = resolve_c_import(importing, "util.h", root, &known, &headers);
+        assert_eq!(result, Some("src/util/util.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_parent_relative() {
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/db/db.c");
+        let (known, headers) = c_index(&["include/db.h"]);
+
+        let result = resolve_c_import(importing, "../../include/db.h", root, &known, &headers);
+        assert_eq!(result, Some("include/db.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_root_relative() {
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/main.c");
+        let (known, headers) = c_index(&["include/config.h"]);
+
+        let result = resolve_c_import(importing, "include/config.h", root, &known, &headers);
+        assert_eq!(result, Some("include/config.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_include_root_suffix() {
+        // `-I include` layout: `#include "db.h"` from src/, header in include/.
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/db/db.c");
+        let (known, headers) = c_index(&["include/db.h", "src/db/db.c"]);
+
+        let result = resolve_c_import(importing, "db.h", root, &known, &headers);
+        assert_eq!(result, Some("include/db.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_subdir_suffix() {
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/app.c");
+        let (known, headers) = c_index(&["src/net/socket.h"]);
+
+        let result = resolve_c_import(importing, "net/socket.h", root, &known, &headers);
+        assert_eq!(result, Some("src/net/socket.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_ambiguous_suffix_is_unresolved() {
+        // Two headers share the basename; without `-I` knowledge we refuse to
+        // guess which one `#include "util.h"` means.
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/app.c");
+        let (known, headers) = c_index(&["lib/a/util.h", "lib/b/util.h"]);
+
+        let result = resolve_c_import(importing, "util.h", root, &known, &headers);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_c_import_suffix_respects_segment_boundary() {
+        // `bar.h` must not resolve to `foobar.h`.
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/app.c");
+        let (known, headers) = c_index(&["vendor/foobar.h"]);
+
+        let result = resolve_c_import(importing, "bar.h", root, &known, &headers);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_c_import_unknown_is_unresolved() {
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/app.c");
+        let (known, headers) = c_index(&["src/other.h"]);
+
+        let result = resolve_c_import(importing, "missing.h", root, &known, &headers);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_c_import_same_dir_wins_over_include_root() {
+        // The compiler checks the including file's directory before any `-I`
+        // path, so a same-dir header shadows a same-named one under include/.
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/db/db.c");
+        let (known, headers) = c_index(&["src/db/db.h", "include/db.h"]);
+
+        let result = resolve_c_import(importing, "db.h", root, &known, &headers);
+        assert_eq!(result, Some("src/db/db.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_dot_slash_same_dir() {
+        // `#include "./util.h"` - the dotted same-dir form the old generic
+        // resolver handled. Must still resolve now that C routes through
+        // resolve_c_import (regression guard).
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/util/util.c");
+        let (known, headers) = c_index(&["src/util/util.h"]);
+
+        let result = resolve_c_import(importing, "./util.h", root, &known, &headers);
+        assert_eq!(result, Some("src/util/util.h".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_c_import_backslash_separator_normalized() {
+        // Windows-style backslash separators in the include resolve against the
+        // forward-slash index keys.
+        let root = Path::new("/project");
+        let importing = Path::new("/project/src/app.c");
+        let (known, headers) = c_index(&["src/net/socket.h"]);
+
+        let result = resolve_c_import(importing, "net\\socket.h", root, &known, &headers);
+        assert_eq!(result, Some("src/net/socket.h".to_string()));
+    }
+
     // --- Rust resolver ---
 
     #[test]
@@ -2322,7 +2660,7 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/utils.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".utils", &known);
+        let result = resolve_python_import("pkg/main.py", ".utils", &known, &[]);
         assert_eq!(result, Some("pkg/utils.py".to_string()));
     }
 
@@ -2331,7 +2669,7 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/models.py".to_string());
 
-        let result = resolve_python_import("pkg/sub/module.py", "..models", &known);
+        let result = resolve_python_import("pkg/sub/module.py", "..models", &known, &[]);
         assert_eq!(result, Some("pkg/models.py".to_string()));
     }
 
@@ -2340,15 +2678,8 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/utils/__init__.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".utils", &known);
+        let result = resolve_python_import("pkg/main.py", ".utils", &known, &[]);
         assert_eq!(result, Some("pkg/utils/__init__.py".to_string()));
-    }
-
-    #[test]
-    fn test_python_absolute_skipped() {
-        let known = HashSet::new();
-        let result = resolve_python_import("pkg/main.py", "os", &known);
-        assert_eq!(result, None);
     }
 
     #[test]
@@ -2356,8 +2687,80 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("pkg/sub/helpers.py".to_string());
 
-        let result = resolve_python_import("pkg/main.py", ".sub.helpers", &known);
+        let result = resolve_python_import("pkg/main.py", ".sub.helpers", &known, &[]);
         assert_eq!(result, Some("pkg/sub/helpers.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_flat_layout() {
+        let mut known = HashSet::new();
+        known.insert("chitta/config.py".to_string());
+        let roots = ["".to_string()];
+
+        let result = resolve_python_import("chitta/main.py", "chitta.config", &known, &roots);
+        assert_eq!(result, Some("chitta/config.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_src_layout() {
+        let mut known = HashSet::new();
+        known.insert("src/chitta/config.py".to_string());
+        let roots = ["src".to_string()];
+
+        let result = resolve_python_import("src/chitta/main.py", "chitta.config", &known, &roots);
+        assert_eq!(result, Some("src/chitta/config.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_package_init() {
+        let mut known = HashSet::new();
+        known.insert("chitta/config/__init__.py".to_string());
+        let roots = ["".to_string()];
+
+        let result = resolve_python_import("chitta/main.py", "chitta.config", &known, &roots);
+        assert_eq!(result, Some("chitta/config/__init__.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_absolute_stdlib_unresolved() {
+        // Standard-library and third-party modules live outside the indexed
+        // tree, so absolute resolution returns None instead of a phantom file.
+        let mut known = HashSet::new();
+        known.insert("chitta/config.py".to_string());
+        let roots = ["".to_string()];
+
+        assert_eq!(
+            resolve_python_import("chitta/main.py", "os", &known, &roots),
+            None
+        );
+        assert_eq!(
+            resolve_python_import("chitta/main.py", "requests.adapters", &known, &roots),
+            None
+        );
+    }
+
+    #[test]
+    fn test_discover_python_import_roots_flat_and_src() {
+        let mut flat = HashSet::new();
+        flat.insert("chitta/__init__.py".to_string());
+        flat.insert("chitta/config.py".to_string());
+        assert_eq!(discover_python_import_roots(&flat), vec!["".to_string()]);
+
+        let mut src = HashSet::new();
+        src.insert("src/chitta/__init__.py".to_string());
+        src.insert("src/chitta/sub/__init__.py".to_string());
+        assert_eq!(discover_python_import_roots(&src), vec!["src".to_string()]);
+    }
+
+    #[test]
+    fn test_discover_python_import_roots_monorepo_sorted() {
+        let mut known = HashSet::new();
+        known.insert("services/a/a/__init__.py".to_string());
+        known.insert("libs/b/__init__.py".to_string());
+        assert_eq!(
+            discover_python_import_roots(&known),
+            vec!["libs".to_string(), "services/a".to_string()]
+        );
     }
 
     // --- Go resolver ---

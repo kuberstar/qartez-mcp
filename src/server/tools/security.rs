@@ -45,6 +45,7 @@ impl QartezServer {
         let limit = params.limit.unwrap_or(50) as usize;
         let offset = params.offset.unwrap_or(0) as usize;
         let include_tests = params.include_tests.unwrap_or(false);
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
 
         // Case-insensitive severity comparison. Previously `CRITICAL`
         // (the natural shout form for importance) was rejected as
@@ -185,33 +186,43 @@ impl QartezServer {
 
         if concise {
             out.push_str("# risk severity rule file symbol line\n");
-            for (i, f) in page.iter().enumerate() {
-                out.push_str(&format!(
-                    "{} {:.4} {} {} {} {} {}\n",
-                    offset + i + 1,
-                    f.risk_score,
-                    f.severity.label(),
-                    f.rule_name,
-                    f.file_path,
-                    f.symbol_name,
-                    f.line_start,
-                ));
-            }
+            let rows: Vec<String> = page
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    format!(
+                        "{} {:.4} {} {} {} {} {}\n",
+                        offset + i + 1,
+                        f.risk_score,
+                        f.severity.label(),
+                        f.rule_name,
+                        f.file_path,
+                        f.symbol_name,
+                        f.line_start,
+                    )
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         } else {
             out.push_str("  # | Risk   | Sev      | Rule              | File                          | Symbol          | Line\n");
             out.push_str("----+--------+----------+-------------------+-------------------------------+-----------------+-----\n");
-            for (i, f) in page.iter().enumerate() {
-                out.push_str(&format!(
-                    "{:>3} | {:>6.4} | {:<8} | {:<17} | {:<29} | {:<15} | {}\n",
-                    offset + i + 1,
-                    f.risk_score,
-                    f.severity.label(),
-                    truncate_path(&f.rule_name, 17),
-                    truncate_path(&f.file_path, 29),
-                    truncate_path(&f.symbol_name, 15),
-                    f.line_start,
-                ));
-            }
+            let rows: Vec<String> = page
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    format!(
+                        "{:>3} | {:>6.4} | {:<8} | {:<17} | {:<29} | {:<15} | {}\n",
+                        offset + i + 1,
+                        f.risk_score,
+                        f.severity.label(),
+                        truncate_path(&f.rule_name, 17),
+                        truncate_path(&f.file_path, 29),
+                        truncate_path(&f.symbol_name, 15),
+                        f.line_start,
+                    )
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
 
             // Append snippets for detailed mode.
             let with_snippets: Vec<_> = page
@@ -221,17 +232,21 @@ impl QartezServer {
                 .collect();
             if !with_snippets.is_empty() {
                 out.push_str("\n## Snippets\n\n");
-                for (i, f, snippet) in with_snippets {
-                    out.push_str(&format!(
-                        "  #{} [{}] {}:{} -- {}\n    {}\n",
-                        offset + i + 1,
-                        f.rule_id,
-                        f.file_path,
-                        f.line_start,
-                        f.description,
-                        snippet,
-                    ));
-                }
+                let snippet_rows: Vec<String> = with_snippets
+                    .into_iter()
+                    .map(|(i, f, snippet)| {
+                        format!(
+                            "  #{} [{}] {}:{} -- {}\n    {}\n",
+                            offset + i + 1,
+                            f.rule_id,
+                            f.file_path,
+                            f.line_start,
+                            f.description,
+                            snippet,
+                        )
+                    })
+                    .collect();
+                budget_render(&mut out, &snippet_rows, token_budget);
             }
         }
 

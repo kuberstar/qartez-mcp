@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.10.0] - 2026-05-27
+
+### Added
+
+- **`qartez_blame` tool - symbol-scoped git blame** - a new analysis-tier tool that runs git blame scoped to a single symbol's line range, in hunk mode (per-line authorship) or aggregate mode (latest-commit-by-date plus per-author line counts). Gated behind `git_depth > 0`, so it is inert on shallow or git-less indexes. Addresses community request #13.
+- **`qartez_arch_review` prompt - structural-risk audit workflow** - a sixth workflow prompt that orchestrates map, stats, security, hotspots, boundaries, deps, and calls into a single architecture-review pass, chaining `qartez_wiki` before `boundaries`. Addresses community request #15.
+- **Python absolute-import resolution** - `from pkg.mod import x` and `import pkg.mod` now resolve against import roots discovered from the indexed `__init__.py` set (both flat and `src/` layouts), and class methods are stamped with `owner_type` so the same-class reference heuristic applies to Python. This populates the import-edges graph for Python projects, the Python analog of the C/C++ edges fix below. Addresses community request #16. Covered by `tests/python_import_edges.rs`.
+
+### Fixed
+
+- **C/C++ `#include` edges were never populated (issue #36)** - quoted includes (`#include "db.h"`) are bare or include-root-relative file references, not dot-anchored module specifiers, so the generic JS/TS resolver rejected them at its `starts_with('.')` guard and wrote zero import edges. A full reindex of a C codebase therefore left the edges table empty, degrading every graph-tier tool (`qartez_impact`, `qartez_deps`, `qartez_diff_impact`, `qartez_hotspots`, `qartez_health`) while the source-scan tools kept working. The `c` / `cpp` languages now route to a dedicated `resolve_c_import` that mirrors the compiler's quoted-include search order: the including file's directory, then the project root, then a unique basename/suffix match across indexed C/C++ files (the `-I include` layout). A `CHeaderIndex` built once per indexing pass keeps the suffix lookup O(1); ambiguous basenames are left unresolved rather than wired to an arbitrary target. Covered by resolver unit tests plus an end-to-end `tests/c_include_edges.rs` regression that indexes a C project and asserts the edges table is populated.
+
+### Changed
+
+- **`token_budget` rollout across the analysis tools** - a shared `budget_render` helper (`helpers.rs`) emits pre-rendered, priority-ordered items into the output buffer until the token budget is exhausted, then prints the uniform `raise token_budget=` truncation marker. A `token_budget` parameter is now wired into the tools that lacked it: `qartez_impact`, `qartez_diff_impact`, `qartez_hotspots`, `qartez_clones`, `qartez_smells`, `qartez_test_gaps`, `qartez_hierarchy`, `qartez_security`, and `qartez_knowledge`. Covered by `budget_render` unit tests (empty input, zero budget, oversized first row, truncation marker plus dropped-count, shared-budget-across-calls) and per-tool budget-truncation regressions.
+- **`qartez_calls` ranks callers by PageRank** - callers are now sorted by their enclosing file's PageRank before the limit and budget cuts are applied, so the most important call sites survive truncation instead of being dropped in arbitrary order.
+- **Documented tool count reconciled to 42** - `README`, `mcp_instructions`, `docs/tools`, `docs/agent-guide`, and `docs/architecture` are updated to match the `total_tool_count_is_42` invariant after the `qartez_blame` addition.
+- **Dashboard dependency bumps** - `svelte` to 5.55.7 and `@sveltejs/kit` to 2.60.1 in the `qartez-dashboard` web package (Dependabot #35, #37), applied at the monorepo source since the public Dependabot PRs target the mirror. `pnpm install` and `vite build` verified with the new versions.
+- **Rust dependency refresh** - lockfile regeneration at release time pulls in the latest semver-compatible crate versions: notably `rmcp` 1.6.0 -> 1.7.0 (the MCP protocol framework), `openssl` 0.10.79 -> 0.10.80, `tree-sitter` 0.26.8 -> 0.26.9, and `serde_json` 1.0.150, plus routine patch bumps across ~20 transitive crates. The full suite (build, test, clippy `--all-features`, `cargo-deny`) was re-verified green on the regenerated lock; no qartez API changes.
+
+### Notes
+
+- The `qartez_blame` tool, the `qartez_arch_review` prompt, and Python absolute-import resolution were implemented independently to address the community feature requests in #13, #15, and #16.
+
 ## [0.9.10] - 2026-05-11
 
 ### Fixed

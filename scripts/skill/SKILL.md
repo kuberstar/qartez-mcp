@@ -4,34 +4,9 @@ description: >-
   Semantic code intelligence skill for qartez MCP. Use qartez tools for code
   exploration, impact analysis, and guarded refactors; treat built-in code-tool
   denials as routing signals and recover via qartez replacements.
-allowed-tools:
-  - mcp__qartez__qartez_map
-  - mcp__qartez__qartez_find
-  - mcp__qartez__qartez_grep
-  - mcp__qartez__qartez_read
-  - mcp__qartez__qartez_outline
-  - mcp__qartez__qartez_stats
-  - mcp__qartez__qartez_impact
-  - mcp__qartez__qartez_deps
-  - mcp__qartez__qartez_refs
-  - mcp__qartez__qartez_calls
-  - mcp__qartez__qartez_cochange
-  - mcp__qartez__qartez_context
-  - mcp__qartez__qartez_unused
-  - mcp__qartez__qartez_hotspots
-  - mcp__qartez__qartez_clones
-  - mcp__qartez__qartez_boundaries
-  - mcp__qartez__qartez_rename
-  - mcp__qartez__qartez_move
-  - mcp__qartez__qartez_rename_file
-  - mcp__qartez__qartez_project
-  - mcp__qartez__qartez_wiki
-  - mcp__qartez__qartez_diff_impact
-  - mcp__qartez__qartez_trend
-  - mcp__qartez__qartez_hierarchy
 ---
 
-# Qartez — Semantic Code Intelligence Skill
+# Qartez - Semantic Code Intelligence Skill
 
 Qartez provides semantic, graph-aware code intelligence for any repository. It replaces naive file-system tools (glob, grep, read) with structured analysis grounded in a pre-built language-aware index.
 

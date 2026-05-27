@@ -40,6 +40,7 @@ impl QartezServer {
         let conn = self.db.lock().map_err(|e| format!("DB lock error: {e}"))?;
         let concise = is_concise(&params.format);
         let include_tests = params.include_tests.unwrap_or(false);
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
         // Mirror the on-disk hint that `qartez_cochange` emits so the
         // two tools give the same recovery advice for the same input.
         // Distinguishes "typo or wrong working dir" from "file exists
@@ -125,9 +126,15 @@ impl QartezServer {
             "Transitive blast radius: {} file(s)\n",
             transitive_names.len(),
         ));
-        for name in &transitive_names {
-            out.push_str(&format!("  - {name}\n"));
-        }
+        // Cap the transitive list at the token budget. The list is the only
+        // unbounded section here (a hub file can pull in hundreds of
+        // dependents), so budgeting it keeps the whole report bounded while
+        // the small co-change and hot-symbol sections below stay intact.
+        let transitive_rows: Vec<String> = transitive_names
+            .iter()
+            .map(|name| format!("  - {name}\n"))
+            .collect();
+        budget_render(&mut out, &transitive_rows, token_budget);
 
         if !cochanges.is_empty() {
             out.push_str(&format!("\nCo-change partners ({}):\n", cochanges.len()));

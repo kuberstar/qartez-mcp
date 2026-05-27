@@ -49,6 +49,7 @@ impl QartezServer {
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(HotspotLevel::File);
         let sort_by = params.sort_by.unwrap_or_default();
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
         // `threshold=0` would require `health <= 0`, but the health
         // formula (`10 / (1 + x)`) is strictly positive, so zero
         // excludes every row. The previous build quietly clamped to
@@ -177,20 +178,24 @@ impl QartezServer {
                 let is_small = scored.len() <= 3 || limit <= 3;
                 if concise {
                     out.push_str("# score health file avg_cc max_cc churn pagerank\n");
-                    for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
-                    {
-                        out.push_str(&format!(
-                            "{} {:.2} {:.1} {} {:.1} {:.0} {} {:.4}\n",
-                            i + 1,
-                            score,
-                            health,
-                            path,
-                            avg,
-                            max,
-                            churn,
-                            pr,
-                        ));
-                    }
+                    let rows: Vec<String> = scored
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (path, score, avg, max, churn, pr, health))| {
+                            format!(
+                                "{} {:.2} {:.1} {} {:.1} {:.0} {} {:.4}\n",
+                                i + 1,
+                                score,
+                                health,
+                                path,
+                                avg,
+                                max,
+                                churn,
+                                pr,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                 } else {
                     if !is_small {
                         out.push_str("# Hotspot Analysis (file level)\n\n");
@@ -203,20 +208,24 @@ impl QartezServer {
                     }
                     out.push_str("  # | Score     | Health | File                               | AvgCC | MaxCC | Churn | PageRank\n");
                     out.push_str("----+-----------+--------+------------------------------------+-------+-------+-------+---------\n");
-                    for (i, (path, score, avg, max, churn, pr, health)) in scored.iter().enumerate()
-                    {
-                        out.push_str(&format!(
-                            "{:>3} | {:>9.2} | {:>6.1} | {:<34} | {:>5.1} | {:>5.0} | {:>5} | {:>8.4}\n",
-                            i + 1,
-                            score,
-                            health,
-                            truncate_path(path, 34),
-                            avg,
-                            max,
-                            churn,
-                            pr,
-                        ));
-                    }
+                    let rows: Vec<String> = scored
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (path, score, avg, max, churn, pr, health))| {
+                            format!(
+                                "{:>3} | {:>9.2} | {:>6.1} | {:<34} | {:>5.1} | {:>5.0} | {:>5} | {:>8.4}\n",
+                                i + 1,
+                                score,
+                                health,
+                                truncate_path(path, 34),
+                                avg,
+                                max,
+                                churn,
+                                pr,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                 }
                 Ok(out)
             }
@@ -301,22 +310,25 @@ impl QartezServer {
                 let is_small = scored.len() <= 3 || limit <= 3;
                 if concise {
                     out.push_str("# score health name kind file cc pagerank churn\n");
-                    for (i, (name, kind, path, score, cc, pr, churn, health)) in
-                        scored.iter().enumerate()
-                    {
-                        out.push_str(&format!(
-                            "{} {:.4} {:.1} {} {} {} {} {:.4} {}\n",
-                            i + 1,
-                            score,
-                            health,
-                            name,
-                            kind,
-                            path,
-                            cc,
-                            pr,
-                            churn,
-                        ));
-                    }
+                    let rows: Vec<String> = scored
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, kind, path, score, cc, pr, churn, health))| {
+                            format!(
+                                "{} {:.4} {:.1} {} {} {} {} {:.4} {}\n",
+                                i + 1,
+                                score,
+                                health,
+                                name,
+                                kind,
+                                path,
+                                cc,
+                                pr,
+                                churn,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                 } else {
                     if !is_small {
                         out.push_str("# Hotspot Analysis (symbol level)\n\n");
@@ -328,22 +340,25 @@ impl QartezServer {
                     }
                     out.push_str("  # | Score    | Health | Symbol                    | Kind     | File                          | CC | PageRank | Churn\n");
                     out.push_str("----+----------+--------+---------------------------+----------+-------------------------------+----+----------+------\n");
-                    for (i, (name, kind, path, score, cc, pr, churn, health)) in
-                        scored.iter().enumerate()
-                    {
-                        out.push_str(&format!(
-                            "{:>3} | {:>8.4} | {:>6.1} | {:<25} | {:<8} | {:<29} | {:>2} | {:>8.4} | {:>5}\n",
-                            i + 1,
-                            score,
-                            health,
-                            truncate_path(name, 25),
-                            truncate_path(kind, 8),
-                            truncate_path(path, 29),
-                            cc,
-                            pr,
-                            churn,
-                        ));
-                    }
+                    let rows: Vec<String> = scored
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, kind, path, score, cc, pr, churn, health))| {
+                            format!(
+                                "{:>3} | {:>8.4} | {:>6.1} | {:<25} | {:<8} | {:<29} | {:>2} | {:>8.4} | {:>5}\n",
+                                i + 1,
+                                score,
+                                health,
+                                truncate_path(name, 25),
+                                truncate_path(kind, 8),
+                                truncate_path(path, 29),
+                                cc,
+                                pr,
+                                churn,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                 }
                 Ok(out)
             }

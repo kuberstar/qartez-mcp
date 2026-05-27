@@ -77,7 +77,7 @@ qartez_test_gaps mode=suggest base=main # which tests should you run?
 
 ## Unlocking tools
 
-By default, all 39 tools are available. With progressive disclosure
+By default, all 42 tools are available. With progressive disclosure
 (`QARTEZ_PROGRESSIVE=1`), start with core tools and unlock more as needed:
 
 ```
@@ -130,7 +130,8 @@ qartez_map top_n=10                     # most important files
 qartez_stats                            # size and language breakdown
 qartez_wiki                             # auto-generated architecture doc
 qartez_hotspots limit=5                 # where the complexity lives
-qartez_knowledge level=module           # who owns what
+qartez_knowledge level=module           # who owns what (file / module level)
+qartez_blame symbol_name=parse_config   # who last touched one specific function
 ```
 
 ### Refactoring

@@ -516,6 +516,7 @@ impl QartezServer {
                 "qartez_security"    => qartez_security:    SoulSecurityParams,
                 "qartez_semantic"    => qartez_semantic:    SemanticParams,
                 "qartez_knowledge"   => qartez_knowledge:   SoulKnowledgeParams,
+                "qartez_blame"       => qartez_blame:       SoulBlameParams,
                 "qartez_replace_symbol"       => qartez_replace_symbol:       SoulReplaceSymbolParams,
                 "qartez_insert_before_symbol" => qartez_insert_before_symbol: SoulInsertSymbolParams,
                 "qartez_insert_after_symbol"  => qartez_insert_after_symbol:  SoulInsertSymbolParams,
@@ -746,16 +747,16 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_41() {
+    fn total_tool_count_is_42() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 41, "expected 41 tools, got {}", all.len());
+        assert_eq!(all.len(), 42, "expected 42 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 19, "analysis tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 20, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 7, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 6, "meta tier");
     }

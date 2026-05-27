@@ -1,6 +1,6 @@
 # Tool reference
 
-Qartez exposes 39 tools via MCP, organized into four tiers. By default all
+Qartez exposes 42 tools via MCP, organized into four tiers. By default all
 tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 `qartez_tools` are visible at startup; unlock others on demand.
 
@@ -357,6 +357,21 @@ Test-to-source mapping and coverage gap analysis. Three modes:
 | `format` | enum | detailed | `detailed` or `concise` |
 | `min_pagerank` | f64 | 0.0 | Filter threshold for gaps mode |
 | `include_symbols` | bool | false | Show exported symbols in map mode |
+
+### `qartez_blame`
+
+Symbol-scoped `git blame`. Resolves a symbol name to its file and line range
+from the index, then blames only those lines, so you see who last touched a
+specific function or type rather than a whole file. Requires git history
+(index with `--git-depth > 0`). Pick this over `qartez_knowledge` when the
+question is "who wrote *this function*"; pick `qartez_knowledge` for
+file- or module-level ownership and bus-factor.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `symbol_name` | string | — | Symbol (function/type/method) to blame. Required. |
+| `file_path` | string | — | Disambiguate a name defined in several files |
+| `mode` | enum | hunk | `hunk` (per-hunk commits/authors) or `aggregate` (per-author rollup with latest commit) |
 
 ### `qartez_knowledge`
 
