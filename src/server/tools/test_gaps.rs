@@ -93,15 +93,16 @@ impl QartezServer {
         let limit = params.limit.unwrap_or(30) as usize;
         let concise = is_concise(&params.format);
         let mode = params.mode.as_deref().unwrap_or("gaps");
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
 
         let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
         let all_edges = read::get_all_edges(&conn).map_err(|e| format!("DB error: {e}"))?;
         let ctx = TestGapsCtx::build(&all_files, &all_edges);
 
         match mode {
-            "map" => self.test_gaps_map(&params, &ctx, &conn, limit, concise),
-            "gaps" => self.test_gaps_find(&params, &ctx, &conn, limit, concise),
-            "suggest" => self.test_gaps_suggest(&params, &ctx, &conn, limit, concise),
+            "map" => self.test_gaps_map(&params, &ctx, &conn, limit, concise, token_budget),
+            "gaps" => self.test_gaps_find(&params, &ctx, &conn, limit, concise, token_budget),
+            "suggest" => self.test_gaps_suggest(&params, &ctx, &conn, limit, concise, token_budget),
             _ => Err(format!(
                 "Unknown mode '{mode}'. Use 'map', 'gaps', or 'suggest'."
             )),
@@ -151,6 +152,7 @@ impl QartezServer {
         conn: &rusqlite::Connection,
         limit: usize,
         concise: bool,
+        token_budget: usize,
     ) -> Result<String, String> {
         let mut source_to_tests: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut test_to_sources: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -335,26 +337,28 @@ impl QartezServer {
         let include_symbols_project = params.include_symbols.unwrap_or(false);
 
         if concise {
-            for (src, tests) in entries.iter().take(limit) {
-                if include_symbols_project {
-                    let sym_count = ctx
-                        .path_to_id
-                        .get(src)
-                        .and_then(|id| read::get_symbols_for_file(conn, *id).ok())
-                        .map(|v| v.iter().filter(|s| s.kind != "field").count())
-                        .unwrap_or(0);
-                    out.push_str(&format!(
-                        "  {} ({} tests, {} symbols)\n",
-                        src,
-                        tests.len(),
-                        sym_count,
-                    ));
-                } else {
-                    out.push_str(&format!("  {} ({})\n", src, tests.len()));
-                }
-            }
+            let rows: Vec<String> = entries
+                .iter()
+                .take(limit)
+                .map(|(src, tests)| {
+                    if include_symbols_project {
+                        let sym_count = ctx
+                            .path_to_id
+                            .get(src)
+                            .and_then(|id| read::get_symbols_for_file(conn, *id).ok())
+                            .map(|v| v.iter().filter(|s| s.kind != "field").count())
+                            .unwrap_or(0);
+                        format!("  {} ({} tests, {} symbols)\n", src, tests.len(), sym_count,)
+                    } else {
+                        format!("  {} ({})\n", src, tests.len())
+                    }
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         } else {
+            let mut blocks: Vec<String> = Vec::new();
             for (src, tests) in entries.iter().take(limit) {
+                let mut out = String::new();
                 out.push_str(&format!("- {} ({} tests)\n", src, tests.len()));
                 for t in tests.iter().take(5) {
                     out.push_str(&format!("    - {t}\n"));
@@ -377,7 +381,9 @@ impl QartezServer {
                         }
                     }
                 }
+                blocks.push(out);
             }
+            budget_render(&mut out, &blocks, token_budget);
         }
         if entries.len() > limit {
             out.push_str(&format!(
@@ -396,6 +402,7 @@ impl QartezServer {
         conn: &rusqlite::Connection,
         limit: usize,
         concise: bool,
+        token_budget: usize,
     ) -> Result<String, String> {
         let min_pagerank = params.min_pagerank.unwrap_or(0.0);
 
@@ -598,27 +605,37 @@ impl QartezServer {
         }
 
         if concise {
-            for (file, score) in gaps.iter().take(limit) {
-                let blast = ctx.reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
-                out.push_str(&format!(
-                    "  {} PR={:.4} blast={} score={:.1}\n",
-                    file.path, file.pagerank, blast, score,
-                ));
-            }
+            let rows: Vec<String> = gaps
+                .iter()
+                .take(limit)
+                .map(|(file, score)| {
+                    let blast = ctx.reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
+                    format!(
+                        "  {} PR={:.4} blast={} score={:.1}\n",
+                        file.path, file.pagerank, blast, score,
+                    )
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         } else {
             out.push_str("| File | PageRank | Blast | Churn | Score |\n");
             out.push_str("|------|----------|-------|-------|-------|\n");
-            for (file, score) in gaps.iter().take(limit) {
-                let blast = ctx.reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
-                out.push_str(&format!(
-                    "| {} | {:.4} | {} | {} | {:.1} |\n",
-                    truncate_path(&file.path, 40),
-                    file.pagerank,
-                    blast,
-                    file.change_count,
-                    score,
-                ));
-            }
+            let rows: Vec<String> = gaps
+                .iter()
+                .take(limit)
+                .map(|(file, score)| {
+                    let blast = ctx.reverse.get(&file.id).map(|v| v.len()).unwrap_or(0);
+                    format!(
+                        "| {} | {:.4} | {} | {} | {:.1} |\n",
+                        truncate_path(&file.path, 40),
+                        file.pagerank,
+                        blast,
+                        file.change_count,
+                        score,
+                    )
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         }
 
         Ok(out)
@@ -631,6 +648,7 @@ impl QartezServer {
         conn: &rusqlite::Connection,
         limit: usize,
         concise: bool,
+        token_budget: usize,
     ) -> Result<String, String> {
         let base = params.base.as_deref().ok_or(
             "The 'suggest' mode requires a 'base' parameter (git diff range, e.g., 'main' or 'HEAD~3').",
@@ -761,11 +779,16 @@ impl QartezServer {
                 test_entries.len(),
             ));
             if concise {
-                for (test, sources) in test_entries.iter().take(limit) {
-                    out.push_str(&format!("  {} (covers {})\n", test, sources.len(),));
-                }
+                let rows: Vec<String> = test_entries
+                    .iter()
+                    .take(limit)
+                    .map(|(test, sources)| format!("  {} (covers {})\n", test, sources.len(),))
+                    .collect();
+                budget_render(&mut out, &rows, token_budget);
             } else {
+                let mut blocks: Vec<String> = Vec::new();
                 for (test, sources) in test_entries.iter().take(limit) {
+                    let mut out = String::new();
                     out.push_str(&format!("- {test}\n"));
                     for src in sources.iter().take(5) {
                         out.push_str(&format!("    covers: {src}\n"));
@@ -773,7 +796,9 @@ impl QartezServer {
                     if sources.len() > 5 {
                         out.push_str(&format!("    ... and {} more\n", sources.len() - 5,));
                     }
+                    blocks.push(out);
                 }
+                budget_render(&mut out, &blocks, token_budget);
             }
             out.push('\n');
         }
@@ -783,9 +808,12 @@ impl QartezServer {
                 "## Untested changes ({} source files need new tests)\n",
                 untested_sources.len(),
             ));
-            for src in untested_sources.iter().take(limit) {
-                out.push_str(&format!("  - {src}\n"));
-            }
+            let rows: Vec<String> = untested_sources
+                .iter()
+                .take(limit)
+                .map(|src| format!("  - {src}\n"))
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         }
 
         Ok(out)

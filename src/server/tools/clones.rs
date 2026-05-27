@@ -77,6 +77,7 @@ impl QartezServer {
         let min_lines = params.min_lines.unwrap_or(8);
         let include_tests = params.include_tests.unwrap_or(false);
         let concise = matches!(params.format, Some(Format::Concise));
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
 
         let total =
             read::count_clone_groups(&conn, min_lines).map_err(|e| format!("DB error: {e}"))?;
@@ -171,7 +172,14 @@ impl QartezServer {
             "{total_dup_symbols} duplicate symbols across {shown} group(s).\n\n"
         ));
 
+        // Render each group into its own buffer so budget_render can drop
+        // whole groups at item boundaries (a group is a multi-line block:
+        // header + optional boilerplate note + one line per duplicate). The
+        // groups are already sorted most-duplicates-first by the DB query, so
+        // a budget cut keeps the largest refactor opportunities.
+        let mut group_blocks: Vec<String> = Vec::with_capacity(groups.len());
         for (i, group) in groups.iter().enumerate() {
+            let mut out = String::new();
             let group_num = offset as usize + i + 1;
             let size = group.symbols.len();
             let lines = group
@@ -237,7 +245,9 @@ impl QartezServer {
                 }
                 out.push('\n');
             }
+            group_blocks.push(out);
         }
+        budget_render(&mut out, &group_blocks, token_budget);
         Ok(out)
     }
 }

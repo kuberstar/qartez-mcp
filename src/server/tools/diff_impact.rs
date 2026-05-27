@@ -39,6 +39,7 @@ impl QartezServer {
         reject_mermaid(&params.format, "qartez_diff_impact")?;
         let concise = is_concise(&params.format);
         let include_tests = params.include_tests.unwrap_or(false);
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
         // Read-only by default. Guard-ACK side effects are opt-in via
         // `ack=true`; the previous behaviour wrote files under
         // `.qartez/acks/` on every read call, which surprised callers
@@ -293,17 +294,17 @@ impl QartezServer {
         if direct_entries.is_empty() {
             out.push_str("No external importers affected.\n");
         } else {
-            for (path, sources) in &direct_entries {
-                let short_sources: Vec<&str> = sources
-                    .iter()
-                    .map(|s| s.rsplit('/').next().unwrap_or(s))
-                    .collect();
-                out.push_str(&format!(
-                    "  - {} (from: {})\n",
-                    path,
-                    short_sources.join(", "),
-                ));
-            }
+            let rows: Vec<String> = direct_entries
+                .iter()
+                .map(|(path, sources)| {
+                    let short_sources: Vec<&str> = sources
+                        .iter()
+                        .map(|s| s.rsplit('/').next().unwrap_or(s))
+                        .collect();
+                    format!("  - {} (from: {})\n", path, short_sources.join(", "),)
+                })
+                .collect();
+            budget_render(&mut out, &rows, token_budget);
         }
 
         if !convergence.is_empty() {

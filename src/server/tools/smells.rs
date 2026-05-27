@@ -52,6 +52,7 @@ impl QartezServer {
             Some(n) => n as usize,
         };
         let concise = matches!(params.format, Some(Format::Concise));
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
 
         let min_cc = params.min_complexity.unwrap_or(15);
         let min_lines = params.min_lines.unwrap_or(50);
@@ -231,15 +232,22 @@ impl QartezServer {
             ));
         }
 
-        format_god_functions(&mut out, &god_functions, concise, min_cc, min_lines);
+        format_god_functions(
+            &mut out,
+            &god_functions,
+            concise,
+            min_cc,
+            min_lines,
+            token_budget,
+        );
         if detect_god && god_functions.is_empty() {
             out.push_str("## God Functions: 0 found at current thresholds.\n\n");
         }
-        format_long_params(&mut out, &long_params, concise, min_params);
+        format_long_params(&mut out, &long_params, concise, min_params, token_budget);
         if detect_params && long_params.is_empty() {
             out.push_str("## Long Parameter Lists: 0 found at current thresholds.\n\n");
         }
-        format_feature_envy(&mut out, &feature_envy, concise, envy_ratio);
+        format_feature_envy(&mut out, &feature_envy, concise, envy_ratio, token_budget);
         if detect_envy && feature_envy.is_empty() {
             // Zero-count markers make the asymmetric output
             // observable. Before, a scan that returned
@@ -835,42 +843,50 @@ fn format_god_functions(
     concise: bool,
     min_cc: u32,
     min_lines: u32,
+    token_budget: usize,
 ) {
     if god_functions.is_empty() {
         return;
     }
     if concise {
         out.push_str("## God Functions\n");
-        for g in god_functions {
-            let tag = if g.kind == "flat_dispatcher" {
-                format!(" [flat_dispatcher arms={}]", g.arm_count)
-            } else {
-                String::new()
-            };
-            out.push_str(&format!(
-                "  {} @ {} L{}-{} CC={} lines={}{}\n",
-                g.name, g.path, g.line_start, g.line_end, g.cc, g.lines, tag,
-            ));
-        }
+        let rows: Vec<String> = god_functions
+            .iter()
+            .map(|g| {
+                let tag = if g.kind == "flat_dispatcher" {
+                    format!(" [flat_dispatcher arms={}]", g.arm_count)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "  {} @ {} L{}-{} CC={} lines={}{}\n",
+                    g.name, g.path, g.line_start, g.line_end, g.cc, g.lines, tag,
+                )
+            })
+            .collect();
+        budget_render(out, &rows, token_budget);
     } else {
         out.push_str(&format!(
             "## God Functions (CC >= {min_cc} AND lines >= {min_lines})\n\n"
         ));
         out.push_str("| Symbol | File | CC | Lines | Range | Kind |\n");
         out.push_str("|--------|------|----|-------|-------|------|\n");
-        let mut any_flat = false;
-        for g in god_functions {
-            let kind_cell = if g.kind == "flat_dispatcher" {
-                any_flat = true;
-                format!("flat_dispatcher (arms={})", g.arm_count)
-            } else {
-                "god_function".to_string()
-            };
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | L{}-{} | {} |\n",
-                g.name, g.path, g.cc, g.lines, g.line_start, g.line_end, kind_cell,
-            ));
-        }
+        let any_flat = god_functions.iter().any(|g| g.kind == "flat_dispatcher");
+        let rows: Vec<String> = god_functions
+            .iter()
+            .map(|g| {
+                let kind_cell = if g.kind == "flat_dispatcher" {
+                    format!("flat_dispatcher (arms={})", g.arm_count)
+                } else {
+                    "god_function".to_string()
+                };
+                format!(
+                    "| {} | {} | {} | {} | L{}-{} | {} |\n",
+                    g.name, g.path, g.cc, g.lines, g.line_start, g.line_end, kind_cell,
+                )
+            })
+            .collect();
+        budget_render(out, &rows, token_budget);
         if any_flat {
             out.push('\n');
             out.push_str(
@@ -886,36 +902,40 @@ fn format_long_params(
     long_params: &[LongParams],
     concise: bool,
     min_params: usize,
+    token_budget: usize,
 ) {
     if long_params.is_empty() {
         return;
     }
     if concise {
         out.push_str("## Long Parameter Lists\n");
-        for lp in long_params {
-            out.push_str(&format!(
-                "  {} @ {} params={}\n",
-                lp.name, lp.path, lp.param_count,
-            ));
-        }
+        let rows: Vec<String> = long_params
+            .iter()
+            .map(|lp| format!("  {} @ {} params={}\n", lp.name, lp.path, lp.param_count,))
+            .collect();
+        budget_render(out, &rows, token_budget);
     } else {
         out.push_str(&format!(
             "## Long Parameter Lists (>= {min_params} params, excluding self)\n\n"
         ));
         out.push_str("| Symbol | File | Params | Signature |\n");
         out.push_str("|--------|------|--------|-----------|\n");
-        for lp in long_params {
-            let sig_display = if lp.signature.len() > 80 {
-                let end = crate::str_utils::floor_char_boundary(&lp.signature, 77);
-                format!("{}...", &lp.signature[..end])
-            } else {
-                lp.signature.clone()
-            };
-            out.push_str(&format!(
-                "| {} | {} | {} | `{}` |\n",
-                lp.name, lp.path, lp.param_count, sig_display,
-            ));
-        }
+        let rows: Vec<String> = long_params
+            .iter()
+            .map(|lp| {
+                let sig_display = if lp.signature.len() > 80 {
+                    let end = crate::str_utils::floor_char_boundary(&lp.signature, 77);
+                    format!("{}...", &lp.signature[..end])
+                } else {
+                    lp.signature.clone()
+                };
+                format!(
+                    "| {} | {} | {} | `{}` |\n",
+                    lp.name, lp.path, lp.param_count, sig_display,
+                )
+            })
+            .collect();
+        budget_render(out, &rows, token_budget);
     }
     out.push('\n');
 }
@@ -925,18 +945,23 @@ fn format_feature_envy(
     feature_envy: &[FeatureEnvy],
     concise: bool,
     envy_ratio: f64,
+    token_budget: usize,
 ) {
     if feature_envy.is_empty() {
         return;
     }
     if concise {
         out.push_str("## Feature Envy\n");
-        for fe in feature_envy {
-            out.push_str(&format!(
-                "  {} @ {} own={} ext={}({}) ratio={:.1}\n",
-                fe.name, fe.path, fe.own_type, fe.envied_type, fe.external_calls, fe.ratio,
-            ));
-        }
+        let rows: Vec<String> = feature_envy
+            .iter()
+            .map(|fe| {
+                format!(
+                    "  {} @ {} own={} ext={}({}) ratio={:.1}\n",
+                    fe.name, fe.path, fe.own_type, fe.envied_type, fe.external_calls, fe.ratio,
+                )
+            })
+            .collect();
+        budget_render(out, &rows, token_budget);
     } else {
         out.push_str(&format!(
             "## Feature Envy (external/own ratio >= {envy_ratio:.1})\n\n"
@@ -947,18 +972,22 @@ fn format_feature_envy(
         out.push_str(
             "|--------|------|----------|-------------|-----------|-----------|-------|\n",
         );
-        for fe in feature_envy {
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {:.1} |\n",
-                fe.name,
-                fe.path,
-                fe.own_type,
-                fe.envied_type,
-                fe.own_calls,
-                fe.external_calls,
-                fe.ratio,
-            ));
-        }
+        let rows: Vec<String> = feature_envy
+            .iter()
+            .map(|fe| {
+                format!(
+                    "| {} | {} | {} | {} | {} | {} | {:.1} |\n",
+                    fe.name,
+                    fe.path,
+                    fe.own_type,
+                    fe.envied_type,
+                    fe.own_calls,
+                    fe.external_calls,
+                    fe.ratio,
+                )
+            })
+            .collect();
+        budget_render(out, &rows, token_budget);
     }
     out.push('\n');
 }

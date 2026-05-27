@@ -32,6 +32,7 @@ impl LanguageSupport for PythonSupport {
             source,
             false,
             None,
+            None,
             &mut symbols,
             &mut imports,
             &mut references,
@@ -98,11 +99,13 @@ fn is_exported(name: &str) -> bool {
     !name.starts_with('_')
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_from_node(
     node: Node,
     source: &[u8],
     inside_class: bool,
     enclosing: Option<usize>,
+    owner: Option<&str>,
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
@@ -110,7 +113,7 @@ fn extract_from_node(
     let mut new_enclosing = enclosing;
     match node.kind() {
         "function_definition" => {
-            if let Some(sym) = extract_function(node, source, inside_class) {
+            if let Some(sym) = extract_function(node, source, inside_class, owner) {
                 let idx = symbols.len();
                 symbols.push(sym);
                 new_enclosing = Some(idx);
@@ -118,9 +121,17 @@ fn extract_from_node(
         }
         "class_definition" => {
             if let Some(sym) = extract_class(node, source) {
+                let class_name = sym.name.clone();
                 let idx = symbols.len();
                 symbols.push(sym);
-                extract_class_methods(node, source, symbols, imports, references);
+                extract_class_methods(
+                    node,
+                    source,
+                    Some(&class_name),
+                    symbols,
+                    imports,
+                    references,
+                );
                 new_enclosing = Some(idx);
                 // Still walk the class body for references at class scope
                 // (base class name, decorators). Methods were already walked
@@ -133,6 +144,7 @@ fn extract_from_node(
                             source,
                             false,
                             new_enclosing,
+                            None,
                             symbols,
                             imports,
                             references,
@@ -143,7 +155,15 @@ fn extract_from_node(
             }
         }
         "decorated_definition" => {
-            extract_decorated(node, source, inside_class, symbols, imports, references);
+            extract_decorated(
+                node,
+                source,
+                inside_class,
+                owner,
+                symbols,
+                imports,
+                references,
+            );
             return;
         }
         "import_statement" => {
@@ -159,12 +179,21 @@ fn extract_from_node(
 
     record_reference(node, source, enclosing, references);
 
+    // A function body's local definitions are not methods of the enclosing
+    // class, so the owner stops at the function boundary. Other nodes (e.g. a
+    // conditional block directly in a class body) keep propagating it.
+    let child_owner = if node.kind() == "function_definition" {
+        None
+    } else {
+        owner
+    };
     for child in children(node) {
         extract_from_node(
             child,
             source,
             inside_class,
             new_enclosing,
+            child_owner,
             symbols,
             imports,
             references,
@@ -283,7 +312,12 @@ fn count_complexity(node: Node) -> u32 {
     total
 }
 
-fn extract_function(node: Node, source: &[u8], inside_class: bool) -> Option<ExtractedSymbol> {
+fn extract_function(
+    node: Node,
+    source: &[u8],
+    inside_class: bool,
+    owner: Option<&str>,
+) -> Option<ExtractedSymbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     if name.is_empty() {
@@ -308,7 +342,11 @@ fn extract_function(node: Node, source: &[u8], inside_class: bool) -> Option<Ext
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
-        owner_type: None,
+        // Only methods carry an owner. `owner` is None for free functions and
+        // for methods of a class whose name could not be extracted, so we never
+        // stamp an empty owner_type (which would mis-fire the same-class
+        // reference heuristic).
+        owner_type: owner.map(str::to_string),
     })
 }
 
@@ -335,6 +373,7 @@ fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
 fn extract_class_methods(
     class_node: Node,
     source: &[u8],
+    owner: Option<&str>,
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
@@ -344,7 +383,9 @@ fn extract_class_methods(
         None => return,
     };
     for child in children(body) {
-        extract_from_node(child, source, true, None, symbols, imports, references);
+        extract_from_node(
+            child, source, true, None, owner, symbols, imports, references,
+        );
     }
 }
 
@@ -352,6 +393,7 @@ fn extract_decorated(
     node: Node,
     source: &[u8],
     inside_class: bool,
+    owner: Option<&str>,
     symbols: &mut Vec<ExtractedSymbol>,
     imports: &mut Vec<ExtractedImport>,
     references: &mut Vec<ExtractedReference>,
@@ -359,17 +401,20 @@ fn extract_decorated(
     for child in children(node) {
         match child.kind() {
             "function_definition" => {
-                if let Some(mut sym) = extract_function(child, source, inside_class) {
+                if let Some(mut sym) = extract_function(child, source, inside_class, owner) {
                     sym.line_start = node.start_position().row as u32 + 1;
                     let idx = symbols.len();
                     symbols.push(sym);
                     if let Some(body) = child.child_by_field_name("body") {
                         for grand in children(body) {
+                            // Local defs inside the decorated function body are
+                            // not methods, so the owner stops here.
                             extract_from_node(
                                 grand,
                                 source,
                                 inside_class,
                                 Some(idx),
+                                None,
                                 symbols,
                                 imports,
                                 references,
@@ -379,14 +424,34 @@ fn extract_decorated(
                 }
             }
             "class_definition" => {
-                if let Some(mut sym) = extract_class(child, source) {
+                // Capture the class name (when extractable) so its methods get
+                // a real owner_type; an unnamed class yields None, never
+                // Some("").
+                let class_name = extract_class(child, source).map(|mut sym| {
                     sym.line_start = node.start_position().row as u32 + 1;
+                    let name = sym.name.clone();
                     symbols.push(sym);
-                }
-                extract_class_methods(child, source, symbols, imports, references);
+                    name
+                });
+                extract_class_methods(
+                    child,
+                    source,
+                    class_name.as_deref(),
+                    symbols,
+                    imports,
+                    references,
+                );
             }
             "decorated_definition" => {
-                extract_decorated(child, source, inside_class, symbols, imports, references);
+                extract_decorated(
+                    child,
+                    source,
+                    inside_class,
+                    owner,
+                    symbols,
+                    imports,
+                    references,
+                );
             }
             _ => {}
         }
@@ -708,6 +773,71 @@ class _InternalHelper:
             .collect();
         assert_eq!(methods.len(), 2);
         assert!(methods.iter().all(|m| m.is_exported));
+    }
+
+    #[test]
+    fn test_method_owner_type_is_enclosing_class() {
+        let result = parse_python("class Foo:\n    def bar(self):\n        return 1\n");
+        let bar = result.symbols.iter().find(|s| s.name == "bar").unwrap();
+        assert_eq!(bar.owner_type.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn test_free_function_has_no_owner_type() {
+        let result = parse_python("def standalone():\n    return 1\n");
+        let f = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "standalone")
+            .unwrap();
+        assert_eq!(f.owner_type, None);
+    }
+
+    #[test]
+    fn test_decorated_method_carries_owner_type() {
+        let result = parse_python(
+            "class Svc:\n    @property\n    def name(self):\n        return self._name\n",
+        );
+        let name = result.symbols.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name.owner_type.as_deref(), Some("Svc"));
+    }
+
+    #[test]
+    fn test_local_function_in_method_has_no_owner_type() {
+        // A nested helper defined inside a method is not itself a method of the
+        // class, so the owner must stop at the function boundary.
+        let result = parse_python(
+            "class Foo:\n    def bar(self):\n        def helper():\n            return 2\n        return helper\n",
+        );
+        let helper = result.symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert_eq!(helper.owner_type, None);
+        let bar = result.symbols.iter().find(|s| s.name == "bar").unwrap();
+        assert_eq!(bar.owner_type.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn test_nested_class_method_owner_is_inner_class() {
+        // A method of an inner class belongs to the inner class, not the outer.
+        let result = parse_python(
+            "class Outer:\n    class Inner:\n        def m(self):\n            return 1\n",
+        );
+        let m = result.symbols.iter().find(|s| s.name == "m").unwrap();
+        assert_eq!(m.owner_type.as_deref(), Some("Inner"));
+    }
+
+    #[test]
+    fn test_method_in_conditional_block_keeps_class_owner() {
+        // A method guarded by `if ...:` inside the class body is still owned by
+        // the class - owner propagates through non-function block nodes.
+        let result = parse_python(
+            "class Foo:\n    if True:\n        def cond_method(self):\n            return 1\n",
+        );
+        let m = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "cond_method")
+            .unwrap();
+        assert_eq!(m.owner_type.as_deref(), Some("Foo"));
     }
 
     #[test]

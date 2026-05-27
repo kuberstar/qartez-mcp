@@ -53,6 +53,7 @@ impl QartezServer {
         };
         let concise = matches!(params.format, Some(Format::Concise));
         let level = params.level.unwrap_or(KnowledgeLevel::File);
+        let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
 
         let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
 
@@ -139,18 +140,23 @@ impl QartezServer {
 
                 if concise {
                     let mut out = String::from("# bus_factor lines authors file\n");
-                    for (i, f) in files.iter().enumerate() {
-                        let author_list: Vec<&str> =
-                            f.authors.iter().map(|(n, _)| n.as_str()).collect();
-                        out.push_str(&format!(
-                            "{} {} {} {} {}\n",
-                            i + 1,
-                            f.bus_factor,
-                            f.total_lines,
-                            author_list.join(";"),
-                            f.path,
-                        ));
-                    }
+                    let rows: Vec<String> = files
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let author_list: Vec<&str> =
+                                f.authors.iter().map(|(n, _)| n.as_str()).collect();
+                            format!(
+                                "{} {} {} {} {}\n",
+                                i + 1,
+                                f.bus_factor,
+                                f.total_lines,
+                                author_list.join(";"),
+                                f.path,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                     Ok(out)
                 } else {
                     let total_scanned = file_paths.len();
@@ -169,24 +175,32 @@ impl QartezServer {
                     out.push_str(
                         "----+----+-------+------------------------------------+------------\n",
                     );
-                    for (i, f) in files.iter().enumerate() {
-                        let top: Vec<String> = f
-                            .authors
-                            .iter()
-                            .take(3)
-                            .map(|(name, lines)| {
-                                format!("{name} ({})", format_contrib_pct(*lines, f.total_lines))
-                            })
-                            .collect();
-                        out.push_str(&format!(
-                            "{:>3} | {:>2} | {:>5} | {:<34} | {}\n",
-                            i + 1,
-                            f.bus_factor,
-                            f.total_lines,
-                            truncate_path(&f.path, 34),
-                            top.join(", "),
-                        ));
-                    }
+                    let rows: Vec<String> = files
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let top: Vec<String> = f
+                                .authors
+                                .iter()
+                                .take(3)
+                                .map(|(name, lines)| {
+                                    format!(
+                                        "{name} ({})",
+                                        format_contrib_pct(*lines, f.total_lines)
+                                    )
+                                })
+                                .collect();
+                            format!(
+                                "{:>3} | {:>2} | {:>5} | {:<34} | {}\n",
+                                i + 1,
+                                f.bus_factor,
+                                f.total_lines,
+                                truncate_path(&f.path, 34),
+                                top.join(", "),
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                     Ok(out)
                 }
             }
@@ -203,17 +217,22 @@ impl QartezServer {
                 if concise {
                     let mut out =
                         String::from("# bus_factor files single_author_files lines module\n");
-                    for (i, m) in modules.iter().enumerate() {
-                        out.push_str(&format!(
-                            "{} {} {} {} {} {}\n",
-                            i + 1,
-                            m.bus_factor,
-                            m.file_count,
-                            m.single_author_files,
-                            m.total_lines,
-                            m.module,
-                        ));
-                    }
+                    let rows: Vec<String> = modules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            format!(
+                                "{} {} {} {} {} {}\n",
+                                i + 1,
+                                m.bus_factor,
+                                m.file_count,
+                                m.single_author_files,
+                                m.total_lines,
+                                m.module,
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                     Ok(out)
                 } else {
                     let mut out = String::from(
@@ -222,26 +241,34 @@ impl QartezServer {
                     );
                     out.push_str("  # | BF | Files | Solo | Lines | Module                          | Top Authors\n");
                     out.push_str("----+----+-------+------+-------+---------------------------------+------------\n");
-                    for (i, m) in modules.iter().enumerate() {
-                        let top: Vec<String> = m
-                            .top_authors
-                            .iter()
-                            .take(3)
-                            .map(|(name, lines)| {
-                                format!("{name} ({})", format_contrib_pct(*lines, m.total_lines))
-                            })
-                            .collect();
-                        out.push_str(&format!(
-                            "{:>3} | {:>2} | {:>5} | {:>4} | {:>5} | {:<31} | {}\n",
-                            i + 1,
-                            m.bus_factor,
-                            m.file_count,
-                            m.single_author_files,
-                            m.total_lines,
-                            truncate_path(&m.module, 31),
-                            top.join(", "),
-                        ));
-                    }
+                    let rows: Vec<String> = modules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            let top: Vec<String> = m
+                                .top_authors
+                                .iter()
+                                .take(3)
+                                .map(|(name, lines)| {
+                                    format!(
+                                        "{name} ({})",
+                                        format_contrib_pct(*lines, m.total_lines)
+                                    )
+                                })
+                                .collect();
+                            format!(
+                                "{:>3} | {:>2} | {:>5} | {:>4} | {:>5} | {:<31} | {}\n",
+                                i + 1,
+                                m.bus_factor,
+                                m.file_count,
+                                m.single_author_files,
+                                m.total_lines,
+                                truncate_path(&m.module, 31),
+                                top.join(", "),
+                            )
+                        })
+                        .collect();
+                    budget_render(&mut out, &rows, token_budget);
                     Ok(out)
                 }
             }

@@ -11,7 +11,7 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 
 ## Tool tiers
 
-Qartez organizes its 39 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
+Qartez organizes its 42 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
 
 ### Core (always available)
 
@@ -41,6 +41,7 @@ Deep investigation for debugging, review, and architecture:
 - `qartez_boundaries` - architecture boundary rule violations
 - `qartez_hierarchy` - type/trait inheritance hierarchy
 - `qartez_trend` - symbol complexity trend over git history
+- `qartez_blame` - symbol-scoped git blame (line authorship; hunk + aggregate modes; requires git_depth > 0)
 - `qartez_security` - scan for OWASP-style vulnerabilities and insecure patterns
 - `qartez_semantic` - semantic code search via embedding similarity (requires `semantic` feature)
 
@@ -83,12 +84,13 @@ Before editing a file that is central to the codebase, ALWAYS call `qartez_impac
 
 ## Prompts
 
-Five workflow prompts orchestrate multiple tools in sequence:
+Six workflow prompts orchestrate multiple tools in sequence:
 - `/qartez_review <file>` - code review with blast radius and co-change analysis
 - `/qartez_architecture [top_n]` - one-minute architecture overview via PageRank
 - `/qartez_debug <symbol>` - definition + body + call hierarchy + references
 - `/qartez_onboard [area]` - five-file reading list for new contributors
 - `/qartez_pre_merge <files>` - pre-merge safety check across changed files
+- `/qartez_arch_review [focus]` - architecture risk audit: fragile hubs, tangled boundaries, security surface, complexity debt
 
 ## Resources
 

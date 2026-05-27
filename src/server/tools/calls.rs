@@ -600,6 +600,22 @@ impl QartezServer {
             }
         }
 
+        // Rank call sites by their enclosing file's PageRank (descending) so
+        // that when `limit` or `token_budget` truncates the list, the call
+        // sites in the most important files survive the cut. `all_files`
+        // already carries each file's PageRank, so this is an in-memory sort
+        // with no extra query. The sort is stable, so several call sites in
+        // one file keep their original discovery order.
+        let file_rank: std::collections::HashMap<&str, f64> = all_files
+            .iter()
+            .map(|f| (f.path.as_str(), f.pagerank))
+            .collect();
+        sites.sort_by(|a, b| {
+            let ra = file_rank.get(a.0.as_str()).copied().unwrap_or(0.0);
+            let rb = file_rank.get(b.0.as_str()).copied().unwrap_or(0.0);
+            rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         if sites.is_empty() {
             out.push_str("callers: none\n");
         } else {
