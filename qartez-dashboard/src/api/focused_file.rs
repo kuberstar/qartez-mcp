@@ -20,6 +20,7 @@ use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::column_exists;
 use crate::state::AppState;
 
 /// Maximum symbols returned for a single file. Bounds payload size on
@@ -233,18 +234,6 @@ fn load_symbols(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<FocusedSy
         out.push(row?);
     }
     Ok(out)
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn load_dependents(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<Dependent>> {

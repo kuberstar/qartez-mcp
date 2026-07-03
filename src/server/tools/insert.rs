@@ -9,7 +9,9 @@ use rmcp::{RoleServer, tool, tool_router};
 
 use super::super::QartezServer;
 use super::super::params::*;
-use super::refactor_common::{join_lines_with_trailing, resolve_unique_symbol, write_atomic};
+use super::refactor_common::{
+    content_uses_crlf, join_lines_with_trailing, resolve_unique_symbol, write_atomic,
+};
 
 /// Direction of the insert relative to the anchor symbol.
 enum InsertPos {
@@ -175,14 +177,22 @@ impl QartezServer {
         }
 
         let preserve_trailing_newline = content.ends_with('\n');
-        let new_code_lines: Vec<&str> = new_code_trimmed.split('\n').collect();
+        // Preserve the file's EOL convention: the anchor lines come from
+        // `content.lines()` (which strips `\r`), so a CRLF file must be
+        // rejoined with `\r\n`. Strip a trailing `\r` from each inserted
+        // line too so pasted CRLF text does not leave `\r\r\n` at the seam.
+        let use_crlf = content_uses_crlf(&content);
+        let new_code_lines: Vec<&str> = new_code_trimmed
+            .split('\n')
+            .map(|l| l.trim_end_matches('\r'))
+            .collect();
 
         let mut rewritten: Vec<&str> = Vec::with_capacity(lines.len() + new_code_lines.len());
         rewritten.extend_from_slice(&lines[..insert_idx]);
         rewritten.extend(new_code_lines.iter().copied());
         rewritten.extend_from_slice(&lines[insert_idx..]);
 
-        let new_content = join_lines_with_trailing(&rewritten, preserve_trailing_newline);
+        let new_content = join_lines_with_trailing(&rewritten, preserve_trailing_newline, use_crlf);
         if new_content == content {
             return Ok(format!(
                 "No changes: insert at L{} produced identical file.",

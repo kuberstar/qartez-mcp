@@ -176,13 +176,81 @@ pub(super) fn write_atomic(abs_path: &std::path::Path, new_content: &str) -> Res
     Ok(())
 }
 
-/// Join `lines` with `\n` and append a trailing `\n` when `preserve_trailing`
-/// is true. `str::lines` strips the last `\n`, so a naive `join` corrupts
-/// POSIX files - every caller here must go through this helper.
-pub(super) fn join_lines_with_trailing(lines: &[&str], preserve_trailing: bool) -> String {
-    let mut out = lines.join("\n");
+/// Join `lines` with the source file's line-ending convention and append a
+/// trailing terminator when `preserve_trailing` is true.
+///
+/// `str::lines` splits on `\n` AND strips a preceding `\r`, so both the
+/// separator and the final `\n` are lost by a naive `join`. When the
+/// original file used CRLF (`use_crlf` true, detected via
+/// `content.contains("\r\n")`) the lines are rejoined with `\r\n` and a
+/// trailing `\r\n` is appended, so a single-symbol edit no longer silently
+/// rewrites an entire CRLF file to LF. POSIX (LF) files keep their `\n`
+/// separators exactly as before. A no-op edit reproduces the original
+/// bytes.
+pub(super) fn join_lines_with_trailing(
+    lines: &[&str],
+    preserve_trailing: bool,
+    use_crlf: bool,
+) -> String {
+    let sep = if use_crlf { "\r\n" } else { "\n" };
+    let mut out = lines.join(sep);
     if preserve_trailing && !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+        out.push_str(sep);
     }
     out
+}
+
+/// Return true when `content` uses CRLF (`\r\n`) line endings. Used by the
+/// refactor tools to decide which terminator `join_lines_with_trailing`
+/// should re-emit so a single-symbol edit preserves the file's existing
+/// EOL convention instead of flipping CRLF to LF.
+pub(super) fn content_uses_crlf(content: &str) -> bool {
+    content.contains("\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_uses_crlf, join_lines_with_trailing};
+
+    // Simulate the split (via `str::lines`) + join round-trip the refactor
+    // tools perform, and assert a CRLF file survives byte-for-byte instead
+    // of being silently rewritten to LF.
+    fn round_trip(content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let preserve_trailing = content.ends_with('\n');
+        let use_crlf = content_uses_crlf(content);
+        join_lines_with_trailing(&lines, preserve_trailing, use_crlf)
+    }
+
+    #[test]
+    fn crlf_file_round_trips_byte_for_byte() {
+        let content = "line one\r\nline two\r\nline three\r\n";
+        assert!(content_uses_crlf(content));
+        let out = round_trip(content);
+        assert_eq!(out, content);
+        // Untouched lines keep their `\r\n` terminators.
+        assert!(out.contains("line one\r\nline two\r\n"));
+    }
+
+    #[test]
+    fn crlf_file_without_trailing_newline_round_trips() {
+        let content = "alpha\r\nbeta\r\ngamma";
+        assert!(content_uses_crlf(content));
+        assert_eq!(round_trip(content), content);
+    }
+
+    #[test]
+    fn lf_file_round_trips_unchanged() {
+        let content = "a\nb\nc\n";
+        assert!(!content_uses_crlf(content));
+        let out = round_trip(content);
+        assert_eq!(out, content);
+        assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn join_appends_crlf_terminator_when_preserving() {
+        let out = join_lines_with_trailing(&["x", "y"], true, true);
+        assert_eq!(out, "x\r\ny\r\n");
+    }
 }

@@ -21,7 +21,11 @@ use crate::state::AppState;
 use crate::ws;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Routes carrying code-intelligence data or side effects. The session
+    // middleware gates all of them: a valid `qartez_session` cookie is
+    // required, so the 0600 token cannot be bypassed by another local
+    // process spoofing the `Origin` header.
+    let protected = Router::new()
         .route("/api/health", get(api::health::handler))
         .route("/api/project", get(api::project::handler))
         .route("/api/focused-file", get(api::focused_file::handler))
@@ -38,8 +42,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/project-health", get(api::project_health::handler))
         .route("/api/shutdown", post(api::shutdown::handler))
         .route("/api/reindex", post(api::reindex::handler))
-        .route("/auth", get(auth_handshake))
         .route("/ws", get(ws::handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session_cookie,
+        ));
+
+    // `/auth` (the token handshake that mints the cookie) and the static
+    // fallback (the SPA shell + assets, which must load before the browser
+    // holds a cookie) stay ungated. The loopback-origin layer wraps
+    // everything and runs BEFORE the session check on protected routes.
+    protected
+        .route("/auth", get(auth_handshake))
         .fallback(get(crate::embed::static_handler))
         .layer(middleware::from_fn(auth::require_loopback_origin))
         .layer(TraceLayer::new_for_http())
@@ -56,7 +70,7 @@ async fn auth_handshake(
     jar: CookieJar,
     Query(query): Query<AuthQuery>,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
-    if !constant_time_eq(query.token.as_bytes(), state.auth_token().as_bytes()) {
+    if !auth::constant_time_eq(query.token.as_bytes(), state.auth_token().as_bytes()) {
         return Err(StatusCode::FORBIDDEN);
     }
     let cookie = Cookie::build((auth::SESSION_COOKIE, state.auth_token().to_string()))
@@ -66,17 +80,6 @@ async fn auth_handshake(
         .path("/")
         .build();
     Ok((jar.add(cookie), Redirect::to("/")))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Bind to `127.0.0.1:<port>` and return the listener. When `port` is `None`

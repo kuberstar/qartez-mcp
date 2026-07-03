@@ -88,6 +88,22 @@ fn extract_document(
         return;
     }
 
+    // Helm chart metadata (`Chart.yaml`): local `dependencies` become edges to
+    // vendored subcharts. Detected before the Kubernetes branch because a chart
+    // file carries no `kind`.
+    if looks_like_helm_chart(mapping, &top_keys, source) {
+        extract_helm_chart_deps(mapping, doc, source, symbols, imports);
+        return;
+    }
+
+    // Kustomize overlays/bases (`kustomization.yaml`, components): the backbone
+    // of a GitOps dependency graph. `kind: Kustomization`/`Component`, or a
+    // kind-less document carrying kustomize-only keys (`resources`, `bases`, ...).
+    if looks_like_kustomization(mapping, &top_keys, source) {
+        extract_kustomization(mapping, doc, source, symbols, imports);
+        return;
+    }
+
     // Kubernetes manifests: has `kind` and `metadata`
     let kind_val = find_scalar_value_in_mapping(mapping, "kind", source);
     let name_val = find_metadata_name(mapping, source);
@@ -111,6 +127,11 @@ fn extract_document(
         extract_configmap_secret_refs(mapping, source, symbols);
         if kind == "Service" {
             extract_service_selectors(mapping, source, symbols);
+        }
+        // ArgoCD App-of-Apps: an Application/ApplicationSet points at the
+        // directory that holds the real manifests via `spec.source.path`.
+        if kind == "Application" || kind == "ApplicationSet" {
+            extract_argocd_sources(mapping, source, imports);
         }
     } else {
         // Generic YAML: extract top-level keys
@@ -762,6 +783,245 @@ fn extract_service_selectors(
 // YAML tree-sitter helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Kustomize / Helm / ArgoCD (infra dependency edges)
+// ---------------------------------------------------------------------------
+
+/// Whether `raw` is a remote reference (git/http/oci or a bare host path) that
+/// has no local file to link, as opposed to a repo-relative path.
+fn is_remote_ref(raw: &str) -> bool {
+    let v = raw.trim();
+    v.contains("://")
+        || v.starts_with("git@")
+        || v.contains("?ref=")
+        || v.starts_with("github.com")
+        || v.starts_with("gitlab.com")
+        || v.starts_with("bitbucket.org")
+}
+
+/// Record a local path reference as an import edge, skipping empties and remote
+/// references. Path resolution (bare siblings, `dir → kustomization.yaml`,
+/// terraform module dirs) happens later in the index resolver.
+fn push_local_import(raw: &str, imports: &mut Vec<ExtractedImport>) {
+    let val = raw.trim();
+    if val.is_empty() || val == "." || is_remote_ref(val) {
+        return;
+    }
+    imports.push(ExtractedImport {
+        source: val.to_string(),
+        specifiers: Vec::new(),
+        is_reexport: false,
+    });
+}
+
+/// Kustomize keys distinctive enough that their mere presence identifies a
+/// kustomization, even without a `kind`. Deliberately excludes `resources`,
+/// which a Helm `values.yaml` also uses (as a mapping) for container
+/// requests/limits.
+const KUSTOMIZE_DISTINCTIVE_KEYS: &[&str] = &[
+    "bases",
+    "components",
+    "crds",
+    "configurations",
+    "patchesStrategicMerge",
+    "patchesJson6902",
+    "configMapGenerator",
+    "secretGenerator",
+    "helmCharts",
+    "generators",
+    "transformers",
+];
+
+/// Whether `key`'s value in `mapping` is a YAML sequence (list), as opposed to a
+/// mapping or scalar. Used to tell a Kustomize `resources:` (a list of paths)
+/// apart from a Helm values `resources:` (a requests/limits mapping).
+fn key_value_is_sequence(mapping: Node, key: &str, source: &[u8]) -> bool {
+    find_value_node(mapping, key, source)
+        .is_some_and(|value| iter_sequence_items(value).next().is_some())
+}
+
+fn looks_like_kustomization(mapping: Node, top_keys: &[String], source: &[u8]) -> bool {
+    match find_scalar_value_in_mapping(mapping, "kind", source).as_deref() {
+        Some("Kustomization") | Some("Component") => true,
+        // Any other explicit `kind` is a regular manifest, not a kustomization.
+        Some(_) => false,
+        // Kind-less: a distinctive kustomize key, or `resources`/`bases`/
+        // `components` present as an actual path sequence.
+        None => {
+            KUSTOMIZE_DISTINCTIVE_KEYS
+                .iter()
+                .any(|k| keys_contain(top_keys, k))
+                || key_value_is_sequence(mapping, "resources", source)
+                || key_value_is_sequence(mapping, "bases", source)
+                || key_value_is_sequence(mapping, "components", source)
+        }
+    }
+}
+
+fn looks_like_helm_chart(mapping: Node, top_keys: &[String], source: &[u8]) -> bool {
+    keys_contain(top_keys, "dependencies")
+        && keys_contain(top_keys, "name")
+        && (keys_contain(top_keys, "version") || keys_contain(top_keys, "apiVersion"))
+        && find_scalar_value_in_mapping(mapping, "kind", source).is_none()
+}
+
+/// Emit one symbol for the kustomization plus an import edge for every local
+/// path it references (resources, bases, components, patches, generator files,
+/// helm values files).
+fn extract_kustomization(
+    doc_mapping: Node,
+    doc: Node,
+    source: &[u8],
+    symbols: &mut Vec<ExtractedSymbol>,
+    imports: &mut Vec<ExtractedImport>,
+) {
+    symbols.push(ExtractedSymbol {
+        name: "Kustomization".to_string(),
+        kind: SymbolKind::Module,
+        line_start: doc.start_position().row as u32 + 1,
+        line_end: doc.end_position().row as u32 + 1,
+        signature: Some("kustomization".to_string()),
+        is_exported: true,
+        parent_idx: None,
+        unused_excluded: false,
+        complexity: None,
+        owner_type: None,
+    });
+
+    // Plain path sequences: each item is a file or directory reference.
+    for key in [
+        "resources",
+        "bases",
+        "components",
+        "crds",
+        "configurations",
+        "patchesStrategicMerge",
+    ] {
+        if let Some(seq) = find_value_node(doc_mapping, key, source) {
+            collect_sequence_values(seq, source, |val, _| push_local_import(&val, imports));
+        }
+    }
+
+    // Structured patch lists: each item is a mapping with a `path`.
+    for key in ["patches", "patchesJson6902"] {
+        if let Some(seq) = find_value_node(doc_mapping, key, source) {
+            for item in iter_sequence_items(seq) {
+                if let Some(m) = find_block_mapping_recursive(item)
+                    && let Some(path) = find_scalar_value_in_mapping(m, "path", source)
+                {
+                    push_local_import(&path, imports);
+                }
+            }
+        }
+    }
+
+    // Generators: `files:`/`envs:` entries may be `path` or `key=path`.
+    for key in ["configMapGenerator", "secretGenerator"] {
+        if let Some(seq) = find_value_node(doc_mapping, key, source) {
+            for item in iter_sequence_items(seq) {
+                let Some(m) = find_block_mapping_recursive(item) else {
+                    continue;
+                };
+                for field in ["files", "envs"] {
+                    if let Some(fseq) = find_value_node(m, field, source) {
+                        collect_sequence_values(fseq, source, |val, _| {
+                            let path = val.rsplit('=').next().unwrap_or(&val);
+                            push_local_import(path, imports);
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Inflated Helm charts: a local values override file.
+    if let Some(seq) = find_value_node(doc_mapping, "helmCharts", source) {
+        for item in iter_sequence_items(seq) {
+            if let Some(m) = find_block_mapping_recursive(item)
+                && let Some(vf) = find_scalar_value_in_mapping(m, "valuesFile", source)
+            {
+                push_local_import(&vf, imports);
+            }
+        }
+    }
+}
+
+/// Emit an import edge for each local Helm chart dependency: a `file://` path or
+/// a vendored `charts/<name>` subchart.
+fn extract_helm_chart_deps(
+    doc_mapping: Node,
+    doc: Node,
+    source: &[u8],
+    symbols: &mut Vec<ExtractedSymbol>,
+    imports: &mut Vec<ExtractedImport>,
+) {
+    if let Some(name) = find_scalar_value_in_mapping(doc_mapping, "name", source) {
+        symbols.push(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Module,
+            line_start: doc.start_position().row as u32 + 1,
+            line_end: doc.end_position().row as u32 + 1,
+            signature: Some("helm chart".to_string()),
+            is_exported: true,
+            parent_idx: None,
+            unused_excluded: false,
+            complexity: None,
+            owner_type: None,
+        });
+    }
+
+    let Some(deps) = find_value_node(doc_mapping, "dependencies", source) else {
+        return;
+    };
+    for item in iter_sequence_items(deps) {
+        let Some(m) = find_block_mapping_recursive(item) else {
+            continue;
+        };
+        if let Some(repo) = find_scalar_value_in_mapping(m, "repository", source)
+            && let Some(local) = repo.strip_prefix("file://")
+        {
+            push_local_import(local, imports);
+        }
+        if let Some(name) = find_scalar_value_in_mapping(m, "name", source) {
+            // Convention: a vendored subchart lives under `charts/<name>`.
+            push_local_import(&format!("charts/{name}"), imports);
+        }
+    }
+}
+
+/// Emit an import edge for each `spec.source.path` an ArgoCD Application (or the
+/// `spec.template.spec` of an ApplicationSet) points at. Paths are repo-root
+/// relative, which the resolver handles.
+fn extract_argocd_sources(doc_mapping: Node, source: &[u8], imports: &mut Vec<ExtractedImport>) {
+    let mut spec_nodes: Vec<Node> = Vec::new();
+    if let Some(spec) = find_value_mapping(doc_mapping, "spec", source) {
+        spec_nodes.push(spec);
+        // ApplicationSet nests the real source under spec.template.spec.
+        if let Some(template) = find_value_mapping(spec, "template", source)
+            && let Some(tmpl_spec) = find_value_mapping(template, "spec", source)
+        {
+            spec_nodes.push(tmpl_spec);
+        }
+    }
+
+    for spec in spec_nodes {
+        if let Some(src) = find_value_mapping(spec, "source", source)
+            && let Some(path) = find_scalar_value_in_mapping(src, "path", source)
+        {
+            push_local_import(&path, imports);
+        }
+        if let Some(seq) = find_value_node(spec, "sources", source) {
+            for item in iter_sequence_items(seq) {
+                if let Some(m) = find_block_mapping_recursive(item)
+                    && let Some(path) = find_scalar_value_in_mapping(m, "path", source)
+                {
+                    push_local_import(&path, imports);
+                }
+            }
+        }
+    }
+}
+
 fn collect_top_keys(mapping: Node, source: &[u8]) -> Vec<String> {
     iter_mapping_pairs(mapping)
         .filter_map(|pair| pair_key_text(pair, source))
@@ -1324,5 +1584,223 @@ handlers:
             .filter(|s| matches!(s.kind, SymbolKind::Task))
             .collect();
         assert_eq!(tasks.len(), 3);
+    }
+
+    // --- Kustomize / Helm / ArgoCD tests ---
+
+    fn import_sources(result: &ParseResult) -> Vec<&str> {
+        result.imports.iter().map(|i| i.source.as_str()).collect()
+    }
+
+    #[test]
+    fn test_kustomization_resources_and_patches() {
+        let result = parse_yaml(
+            r#"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - deployment.yaml
+  - service.yaml
+components:
+  - ../../components/monitoring
+patchesStrategicMerge:
+  - patch-replicas.yaml
+patches:
+  - path: patch-env.yaml
+    target:
+      kind: Deployment
+configMapGenerator:
+  - name: app-config
+    files:
+      - config.properties
+      - key.txt=secret.txt
+"#,
+        );
+        let imports = import_sources(&result);
+        for expected in [
+            "../../base",
+            "deployment.yaml",
+            "service.yaml",
+            "../../components/monitoring",
+            "patch-replicas.yaml",
+            "patch-env.yaml",
+            "config.properties",
+            "secret.txt",
+        ] {
+            assert!(
+                imports.contains(&expected),
+                "kustomization import {expected} missing from {imports:?}"
+            );
+        }
+        assert!(result.symbols.iter().any(|s| s.name == "Kustomization"));
+    }
+
+    #[test]
+    fn test_kindless_kustomization_detected() {
+        // A kustomization.yaml need not carry `kind:`.
+        let result = parse_yaml(
+            r#"
+resources:
+  - namespace.yaml
+  - ../base
+"#,
+        );
+        let imports = import_sources(&result);
+        assert!(imports.contains(&"namespace.yaml"));
+        assert!(imports.contains(&"../base"));
+    }
+
+    #[test]
+    fn test_kustomization_skips_remote_resources() {
+        let result = parse_yaml(
+            r#"
+kind: Kustomization
+resources:
+  - github.com/org/repo/overlays/prod?ref=v1.2.3
+  - https://example.com/manifest.yaml
+  - local.yaml
+"#,
+        );
+        let imports = import_sources(&result);
+        assert_eq!(imports, vec!["local.yaml"]);
+    }
+
+    #[test]
+    fn test_argocd_application_source_path() {
+        let result = parse_yaml(
+            r#"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+spec:
+  source:
+    repoURL: https://example.com/repo.git
+    path: k8s-apps/prod/my-app
+    targetRevision: main
+"#,
+        );
+        let imports = import_sources(&result);
+        assert!(imports.contains(&"k8s-apps/prod/my-app"));
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|s| s.name == "Application/my-app")
+        );
+    }
+
+    #[test]
+    fn test_argocd_applicationset_template_path_and_multi_sources() {
+        let result = parse_yaml(
+            r#"
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-set
+spec:
+  template:
+    spec:
+      sources:
+        - repoURL: https://example.com/repo.git
+          path: k8s-apps/dev/svc-a
+        - repoURL: https://example.com/repo.git
+          path: k8s-apps/dev/svc-b
+"#,
+        );
+        let imports = import_sources(&result);
+        assert!(imports.contains(&"k8s-apps/dev/svc-a"));
+        assert!(imports.contains(&"k8s-apps/dev/svc-b"));
+    }
+
+    #[test]
+    fn test_helm_chart_dependencies() {
+        let result = parse_yaml(
+            r#"
+apiVersion: v2
+name: my-wrapper
+version: 0.1.0
+dependencies:
+  - name: common
+    version: 1.0.0
+    repository: file://../common
+  - name: redis
+    version: 17.0.0
+    repository: https://charts.bitnami.com/bitnami
+"#,
+        );
+        let imports = import_sources(&result);
+        // Local file:// dependency resolves to its path.
+        assert!(imports.contains(&"../common"));
+        // Vendored subchart convention for each dep name.
+        assert!(imports.contains(&"charts/common"));
+        assert!(imports.contains(&"charts/redis"));
+        // Remote https repository is not a local edge.
+        assert!(!imports.iter().any(|i| i.contains("bitnami.com")));
+        assert!(result.symbols.iter().any(|s| s.name == "my-wrapper"));
+    }
+
+    #[test]
+    fn test_helm_values_with_resources_map_not_kustomization() {
+        // A Helm values.yaml commonly has a top-level `resources:` MAPPING
+        // (container requests/limits). It must NOT be mistaken for a Kustomize
+        // file, whose `resources:` is a SEQUENCE of paths.
+        let result = parse_yaml(
+            r#"
+image:
+  repository: nginx
+  tag: "1.25"
+replicaCount: 2
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+"#,
+        );
+        assert!(
+            result.imports.is_empty(),
+            "values.yaml must not emit import edges, got {:?}",
+            result.imports
+        );
+        assert!(
+            !result.symbols.iter().any(|s| s.name == "Kustomization"),
+            "values.yaml must not be classified as a Kustomization"
+        );
+    }
+
+    #[test]
+    fn test_empty_resources_sequence_not_kustomization_symbol_still_safe() {
+        // `resources: []` (empty) should not crash and produces no edges.
+        let result = parse_yaml("resources: []\n");
+        assert!(result.imports.is_empty());
+    }
+
+    #[test]
+    fn test_plain_manifest_not_treated_as_kustomize() {
+        // A ClusterRole has nested `resources:` but a real `kind` - must stay a
+        // Kubernetes manifest, not a kustomization.
+        let result = parse_yaml(
+            r#"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list"]
+"#,
+        );
+        assert!(result.imports.is_empty());
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|s| s.name == "ClusterRole/reader")
+        );
     }
 }

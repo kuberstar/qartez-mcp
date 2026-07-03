@@ -523,6 +523,7 @@ impl QartezServer {
                 "qartez_safe_delete"          => qartez_safe_delete:          SoulSafeDeleteParams,
                 "qartez_maintenance"          => qartez_maintenance:          SoulMaintenanceParams,
                 "qartez_understand"           => qartez_understand:           SoulUnderstandParams,
+                "qartez_path"                 => qartez_path:                 crate::server::tools::path::SoulPathParams,
             }
         )
     }
@@ -747,16 +748,16 @@ mod progressive_tests {
     }
 
     #[test]
-    fn total_tool_count_is_42() {
+    fn total_tool_count_is_43() {
         let server = test_server();
         let all = server.tool_router.list_all();
-        assert_eq!(all.len(), 42, "expected 42 tools, got {}", all.len());
+        assert_eq!(all.len(), 43, "expected 43 tools, got {}", all.len());
     }
 
     #[test]
     fn tier_sizes_are_correct() {
         assert_eq!(tiers::TIER_CORE.len(), 8, "core tier");
-        assert_eq!(tiers::TIER_ANALYSIS.len(), 20, "analysis tier");
+        assert_eq!(tiers::TIER_ANALYSIS.len(), 21, "analysis tier");
         assert_eq!(tiers::TIER_REFACTOR.len(), 7, "refactor tier");
         assert_eq!(tiers::TIER_META.len(), 6, "meta tier");
     }

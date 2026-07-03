@@ -27,6 +27,7 @@ mod maintenance;
 mod map;
 mod mv;
 mod outline;
+pub(in crate::server) mod path;
 mod project;
 mod read;
 mod refactor_common;
@@ -92,5 +93,6 @@ impl QartezServer {
             + Self::qartez_safe_delete_router()
             + Self::qartez_maintenance_router()
             + Self::qartez_understand_router()
+            + Self::qartez_path_router()
     }
 }

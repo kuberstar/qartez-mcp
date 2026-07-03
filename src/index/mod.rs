@@ -46,10 +46,47 @@ fn max_file_bytes() -> u64 {
         .unwrap_or(1_000_000) // 1 MB default
 }
 
+/// Summary of what a (re)index pass changed on disk.
+///
+/// Returned by [`full_index`], [`full_index_root`], and [`full_index_multi`]
+/// so callers can decide whether the expensive global derived tables
+/// (PageRank, symbol PageRank, co-change) need recomputing. A pass that
+/// touched no files leaves every count at zero, which lets the MCP-server
+/// startup path keep running the cheap reconciliation walk on every start
+/// while skipping the heavy recompute when nothing actually changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexOutcome {
+    /// Files parsed and written because they were new or had a changed mtime.
+    pub updated: usize,
+    /// Files removed from the index because they no longer exist on disk.
+    pub deleted: usize,
+}
+
+impl IndexOutcome {
+    /// Returns `true` when the pass altered the indexed file set in any way.
+    ///
+    /// Drives the recompute decision: a pass that neither updated nor deleted
+    /// any file cannot have invalidated PageRank or co-change, so those global
+    /// recomputes can be skipped.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.updated > 0 || self.deleted > 0
+    }
+
+    /// Accumulates another pass's counts into this one.
+    ///
+    /// Used by [`full_index_multi`] to fold the per-root outcomes of a
+    /// multi-root workspace into a single workspace-wide summary.
+    fn merge(&mut self, other: IndexOutcome) {
+        self.updated += other.updated;
+        self.deleted += other.deleted;
+    }
+}
+
 /// Single-root convenience: indexes one root with no path prefix and no
 /// cross-root known paths. This is the common case and preserves the
 /// original call signature so all existing callers and tests work unchanged.
-pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<()> {
+pub fn full_index(conn: &Connection, root: &Path, force: bool) -> Result<IndexOutcome> {
     full_index_root(conn, root, force, "", &HashSet::new())
 }
 
@@ -69,12 +106,12 @@ pub fn full_index_multi(
     roots: &[PathBuf],
     aliases: &HashMap<PathBuf, String>,
     force: bool,
-) -> Result<()> {
+) -> Result<IndexOutcome> {
     if roots.len() <= 1 {
         if let Some(root) = roots.first() {
             return full_index(conn, root, force);
         }
-        return Ok(());
+        return Ok(IndexOutcome::default());
     }
 
     // Two-pass: first pass collects all file paths across every root, then
@@ -113,11 +150,12 @@ pub fn full_index_multi(
             all_known.insert(raw_rel);
         }
     }
+    let mut outcome = IndexOutcome::default();
     for (root, prefix) in &roots_with_prefixes {
         tracing::info!("Indexing root: {} (prefix: {prefix})", root.display());
-        full_index_root(conn, root, force, prefix, &all_known)?;
+        outcome.merge(full_index_root(conn, root, force, prefix, &all_known)?);
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Delete files belonging to DB root prefixes that are no longer listed
@@ -297,9 +335,11 @@ fn ingest_parsed_file(
 /// Resolve every entry's import specifiers to target file ids, write the
 /// `import` edges, and return a per-file map of resolved target ids that
 /// the symbol-reference resolver consumes.
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_write_import_edges(
     tx: &Connection,
     root: &Path,
+    path_prefix: &str,
     indexed: &[IndexedFile],
     known_paths: &HashSet<String>,
     path_to_id: &HashMap<String, i64>,
@@ -329,7 +369,21 @@ fn resolve_and_write_import_edges(
                 &python_roots,
             );
             for target_rel in &targets {
-                if let Some(&target_id) = path_to_id.get(target_rel.as_str()) {
+                // Resolvers work against a single root and yield keys relative
+                // to THIS root. In single-root mode DB rows (and `path_to_id`)
+                // are unprefixed, so look up directly. In multi-root mode DB
+                // rows are root-prefixed, so look up ONLY the prefixed form: a
+                // bare-key lookup could otherwise bind to a sibling root whose
+                // prefix happens to equal a leading subdirectory segment of this
+                // key, writing an edge into the wrong root.
+                let target_id = if path_prefix.is_empty() {
+                    path_to_id.get(target_rel.as_str()).copied()
+                } else {
+                    path_to_id
+                        .get(format!("{path_prefix}/{target_rel}").as_str())
+                        .copied()
+                };
+                if let Some(target_id) = target_id {
                     write::insert_edge(
                         tx,
                         entry.file_id,
@@ -529,7 +583,7 @@ pub fn full_index_root(
     force: bool,
     path_prefix: &str,
     extra_known: &HashSet<String>,
-) -> Result<()> {
+) -> Result<IndexOutcome> {
     let files = walker::walk_source_files(root);
     let pool = ParserPool::new();
     let go_module = read_go_module(root);
@@ -565,43 +619,54 @@ pub fn full_index_root(
 
     let deleted = remove_stale_files(&tx, root, path_prefix, &known_paths)?;
 
-    let path_to_id: HashMap<String, i64> = {
-        let all_files = read::get_all_files(&tx)?;
-        all_files.into_iter().map(|f| (f.path, f.id)).collect()
-    };
+    // Skip the post-walk derived-table rebuilds when the walk touched
+    // nothing. With the MCP-server startup path now running this
+    // reconciliation on every start (see `main.rs`), an unchanged tree
+    // must stay cheap: `sync_fts` and `populate_unused_exports` are
+    // whole-table rewrites, and the import/reference passes scan the full
+    // known-path set. None of that can change when no file was ingested or
+    // removed, so the existing edges, symbol refs, FTS, and unused-exports
+    // rows are still valid and are left untouched.
+    if updated > 0 || deleted > 0 {
+        let path_to_id: HashMap<String, i64> = {
+            let all_files = read::get_all_files(&tx)?;
+            all_files.into_iter().map(|f| (f.path, f.id)).collect()
+        };
 
-    // Import resolution pass: writes edge rows AND records, per file, the
-    // set of files we actually imported from. The reference resolver below
-    // uses that set as the Priority-2 lookup ("target symbol lives in a
-    // file we import").
-    let imports_by_file = resolve_and_write_import_edges(
-        &tx,
-        root,
-        &indexed,
-        &known_paths,
-        &path_to_id,
-        go_module.as_deref(),
-        &dart_packages,
-    )?;
+        // Import resolution pass: writes edge rows AND records, per file, the
+        // set of files we actually imported from. The reference resolver below
+        // uses that set as the Priority-2 lookup ("target symbol lives in a
+        // file we import").
+        let imports_by_file = resolve_and_write_import_edges(
+            &tx,
+            root,
+            path_prefix,
+            &indexed,
+            &known_paths,
+            &path_to_id,
+            go_module.as_deref(),
+            &dart_packages,
+        )?;
 
-    resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
+        resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
 
-    write::sync_fts(&tx)?;
-    // Per-file body FTS rebuild scoped to the files we just (re)ingested.
-    // The wholesale `rebuild_symbol_bodies(&tx, root)` we used to call here
-    // wipes the entire `symbols_body_fts` table and only repopulates files
-    // reachable from `root`, which silently destroyed primary-root bodies
-    // on every `qartez_workspace add` for a secondary root. Per-file is
-    // safe because changed files already had their body_fts rows cleared
-    // via `delete_file_data` / `clear_file_content` inside `try_ingest_file`,
-    // and unchanged files retain valid bodies untouched.
-    for entry in &indexed {
-        write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.raw_rel)?;
+        write::sync_fts(&tx)?;
+        // Per-file body FTS rebuild scoped to the files we just (re)ingested.
+        // The wholesale `rebuild_symbol_bodies(&tx, root)` we used to call here
+        // wipes the entire `symbols_body_fts` table and only repopulates files
+        // reachable from `root`, which silently destroyed primary-root bodies
+        // on every `qartez_workspace add` for a secondary root. Per-file is
+        // safe because changed files already had their body_fts rows cleared
+        // via `delete_file_data` / `clear_file_content` inside `try_ingest_file`,
+        // and unchanged files retain valid bodies untouched.
+        for entry in &indexed {
+            write::rebuild_symbol_bodies_for_file(&tx, root, entry.file_id, &entry.raw_rel)?;
+        }
+        write::populate_unused_exports(&tx)?;
+
+        #[cfg(feature = "semantic")]
+        rebuild_semantic_embeddings_if_available(&tx, root);
     }
-    write::populate_unused_exports(&tx)?;
-
-    #[cfg(feature = "semantic")]
-    rebuild_semantic_embeddings_if_available(&tx, root);
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -615,32 +680,41 @@ pub fn full_index_root(
 
     // Checkpoint the WAL so it doesn't grow unboundedly across indexing runs.
     // Failure is non-fatal - the next run or SQLite's auto-checkpoint will
-    // eventually flush it. Skipped when QARTEZ_DEFER_COMPACTION=1 so the MCP
-    // background indexer can hand off readiness immediately and let a
-    // separate post-index step (or qartez_maintenance checkpoint) flush
-    // the WAL off the critical path.
+    // eventually flush it. Skipped when compaction deferral is enabled
+    // (see `set_defer_compaction`) so the MCP background indexer can hand
+    // off readiness immediately and let a separate post-index step (or
+    // qartez_maintenance checkpoint) flush the WAL off the critical path.
     if compaction_deferred() {
-        tracing::debug!("WAL checkpoint deferred (QARTEZ_DEFER_COMPACTION=1)");
+        tracing::debug!("WAL checkpoint deferred (compaction deferral enabled)");
     } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
         tracing::debug!("WAL checkpoint after full_index failed (non-fatal): {e}");
     }
 
     tracing::info!("indexing complete: {updated} updated, {skipped} skipped, {deleted} deleted");
-    Ok(())
+    Ok(IndexOutcome { updated, deleted })
 }
 
-/// Returns true when the caller has set `QARTEZ_DEFER_COMPACTION=1` so
-/// the indexer should skip its inline WAL checkpoint.
+/// Process-global flag controlling whether the indexer skips its inline
+/// WAL checkpoint. Set via [`set_defer_compaction`]; defaults to `false`.
+static DEFER_COMPACTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable deferral of the indexer's inline WAL checkpoints.
 ///
-/// The MCP-server background indexer sets this so `tools/list` can
+/// The MCP-server background indexer enables this so `tools/list` can
 /// return as soon as parsing is done, then triggers
 /// `wal_checkpoint(TRUNCATE)` itself once startup has handed off. CLI
-/// and unit-test paths leave the variable unset and keep the original
-/// inline-checkpoint behaviour.
+/// and unit-test paths leave it disabled and keep the original
+/// inline-checkpoint behaviour. Replaces the former
+/// `QARTEZ_DEFER_COMPACTION` env var, whose `set_var` write was unsound
+/// under the multi-threaded tokio runtime (Rust 2024 UB).
+pub fn set_defer_compaction(deferred: bool) {
+    DEFER_COMPACTION.store(deferred, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns true when [`set_defer_compaction`] has been called with `true`
+/// so the indexer should skip its inline WAL checkpoint.
 fn compaction_deferred() -> bool {
-    std::env::var("QARTEZ_DEFER_COMPACTION")
-        .ok()
-        .is_some_and(|v| v == "1")
+    DEFER_COMPACTION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Second-pass reference resolution. Runs after every file has been parsed
@@ -1067,6 +1141,11 @@ fn resolve_targets(
             .into_iter()
             .collect(),
         "go" => resolve_go_import(specifier, known_files, go_module),
+        // Infra-as-code: Kustomize/Helm/ArgoCD YAML and Terraform/OpenTofu HCL
+        // reference files and directories, not dot-anchored module specifiers.
+        "yaml" | "hcl" => {
+            resolve_infra_import(rel_path, specifier, root, known_files, language == "hcl")
+        }
         "dart" => resolve_dart_import(rel_path, specifier, root, known_files, dart_packages),
         // C/C++ quoted includes are file references, not dot-anchored module
         // specifiers, so they need their own resolver (see `resolve_c_import`).
@@ -1207,6 +1286,145 @@ fn resolve_c_import(
 
     // 3. Unique suffix match against the indexed C/C++ file set.
     c_headers.unique_suffix_match(&spec)
+}
+
+// --- Infrastructure-as-code (Kustomize / Helm / ArgoCD / Terraform) ---
+
+/// Resolve an infra path reference to indexed file(s).
+///
+/// Infra references are plain filesystem paths, not dot-anchored module
+/// specifiers: Kustomize `resources: [../base, deployment.yaml]`, a Helm
+/// `Chart.yaml` `file://` dependency, an ArgoCD `spec.source.path` (repo-root
+/// relative), or a Terraform `module { source = "../modules/x" }`. The extractor
+/// stores the raw path; this resolver maps it to file(s) by trying, in order:
+///
+/// 1. relative to the referencing file's own directory (`./x`, `../x`, bare
+///    sibling `deployment.yaml`);
+/// 2. relative to the repo root (leading-slash includes, ArgoCD app paths).
+///
+/// For each base it accepts an exact file, then directory forms gated by
+/// language so a reference never crosses file types: for YAML (`for_hcl =
+/// false`) a directory containing a `kustomization.yaml`/`Chart.yaml`
+/// entrypoint, else a directory of raw manifests (all its top-level
+/// `.yaml`/`.yml` files, covering an ArgoCD `path:` to a plain manifest folder);
+/// for HCL (`for_hcl = true`) a Terraform module directory (all its top-level
+/// `.tf` files). Returns every matching indexed path; empty when nothing local
+/// resolves
+/// (remote `github.com/...?ref=`, `oci://`, `https://` refs are dropped by the
+/// extractor before they reach here).
+fn resolve_infra_import(
+    rel_path: &str,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+    for_hcl: bool,
+) -> Vec<String> {
+    let spec = specifier.strip_prefix("file://").unwrap_or(specifier);
+    if spec.contains("://") || spec.starts_with("git@") {
+        return Vec::new();
+    }
+    let spec = spec.trim().trim_end_matches('/');
+    if spec.is_empty() || spec == "." {
+        return Vec::new();
+    }
+    // Root-relative form for the repo-root base (strip a leading `/`).
+    let spec_rel = spec.trim_start_matches('/');
+
+    // Bases to try, in priority order. A leading `/` means repo-root only.
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if !spec.starts_with('/')
+        && let Some(dir) = Path::new(rel_path).parent()
+    {
+        bases.push(root.join(dir));
+    }
+    bases.push(root.to_path_buf());
+
+    for base in bases {
+        let abs = normalize_path(&base.join(spec_rel));
+        let rel = match abs.strip_prefix(root) {
+            Ok(r) => to_forward_slash(r.to_string_lossy().into_owned()),
+            Err(_) => continue,
+        };
+        if rel == rel_path {
+            continue;
+        }
+
+        // 1. Exact file.
+        if known_files.contains(&rel) {
+            return vec![rel];
+        }
+
+        // 2. Directory entrypoint: kustomize dir or Helm chart dir. YAML only -
+        //    an HCL `module` source never points at a kustomization/chart.
+        if !for_hcl {
+            for entry in [
+                "kustomization.yaml",
+                "kustomization.yml",
+                "Kustomization",
+                "Chart.yaml",
+            ] {
+                let candidate = if rel.is_empty() {
+                    entry.to_string()
+                } else {
+                    format!("{rel}/{entry}")
+                };
+                if candidate != rel_path && known_files.contains(&candidate) {
+                    return vec![candidate];
+                }
+            }
+        }
+
+        let prefix = if rel.is_empty() {
+            String::new()
+        } else {
+            format!("{rel}/")
+        };
+
+        // 3. Terraform module directory: every top-level `.tf` file under it.
+        //    HCL only - a YAML manifest never references a `.tf` module, and
+        //    gating avoids a full scan for the common YAML case.
+        if for_hcl {
+            let mut tf: Vec<String> = known_files
+                .iter()
+                .filter(|p| {
+                    p.len() > prefix.len()
+                        && p.starts_with(&prefix)
+                        && p.ends_with(".tf")
+                        && !p[prefix.len()..].contains('/')
+                        && p.as_str() != rel_path
+                })
+                .cloned()
+                .collect();
+            if !tf.is_empty() {
+                tf.sort();
+                return tf;
+            }
+        }
+
+        // 4. Directory of raw manifests (e.g. an ArgoCD `path:` pointing at a
+        //    directory with no kustomization entrypoint): link to every
+        //    top-level YAML manifest in it. YAML only. Skipped for the repo root
+        //    so a root-relative miss never links to the entire tree.
+        if !for_hcl && !rel.is_empty() {
+            let mut manifests: Vec<String> = known_files
+                .iter()
+                .filter(|p| {
+                    p.len() > prefix.len()
+                        && p.starts_with(&prefix)
+                        && (p.ends_with(".yaml") || p.ends_with(".yml"))
+                        && !p[prefix.len()..].contains('/')
+                        && p.as_str() != rel_path
+                })
+                .cloned()
+                .collect();
+            if !manifests.is_empty() {
+                manifests.sort();
+                return manifests;
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 // --- TypeScript / JavaScript ---
@@ -2028,28 +2246,57 @@ pub fn incremental_index_with_prefix(
     }
 
     // --- Phase 3: resolve edges & references for changed files ---
-    // Build the full path→id map from the DB (includes unchanged files).
-    let path_to_id: HashMap<String, i64> = {
-        let all_files = read::get_all_files(&tx)?;
-        all_files.into_iter().map(|f| (f.path, f.id)).collect()
-    };
-    let known_paths: HashSet<String> = path_to_id.keys().cloned().collect();
+    // Guard the whole edge/reference pass behind a non-empty `indexed` set.
+    // On pure-delete watcher events (or when every changed file was
+    // skipped) `indexed` is empty, so this block would build the full
+    // path→id map, then `resolve_symbol_references` would run its
+    // `get_all_symbols_with_path` scan and four whole-project HashMaps only
+    // to loop over nothing. `full_index_root` guards the analogous block
+    // the same way (`if updated > 0 || deleted > 0`).
+    if !indexed.is_empty() {
+        // Build the full path→id map from the DB (includes unchanged files).
+        let path_to_id: HashMap<String, i64> = {
+            let all_files = read::get_all_files(&tx)?;
+            all_files.into_iter().map(|f| (f.path, f.id)).collect()
+        };
+        // Resolvers generate candidates relative to a single root (unprefixed),
+        // but DB keys are root-prefixed in multi-root mode. Mirror
+        // full_index_root by also exposing this root's files under their
+        // unprefixed form, so incremental re-resolution finds same-root targets
+        // instead of silently dropping the edited file's edges.
+        let known_paths: HashSet<String> = {
+            let mut paths: HashSet<String> = path_to_id.keys().cloned().collect();
+            if !path_prefix.is_empty() {
+                let pfx = format!("{path_prefix}/");
+                let unprefixed: Vec<String> = path_to_id
+                    .keys()
+                    .filter_map(|p| p.strip_prefix(&pfx).map(str::to_string))
+                    .collect();
+                paths.extend(unprefixed);
+            }
+            paths
+        };
 
-    let imports_by_file = resolve_and_write_import_edges(
-        &tx,
-        root,
-        &indexed,
-        &known_paths,
-        &path_to_id,
-        go_module.as_deref(),
-        &dart_packages,
-    )?;
+        let imports_by_file = resolve_and_write_import_edges(
+            &tx,
+            root,
+            path_prefix,
+            &indexed,
+            &known_paths,
+            &path_to_id,
+            go_module.as_deref(),
+            &dart_packages,
+        )?;
 
-    resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
+        resolve_symbol_references(&tx, &indexed, &imports_by_file)?;
+    }
 
     // Restore the snapshot: look each preserved ref up by (file, name,
     // kind) against the newly-inserted symbols. Ambiguous or missing
     // matches are dropped rather than pointing at the wrong symbol.
+    // Kept OUTSIDE the guard above: on a pure delete `preserved_refs` is
+    // empty so this is a harmless no-op, and any snapshotted refs still
+    // need restoring even if this pass ingested no new symbols.
     restore_cross_file_refs(&tx, &preserved_refs)?;
 
     // --- Phase 4: update derived tables ---
@@ -2083,11 +2330,12 @@ pub fn incremental_index_with_prefix(
     // without waiting for readers/writers and without the fsync+truncate
     // pass that makes TRUNCATE expensive on Windows under NTFS + Defender.
     // The watcher path runs a periodic TRUNCATE on its own cadence so the
-    // WAL file still shrinks. Skipped entirely when QARTEZ_DEFER_COMPACTION=1
-    // so the MCP startup path can flush the WAL once after the indexing
-    // burst finishes instead of N times.
+    // WAL file still shrinks. Skipped entirely when compaction deferral is
+    // enabled (see `set_defer_compaction`) so the MCP startup path can
+    // flush the WAL once after the indexing burst finishes instead of N
+    // times.
     if compaction_deferred() {
-        tracing::debug!("incremental WAL checkpoint deferred (QARTEZ_DEFER_COMPACTION=1)");
+        tracing::debug!("incremental WAL checkpoint deferred (compaction deferral enabled)");
     } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
         tracing::debug!("WAL checkpoint after incremental_index failed (non-fatal): {e}");
     }
@@ -2107,6 +2355,191 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
+
+    // --- resolve_infra_import: Kustomize / Helm / ArgoCD / Terraform ---------
+
+    fn infra_known(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn infra_resolves_bare_sibling_file() {
+        let root = Path::new("/repo");
+        let known = infra_known(&["k8s/prod/kustomization.yaml", "k8s/prod/deployment.yaml"]);
+        let hit = resolve_infra_import(
+            "k8s/prod/kustomization.yaml",
+            "deployment.yaml",
+            root,
+            &known,
+            false,
+        );
+        assert_eq!(hit, vec!["k8s/prod/deployment.yaml"]);
+    }
+
+    #[test]
+    fn infra_resolves_parent_dir_to_kustomization() {
+        let root = Path::new("/repo");
+        let known = infra_known(&[
+            "k8s/overlays/prod/kustomization.yaml",
+            "k8s/base/kustomization.yaml",
+        ]);
+        let hit = resolve_infra_import(
+            "k8s/overlays/prod/kustomization.yaml",
+            "../../base",
+            root,
+            &known,
+            false,
+        );
+        assert_eq!(hit, vec!["k8s/base/kustomization.yaml"]);
+    }
+
+    #[test]
+    fn infra_resolves_argocd_root_relative_path() {
+        let root = Path::new("/repo");
+        let known = infra_known(&[
+            "argocd/apps/my-app.yaml",
+            "k8s-apps/prod/my-app/kustomization.yaml",
+        ]);
+        // ArgoCD paths are repo-root relative, not relative to the manifest.
+        let hit = resolve_infra_import(
+            "argocd/apps/my-app.yaml",
+            "k8s-apps/prod/my-app",
+            root,
+            &known,
+            false,
+        );
+        assert_eq!(hit, vec!["k8s-apps/prod/my-app/kustomization.yaml"]);
+    }
+
+    #[test]
+    fn infra_resolves_terraform_module_dir_to_tf_files() {
+        let root = Path::new("/repo");
+        let known = infra_known(&[
+            "infra/main.tf",
+            "modules/vpc/main.tf",
+            "modules/vpc/variables.tf",
+            "modules/vpc/outputs.tf",
+            "modules/vpc/nested/deep.tf",
+        ]);
+        let mut hit = resolve_infra_import("infra/main.tf", "../modules/vpc", root, &known, true);
+        hit.sort();
+        // Only top-level .tf files of the module dir, not nested ones.
+        assert_eq!(
+            hit,
+            vec![
+                "modules/vpc/main.tf".to_string(),
+                "modules/vpc/outputs.tf".to_string(),
+                "modules/vpc/variables.tf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn infra_strips_file_scheme_and_skips_remote() {
+        let root = Path::new("/repo");
+        let known = infra_known(&["charts/app/Chart.yaml", "charts/common/Chart.yaml"]);
+        // file:// local dependency resolves to the chart dir entrypoint.
+        let hit = resolve_infra_import(
+            "charts/app/Chart.yaml",
+            "file://../common",
+            root,
+            &known,
+            false,
+        );
+        assert_eq!(hit, vec!["charts/common/Chart.yaml"]);
+        // Remote references never resolve.
+        assert!(
+            resolve_infra_import(
+                "charts/app/Chart.yaml",
+                "https://charts.example.com",
+                root,
+                &known,
+                false,
+            )
+            .is_empty()
+        );
+        assert!(
+            resolve_infra_import(
+                "k8s/kustomization.yaml",
+                "github.com/org/repo//overlay?ref=v1",
+                root,
+                &known,
+                false,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn infra_resolves_argocd_dir_of_raw_manifests() {
+        let root = Path::new("/repo");
+        // An ArgoCD app whose `path:` points at a directory of raw manifests
+        // (no kustomization.yaml). Link to every top-level manifest, minus self.
+        let known = infra_known(&[
+            "apps/foo/application.yaml",
+            "apps/foo/deployment.yaml",
+            "apps/foo/service.yaml",
+            "apps/foo/values.yaml",
+            "apps/foo/nested/extra.yaml",
+        ]);
+        let mut hit =
+            resolve_infra_import("apps/foo/application.yaml", "apps/foo", root, &known, false);
+        hit.sort();
+        assert_eq!(
+            hit,
+            vec![
+                "apps/foo/deployment.yaml".to_string(),
+                "apps/foo/service.yaml".to_string(),
+                "apps/foo/values.yaml".to_string(),
+            ],
+            "should link to top-level manifests only, excluding self and nested"
+        );
+    }
+
+    #[test]
+    fn infra_kustomization_dir_wins_over_raw_manifest_fallback() {
+        let root = Path::new("/repo");
+        // When a directory has a kustomization.yaml, that is the entrypoint -
+        // do not also fan out to every raw manifest.
+        let known = infra_known(&[
+            "apps/bar/application.yaml",
+            "apps/bar/kustomization.yaml",
+            "apps/bar/deployment.yaml",
+        ]);
+        let hit =
+            resolve_infra_import("apps/bar/application.yaml", "apps/bar", root, &known, false);
+        assert_eq!(hit, vec!["apps/bar/kustomization.yaml"]);
+    }
+
+    #[test]
+    fn infra_language_gating_prevents_cross_language_edges() {
+        let root = Path::new("/repo");
+        // A YAML ref to a directory that holds only .tf files must NOT link to
+        // them (a manifest never depends on a Terraform module).
+        let tf_only = infra_known(&["k8s/kustomization.yaml", "mod/main.tf", "mod/vars.tf"]);
+        assert!(
+            resolve_infra_import("k8s/kustomization.yaml", "../mod", root, &tf_only, false)
+                .is_empty(),
+            "YAML must not resolve to .tf files"
+        );
+        // An HCL module ref to a directory that holds only YAML must NOT link to
+        // it, and must not treat a kustomization.yaml as a module entrypoint.
+        let yaml_only = infra_known(&["infra/main.tf", "mod/kustomization.yaml", "mod/x.yaml"]);
+        assert!(
+            resolve_infra_import("infra/main.tf", "./mod", root, &yaml_only, true).is_empty(),
+            "HCL must not resolve to YAML manifests or kustomization dirs"
+        );
+    }
+
+    #[test]
+    fn infra_never_returns_self_edge() {
+        let root = Path::new("/repo");
+        let known = infra_known(&["k8s/kustomization.yaml"]);
+        // A `.` or same-dir reference must not link the file to itself.
+        assert!(
+            resolve_infra_import("k8s/kustomization.yaml", ".", root, &known, false).is_empty()
+        );
+    }
 
     // --- replace_backslashes_with_slashes: platform-independent ----------
     //
@@ -2994,6 +3427,270 @@ mod tests {
     // --- Integration tests ---
 
     #[test]
+    fn test_multi_root_no_cross_root_edge_on_prefix_collision() {
+        // A sibling root's prefix ("shared") equals a subdirectory name inside
+        // another root ("app/shared"). The resolver yields the current-root
+        // relative key "shared/deployment.yaml", which must resolve to
+        // app/shared/deployment.yaml - NOT to the sibling root's
+        // shared/deployment.yaml. Guards against a bare-key lookup binding an
+        // edge to the wrong root.
+        let tmp = TempDir::new().unwrap();
+        let root_shared = tmp.path().join("shared");
+        let root_app = tmp.path().join("app");
+        fs::create_dir_all(&root_shared).unwrap();
+        fs::create_dir_all(root_app.join("shared")).unwrap();
+
+        // Sibling root "shared" with a top-level deployment.yaml → DB path
+        // "shared/deployment.yaml".
+        fs::write(root_shared.join("deployment.yaml"), "kind: Deployment\n").unwrap();
+
+        // Root "app" with a subdirectory literally named "shared".
+        fs::write(
+            root_app.join("shared/kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - deployment.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            root_app.join("shared/deployment.yaml"),
+            "kind: Deployment\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        let roots = vec![root_shared.clone(), root_app.clone()];
+        let aliases = HashMap::new();
+        full_index_multi(&conn, &roots, &aliases, true).unwrap();
+
+        let id = |p: &str| read::get_file_by_path(&conn, p).unwrap().unwrap().id;
+        let edges = read::get_all_edges(&conn).unwrap();
+        let linked = |from: &str, to: &str| {
+            let (f, t) = (id(from), id(to));
+            edges.iter().any(|e| e.0 == f && e.1 == t)
+        };
+
+        assert!(
+            linked(
+                "app/shared/kustomization.yaml",
+                "app/shared/deployment.yaml"
+            ),
+            "must link to the SAME-root deployment; edges {edges:?}"
+        );
+        assert!(
+            !linked("app/shared/kustomization.yaml", "shared/deployment.yaml"),
+            "must NOT link across roots to the sibling 'shared' root's file"
+        );
+    }
+
+    #[test]
+    fn test_multi_root_incremental_reresolves_infra_edges() {
+        // After the initial multi-root full index, a live edit to a manifest
+        // goes through incremental_index. That path must re-resolve the edited
+        // file's edges under the root prefix - otherwise a save in a multi-root
+        // (submodule) workspace silently drops the file's edges until a full
+        // reindex.
+        let tmp = TempDir::new().unwrap();
+        let root_a = tmp.path().join("submod-a");
+        let root_b = tmp.path().join("submod-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        fs::write(
+            root_a.join("kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - deployment.yaml\n",
+        )
+        .unwrap();
+        fs::write(root_a.join("deployment.yaml"), "kind: Deployment\n").unwrap();
+        fs::write(root_a.join("service.yaml"), "kind: Service\n").unwrap();
+        fs::write(
+            root_b.join("kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - cfg.yaml\n",
+        )
+        .unwrap();
+        fs::write(root_b.join("cfg.yaml"), "kind: ConfigMap\n").unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        let roots = vec![root_a.clone(), root_b.clone()];
+        let aliases = HashMap::new();
+        full_index_multi(&conn, &roots, &aliases, true).unwrap();
+
+        // Live edit: kustomization now also pulls in service.yaml.
+        fs::write(
+            root_a.join("kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - deployment.yaml\n  - service.yaml\n",
+        )
+        .unwrap();
+        incremental_index_with_prefix(
+            &conn,
+            &root_a,
+            "submod-a",
+            &[root_a.join("kustomization.yaml")],
+            &[],
+        )
+        .unwrap();
+
+        let id = |p: &str| read::get_file_by_path(&conn, p).unwrap().unwrap().id;
+        let edges = read::get_all_edges(&conn).unwrap();
+        let linked = |from: &str, to: &str| {
+            let (f, t) = (id(from), id(to));
+            edges.iter().any(|e| e.0 == f && e.1 == t)
+        };
+        assert!(
+            linked("submod-a/kustomization.yaml", "submod-a/deployment.yaml"),
+            "existing edge must survive incremental re-index; edges {edges:?}"
+        );
+        assert!(
+            linked("submod-a/kustomization.yaml", "submod-a/service.yaml"),
+            "newly added edge must be resolved by incremental re-index in multi-root mode"
+        );
+    }
+
+    #[test]
+    fn test_multi_root_infra_edges_resolve_within_each_root() {
+        // Two roots (as `qartez_workspace add` / submodules produce), each with
+        // an internal Kustomize edge. In multi-root mode DB paths are prefixed
+        // with the root dir name; the resolver works on unprefixed paths, so the
+        // edge write must reconcile the two. Regression for multi-root/submodule
+        // resolution returning zero edges.
+        let tmp = TempDir::new().unwrap();
+        let root_a = tmp.path().join("submod-a");
+        let root_b = tmp.path().join("submod-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        fs::write(
+            root_a.join("kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - deployment.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            root_a.join("deployment.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: a\n",
+        )
+        .unwrap();
+        fs::write(
+            root_b.join("kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - service.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            root_b.join("service.yaml"),
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: b\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        let roots = vec![root_a.clone(), root_b.clone()];
+        let aliases = HashMap::new();
+        full_index_multi(&conn, &roots, &aliases, true).unwrap();
+
+        let id = |p: &str| read::get_file_by_path(&conn, p).unwrap().unwrap().id;
+        let edges = read::get_all_edges(&conn).unwrap();
+        let linked = |from: &str, to: &str| {
+            let (f, t) = (id(from), id(to));
+            edges.iter().any(|e| e.0 == f && e.1 == t)
+        };
+
+        assert!(
+            linked("submod-a/kustomization.yaml", "submod-a/deployment.yaml"),
+            "root A internal edge missing in multi-root mode; edges {edges:?}"
+        );
+        assert!(
+            linked("submod-b/kustomization.yaml", "submod-b/service.yaml"),
+            "root B internal edge missing in multi-root mode"
+        );
+    }
+
+    #[test]
+    fn test_full_index_infra_dependency_edges() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Kustomize base.
+        fs::create_dir_all(root.join("k8s/base")).unwrap();
+        fs::write(
+            root.join("k8s/base/kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - deployment.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("k8s/base/deployment.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\n",
+        )
+        .unwrap();
+
+        // Kustomize prod overlay pointing back at the base.
+        fs::create_dir_all(root.join("k8s/overlays/prod")).unwrap();
+        fs::write(
+            root.join("k8s/overlays/prod/kustomization.yaml"),
+            "kind: Kustomization\nresources:\n  - ../../base\npatchesStrategicMerge:\n  - replicas.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("k8s/overlays/prod/replicas.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 3\n",
+        )
+        .unwrap();
+
+        // ArgoCD Application pointing at the overlay (repo-root relative path).
+        fs::create_dir_all(root.join("argocd")).unwrap();
+        fs::write(
+            root.join("argocd/app.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: app\nspec:\n  source:\n    repoURL: https://example.com/repo.git\n    path: k8s/overlays/prod\n",
+        )
+        .unwrap();
+
+        // Terraform root module referencing a local child module.
+        fs::create_dir_all(root.join("tf/modules/vpc")).unwrap();
+        fs::write(
+            root.join("tf/main.tf"),
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tf/modules/vpc/main.tf"),
+            "resource \"x\" \"y\" {}\n",
+        )
+        .unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+        full_index(&conn, root, true).unwrap();
+
+        let id = |p: &str| read::get_file_by_path(&conn, p).unwrap().unwrap().id;
+        let edges = read::get_all_edges(&conn).unwrap();
+        let linked = |from: &str, to: &str| {
+            let (f, t) = (id(from), id(to));
+            edges.iter().any(|e| e.0 == f && e.1 == t)
+        };
+
+        assert!(
+            linked(
+                "k8s/overlays/prod/kustomization.yaml",
+                "k8s/base/kustomization.yaml"
+            ),
+            "overlay → base kustomize edge missing; edges {edges:?}"
+        );
+        assert!(
+            linked(
+                "k8s/overlays/prod/kustomization.yaml",
+                "k8s/overlays/prod/replicas.yaml"
+            ),
+            "overlay → patch edge missing"
+        );
+        assert!(
+            linked("k8s/base/kustomization.yaml", "k8s/base/deployment.yaml"),
+            "base → resource edge missing"
+        );
+        assert!(
+            linked("argocd/app.yaml", "k8s/overlays/prod/kustomization.yaml"),
+            "argocd → overlay edge missing"
+        );
+        assert!(
+            linked("tf/main.tf", "tf/modules/vpc/main.tf"),
+            "terraform module edge missing"
+        );
+    }
+
+    #[test]
     fn test_full_index_with_temp_dir() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -3242,6 +3939,104 @@ mod tests {
         fs::write(root.join("second.ts"), "export const Y = 2;\n").unwrap();
         full_index(&conn, root, false).unwrap();
         assert_eq!(read::get_file_count(&conn).unwrap(), 2);
+    }
+
+    /// The MCP-server startup path always runs the reconciliation walk and
+    /// uses [`IndexOutcome::changed`] to decide whether to recompute the heavy
+    /// global derived tables. This pins that signal: a fresh index reports
+    /// changes, a no-op re-index reports none, and an added/deleted file flips
+    /// it back on - so files appearing while the server was down (a matching
+    /// fingerprint but a changed tree) still trigger the recompute.
+    #[test]
+    fn full_index_outcome_reports_changes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("first.ts"), "export const X = 1;\n").unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+
+        // First index: the new file counts as updated, so changed() is true.
+        let fresh = full_index(&conn, root, false).unwrap();
+        assert!(fresh.changed(), "first index of a new file should change");
+        assert_eq!(fresh.updated, 1);
+        assert_eq!(fresh.deleted, 0);
+
+        // Re-index with nothing touched: no updates, no deletes, no recompute.
+        let noop = full_index(&conn, root, false).unwrap();
+        assert!(
+            !noop.changed(),
+            "re-indexing an unchanged tree must report no changes ({noop:?})"
+        );
+        assert_eq!(noop, IndexOutcome::default());
+
+        // A file added while "down" is the downtime case: a plain re-index
+        // (no force) must discover it and report a change.
+        fs::write(root.join("second.ts"), "export const Y = 2;\n").unwrap();
+        let added = full_index(&conn, root, false).unwrap();
+        assert!(added.changed(), "an added file should change");
+        assert_eq!(added.updated, 1);
+
+        // Deleting a file is also a change, via the stale-removal path.
+        fs::remove_file(root.join("second.ts")).unwrap();
+        let removed = full_index(&conn, root, false).unwrap();
+        assert!(removed.changed(), "a deleted file should change");
+        assert_eq!(removed.deleted, 1);
+    }
+
+    /// A no-op re-index (force=false, nothing changed on disk) must leave the
+    /// derived tables - symbols FTS, import edges, and unused-exports - fully
+    /// intact. `full_index_root` skips the whole-table rebuilds in that case
+    /// (the startup path runs this walk on every start), so this pins that the
+    /// skip preserves, rather than wipes, the existing derived state.
+    #[test]
+    fn noop_reindex_preserves_derived_tables() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // lib.ts is imported by app.ts -> yields an import edge. orphan.ts is
+        // imported by nobody and its export is never referenced -> an unused
+        // export (the heuristic only flags exports of files with no incoming
+        // edge, so the unused case needs a separate orphan file).
+        fs::write(root.join("lib.ts"), "export function used() {}\n").unwrap();
+        fs::write(
+            root.join("app.ts"),
+            "import { used } from \"./lib\";\nused();\n",
+        )
+        .unwrap();
+        fs::write(root.join("orphan.ts"), "export function lonely() {}\n").unwrap();
+
+        let conn = storage::open_in_memory().unwrap();
+
+        let fresh = full_index(&conn, root, true).unwrap();
+        assert!(fresh.changed(), "first full index should change");
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let fts_before = count("SELECT COUNT(*) FROM symbols_fts");
+        let edges_before = count("SELECT COUNT(*) FROM edges");
+        let unused_before = count("SELECT COUNT(*) FROM unused_exports");
+        assert!(fts_before > 0, "FTS should be populated after first index");
+        assert!(edges_before > 0, "the import should produce an edge");
+        assert!(unused_before > 0, "`lonely` should be an unused export");
+
+        // True no-op: same files, same mtimes, force=false.
+        let noop = full_index(&conn, root, false).unwrap();
+        assert!(!noop.changed(), "an unchanged tree must report no change");
+
+        // The skip must preserve every derived table exactly.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM symbols_fts"),
+            fts_before,
+            "no-op reindex must not wipe symbols_fts"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM edges"),
+            edges_before,
+            "no-op reindex must not wipe edges"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM unused_exports"),
+            unused_before,
+            "no-op reindex must not wipe unused_exports"
+        );
     }
 
     // -- Symbol reference resolution --

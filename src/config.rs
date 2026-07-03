@@ -367,6 +367,120 @@ fn is_home_dir(path: &Path) -> bool {
     cross_platform_home().is_some_and(|home| path == home)
 }
 
+/// Resolve a writable on-disk location for the index database.
+///
+/// When the caller passed an explicit `--db-path`, that choice is honored
+/// verbatim: its parent directory is created and any failure is propagated so
+/// the operator sees exactly why their chosen path did not work.
+///
+/// Otherwise the preferred location is `<anchor>/.qartez/index.db`. Some hosts
+/// mount the project tree read-only (corporate sandboxes such as Google's
+/// read-only source mounts, the Nix store, container image layers). On such a
+/// filesystem creating `.qartez/` fails with `EROFS`/`EACCES` (os error 30),
+/// which previously aborted startup *before* the MCP `initialize` handshake
+/// completed and surfaced to the client as `calling "initialize": EOF`. To
+/// stay functional there, fall back to a writable per-project cache directory.
+fn resolve_db_path(explicit: Option<&Path>, anchor: &Path) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        return Ok(p.to_path_buf());
+    }
+
+    let preferred = anchor.join(".qartez").join("index.db");
+    if preferred.parent().is_some_and(ensure_writable_dir) {
+        return Ok(preferred);
+    }
+
+    // The in-tree location is read-only. Try writable cache locations in
+    // order of preference (persistent cache home first, OS temp dir last).
+    for base in fallback_db_bases(anchor) {
+        if base.parent().is_some_and(ensure_writable_dir) {
+            tracing::warn!(
+                "project directory is read-only; storing qartez index at {} instead of {}",
+                base.display(),
+                preferred.display()
+            );
+            return Ok(base);
+        }
+    }
+
+    // Nothing was writable. Re-run the in-tree creation so the caller gets the
+    // original, most-relevant filesystem error rather than a synthetic one.
+    if let Some(parent) = preferred.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(preferred)
+}
+
+/// Ensure `dir` exists and confirm a file can actually be created inside it.
+///
+/// `create_dir_all` returning `Ok` is not sufficient proof of writability: on
+/// a read-only filesystem an already-present directory yields `Ok` while the
+/// subsequent database-file creation still fails with `EROFS`. We therefore
+/// write and immediately remove a per-process probe file to detect that case
+/// up front, before SQLite tries (and aborts startup). The probe name carries
+/// the process id so two qartez instances racing on the same directory never
+/// delete each other's probe.
+fn ensure_writable_dir(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".qartez-write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Candidate writable database paths to use when the in-tree `.qartez/`
+/// location is read-only, most-preferred first.
+///
+/// Each candidate directory is keyed by a hash of the normalized anchor path,
+/// so distinct projects never share an index while repeated runs of the same
+/// project reuse it. A short human-readable label (the anchor's final path
+/// component) is prepended purely to make the cache directory recognizable.
+fn fallback_db_bases(anchor: &Path) -> Vec<PathBuf> {
+    let key = normalize_for_dedup(anchor);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&key, &mut hasher);
+    let hash = std::hash::Hasher::finish(&hasher);
+    let label = anchor
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".to_string());
+    let dir_name = format!("{label}-{hash:016x}");
+
+    let mut bases = Vec::new();
+    if let Some(cache) = persistent_cache_root() {
+        bases.push(cache.join("qartez").join(&dir_name).join("index.db"));
+    }
+    bases.push(
+        std::env::temp_dir()
+            .join("qartez")
+            .join(&dir_name)
+            .join("index.db"),
+    );
+    bases
+}
+
+/// Persistent per-user cache directory, preferred over the volatile OS temp
+/// dir so a fallback index survives reboots. Honors `XDG_CACHE_HOME`, then
+/// `~/.cache`. Returns `None` when no home directory can be located, leaving
+/// the OS temp dir as the only fallback.
+fn persistent_cache_root() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    cross_platform_home().map(|home| home.join(".cache"))
+}
+
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
         let cwd = std::env::current_dir()?;
@@ -404,14 +518,7 @@ impl Config {
         } else {
             &primary_root
         };
-        let db_path = match &cli.db_path {
-            Some(p) => p.clone(),
-            None => db_anchor.join(".qartez").join("index.db"),
-        };
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let db_path = resolve_db_path(cli.db_path.as_deref(), db_anchor)?;
 
         Ok(Config {
             project_roots,
@@ -429,6 +536,57 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn writable_anchor_uses_in_tree_db_location() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = resolve_db_path(None, tmp.path()).unwrap();
+        assert_eq!(resolved, tmp.path().join(".qartez").join("index.db"));
+        assert!(resolved.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn explicit_db_path_is_honored_and_parent_created() {
+        let tmp = TempDir::new().unwrap();
+        let explicit = tmp.path().join("custom").join("my.db");
+        let resolved = resolve_db_path(Some(&explicit), tmp.path()).unwrap();
+        assert_eq!(resolved, explicit);
+        assert!(explicit.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn read_only_anchor_falls_back_to_writable_cache() {
+        // Anchor whose `.qartez` parent cannot be created because a path
+        // component is a regular file, not a directory. This reproduces the
+        // read-only / unwritable in-tree case (the Google read-only mount
+        // EROFS crash) without needing chmod, which is not portable.
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let anchor = file.join("project");
+
+        let resolved = resolve_db_path(None, &anchor).unwrap();
+        assert!(
+            !resolved.starts_with(&anchor),
+            "expected fallback away from unwritable anchor, got {}",
+            resolved.display()
+        );
+        assert_eq!(resolved.file_name().unwrap(), "index.db");
+        assert!(resolved.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn fallback_db_bases_are_distinct_per_anchor() {
+        let a = fallback_db_bases(Path::new("/projects/alpha"));
+        let b = fallback_db_bases(Path::new("/projects/beta"));
+        assert!(!a.is_empty() && !b.is_empty());
+        assert_ne!(
+            a[0], b[0],
+            "different projects must not share a fallback DB"
+        );
+        // Same anchor is stable across calls so repeated runs reuse the index.
+        assert_eq!(a, fallback_db_bases(Path::new("/projects/alpha")));
+    }
 
     #[test]
     fn test_detect_qartez_workspace_expansion() {

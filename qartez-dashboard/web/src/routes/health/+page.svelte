@@ -62,7 +62,9 @@
 		</CardContent>
 	</Card>
 
-	{#if loadError && !data}
+	{#if loading && !data}
+		<EmptyState icon={HeartPulse} title="Loading health..." />
+	{:else if loadError && !data}
 		<EmptyState
 			icon={HeartPulse}
 			title="Could not load health"

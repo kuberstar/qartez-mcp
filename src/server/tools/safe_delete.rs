@@ -10,7 +10,8 @@ use rmcp::{RoleServer, tool, tool_router};
 use super::super::QartezServer;
 use super::super::params::*;
 use super::refactor_common::{
-    join_lines_with_trailing, resolve_unique_symbol, validate_range, write_atomic,
+    content_uses_crlf, join_lines_with_trailing, resolve_unique_symbol, validate_range,
+    write_atomic,
 };
 
 use crate::storage::read;
@@ -295,7 +296,12 @@ impl QartezServer {
         }
 
         let preserve_trailing_newline = content.ends_with('\n');
-        let new_content = join_lines_with_trailing(&remaining_lines, preserve_trailing_newline);
+        // Preserve the file's EOL convention. `remaining_lines` came from
+        // `content.lines()` (which strips `\r`), so a CRLF file must be
+        // rejoined with `\r\n` instead of being silently flipped to LF.
+        let use_crlf = content_uses_crlf(&content);
+        let new_content =
+            join_lines_with_trailing(&remaining_lines, preserve_trailing_newline, use_crlf);
         write_atomic(&abs_path, &new_content)?;
 
         let mut out = format!(

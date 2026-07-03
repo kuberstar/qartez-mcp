@@ -10,7 +10,7 @@
   </p>
   <p align="center">
     <a href="#quickstart">Quickstart</a> ·
-    <a href="#the-37-tools">37 Tools</a> ·
+    <a href="#the-43-tools">43 Tools</a> ·
     <a href="#modification-guard">Guard</a> ·
     <a href="#benchmarks">Benchmarks</a> ·
     <a href="#comparison-with-alternatives">Comparison</a> ·
@@ -24,7 +24,7 @@
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg"></a>
     <img alt="MSRV 1.88" src="https://img.shields.io/badge/MSRV-1.88-orange.svg">
     <img alt="37 languages" src="https://img.shields.io/badge/languages-37-green.svg">
-    <img alt="37 MCP tools" src="https://img.shields.io/badge/MCP_tools-37-purple.svg">
+    <img alt="43 MCP tools" src="https://img.shields.io/badge/MCP_tools-43-purple.svg">
   </p>
 </p>
 
@@ -194,7 +194,7 @@ The result: your AI works faster, uses fewer tokens, refactors safely, and stops
 
 ---
 
-## The 42 tools
+## The 43 tools
 
 Think of these as the **standard library for AI code understanding**. Each one replaces a multi-step human workflow with a single, token-efficient call the agent can reason about.
 
@@ -236,6 +236,7 @@ Tools are organized into **tiers** with progressive disclosure. Core tools are a
 | `qartez_knowledge` | **Bus-factor analysis.** Git-blame-based authorship at file and module level. Surfaces single-author files and modules where knowledge is concentrated in one contributor. |
 | `qartez_blame` | **Symbol-scoped git blame.** Resolves a function/type name to its line range and blames only those lines: per-hunk commits/authors, or a per-author rollup with each author's latest commit. |
 | `qartez_semantic` | Semantic search using a local embedding model. Natural-language queries ranked by hybrid FTS5 + vector similarity (RRF). Requires the `semantic` cargo feature and a one-time model download (~270 MB). |
+| `qartez_path` | Shortest call/reference path between two symbols. Forward BFS over the symbol-reference graph returns the ordered symbol/file chain plus a count of alternative shortest paths. Filter edges by `kind` (`call` or `type`). |
 
 ### Refactor (unlock via `qartez_tools`)
 

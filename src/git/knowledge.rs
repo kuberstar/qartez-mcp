@@ -64,17 +64,23 @@ pub fn analyze_knowledge(
                 continue;
             };
 
+            // git2 0.21 returns Option here: a null signature pointer means the
+            // author metadata is unavailable, so treat absent as "unknown".
             let sig = hunk.final_signature();
-            let raw_name = sig.name().unwrap_or("unknown").to_string();
+            let raw_name = sig
+                .as_ref()
+                .and_then(|s| s.name().ok())
+                .unwrap_or("unknown")
+                .to_string();
 
             // Apply mailmap for author deduplication.
-            let author_name = if let Some(ref mm) = mailmap {
-                mm.resolve_signature(&sig)
+            let author_name = match (&mailmap, &sig) {
+                (Some(mm), Some(s)) => mm
+                    .resolve_signature(s)
                     .ok()
-                    .and_then(|resolved| resolved.name().map(String::from))
-                    .unwrap_or(raw_name)
-            } else {
-                raw_name
+                    .and_then(|resolved| resolved.name().ok().map(String::from))
+                    .unwrap_or(raw_name),
+                _ => raw_name,
             };
 
             let lines = hunk.lines_in_hunk() as u32;

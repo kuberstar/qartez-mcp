@@ -93,16 +93,28 @@ impl QartezServer {
             HotspotLevel::File => {
                 let all_files = read::get_all_files(&conn).map_err(|e| format!("DB error: {e}"))?;
 
+                // Bulk-load the full symbol set once and group complexity
+                // values by file_id, rather than issuing an uncached
+                // get_symbols_for_file query per file (an O(files) N+1 fan-out
+                // of fresh SQL compiles). One pass over the shared symbol list
+                // reproduces the same per-file complexity lists.
+                let all_symbols =
+                    read::get_all_symbols_with_path(&conn).map_err(|e| format!("DB error: {e}"))?;
+                let mut cc_by_file: HashMap<i64, Vec<u32>> = HashMap::new();
+                for (sym, _) in &all_symbols {
+                    if let Some(cc) = sym.complexity {
+                        cc_by_file.entry(sym.file_id).or_default().push(cc);
+                    }
+                }
+
                 // For each file, compute avg complexity of its functions.
                 // Tuple: (path, score, avg_cc, max_cc, churn, coupling, health)
                 let mut scored: Vec<(String, f64, f64, f64, i64, f64, f64)> = Vec::new();
                 for file in &all_files {
-                    let symbols = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
-                    let complexities: Vec<u32> =
-                        symbols.iter().filter_map(|s| s.complexity).collect();
-                    if complexities.is_empty() {
-                        continue;
-                    }
+                    let complexities = match cc_by_file.get(&file.id) {
+                        Some(c) if !c.is_empty() => c,
+                        _ => continue,
+                    };
                     let avg_cc = complexities.iter().copied().sum::<u32>() as f64
                         / complexities.len() as f64;
                     let max_cc = complexities.iter().copied().max().unwrap_or(1) as f64;

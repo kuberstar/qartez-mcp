@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 /// Default match count when the caller omits `?limit=`. Matches the
@@ -94,7 +95,7 @@ pub async fn handler(
         ));
     }
     let needle = trimmed.to_string();
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let prefix = query.prefix.unwrap_or(false);
     let root = state.project_root().to_path_buf();
 
@@ -124,13 +125,6 @@ pub async fn handler(
                 Json(ApiError { error: "internal" }),
             ))
         }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
     }
 }
 

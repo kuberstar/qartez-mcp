@@ -25,7 +25,9 @@ use axum::http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::api::handler_util::{ApiError, run_blocking};
 use crate::api::hotspots;
+use crate::api::limits::clamp_limit;
 use crate::api::smells;
 use crate::state::AppState;
 
@@ -66,47 +68,13 @@ pub struct ProjectHealthResponse {
     pub indexed: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ApiError {
-    pub error: &'static str,
-}
-
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<ProjectHealthQuery>,
 ) -> Result<Json<ProjectHealthResponse>, (StatusCode, Json<ApiError>)> {
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let root = state.project_root().to_path_buf();
-
-    let result = tokio::task::spawn_blocking(move || compute_at_root(&root, limit))
-        .await
-        .map_err(|error| {
-            tracing::error!(?error, "project_health.join.failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "join error",
-                }),
-            )
-        })?;
-
-    match result {
-        Ok(response) => Ok(Json(response)),
-        Err(error) => {
-            tracing::error!(?error, "project_health.query.failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: "internal" }),
-            ))
-        }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
-    }
+    run_blocking(root, limit, "project_health", compute_at_root).await
 }
 
 fn compute_at_root(root: &Path, limit: i64) -> anyhow::Result<ProjectHealthResponse> {

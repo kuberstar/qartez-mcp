@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 const DEFAULT_MIN_LINES: i64 = 8;
@@ -66,7 +67,7 @@ pub async fn handler(
         .min_lines
         .filter(|v| *v >= 1)
         .unwrap_or(DEFAULT_MIN_LINES);
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let root = state.project_root().to_path_buf();
 
     let result =
@@ -91,13 +92,6 @@ pub async fn handler(
                 Json(ApiError { error: "internal" }),
             ))
         }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
     }
 }
 

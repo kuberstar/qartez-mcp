@@ -1,6 +1,6 @@
 # Tool reference
 
-Qartez exposes 42 tools via MCP, organized into four tiers. By default all
+Qartez exposes 43 tools via MCP, organized into four tiers. By default all
 tools are available. With `QARTEZ_PROGRESSIVE=1`, only the core tier and
 `qartez_tools` are visible at startup; unlock others on demand.
 
@@ -390,6 +390,24 @@ Bus factor = minimum number of authors whose combined line count exceeds 50%
 of total. Bus factor 1 means a single person owns most of the code.
 
 Requires `git_depth > 0`.
+
+### `qartez_path`
+
+Shortest call/reference path between two symbols. Runs a forward BFS over the
+persisted symbol-reference graph from `from` to `to` and returns the ordered
+symbol/file chain plus a count of alternative shortest paths. The default
+graph combines `call` and `type` edges; pass `kind` to restrict traversal to
+one edge kind. Same-symbol and no-path cases are reported gracefully.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `from` | string | **required** | Origin symbol name (aliases `source`, `symbol`) |
+| `to` | string | **required** | Destination symbol name (alias `target`) |
+| `kind` | string | — | Edge kind to traverse: `call` or `type` (default: both) |
+| `from_file` | string | — | Disambiguate the origin when defined in several files |
+| `to_file` | string | — | Disambiguate the destination when defined in several files |
+| `max_depth` | u32 | 25 | Max hops to search (max 50) |
+| `token_budget` | u32 | 4000 | Approximate output token budget |
 
 ---
 
