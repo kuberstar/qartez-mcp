@@ -114,7 +114,9 @@
 		</CardContent>
 	</Card>
 
-	{#if loadError && !data}
+	{#if loading && !data}
+		<EmptyState icon={AlertTriangle} title="Loading smells..." />
+	{:else if loadError && !data}
 		<EmptyState
 			icon={AlertTriangle}
 			title="Could not load smells"

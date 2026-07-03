@@ -69,7 +69,9 @@
 		</CardContent>
 	</Card>
 
-	{#if loadError && !data}
+	{#if loading && !data}
+		<EmptyState icon={Copy} title="Loading clones..." />
+	{:else if loadError && !data}
 		<EmptyState
 			icon={Copy}
 			title="Could not load clones"

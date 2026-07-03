@@ -4,9 +4,12 @@
 //! `serve()` future awaits this token via `with_graceful_shutdown`, so
 //! cancellation drains in-flight requests and exits the process.
 //!
-//! Authentication and same-origin are already enforced by the router-level
-//! middleware, so this handler does no extra guarding. The browser sees
-//! `202 Accepted` immediately; the actual shutdown happens asynchronously.
+//! This route sits behind the router-level middleware stack: the
+//! loopback-origin check plus the `qartez_session` cookie gate
+//! (`auth::require_session_cookie`), so an unauthenticated caller is rejected
+//! before reaching this handler and it does no extra guarding of its own. The
+//! browser sees `202 Accepted` immediately; the actual shutdown happens
+//! asynchronously.
 
 use axum::Json;
 use axum::extract::State;

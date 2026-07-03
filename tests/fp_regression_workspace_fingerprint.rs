@@ -215,22 +215,30 @@ fn checkpoint_truncate_runs_against_post_index_db() {
 }
 
 #[test]
-fn deferred_compaction_env_skips_inline_wal_truncate() {
-    // Set the env var BEFORE opening the DB so the indexer's inline
-    // checkpoint is skipped. The post-indexer WAL file should still
-    // exist but the checkpoint counter shouldn't have run.
+fn deferred_compaction_skips_inline_wal_truncate() {
+    // Enable deferral through the process-global flag (the sound
+    // replacement for the former `QARTEZ_DEFER_COMPACTION` env var, whose
+    // `set_var` write was UB under the multi-threaded tokio runtime). With
+    // it set, the indexer skips its inline `wal_checkpoint(TRUNCATE)` so the
+    // MCP server can hand off quickly and truncate later.
     //
-    // We can't directly observe "checkpoint did not run" without
-    // hooking SQLite's internals, so we verify the behaviour by
-    // contract: the indexer succeeds, the meta table is populated,
-    // and a follow-up explicit checkpoint succeeds (i.e. the
-    // earlier-skipped one didn't leave the DB in a busy state).
-    // SAFETY: this test is single-threaded inside `cargo test`'s
-    // per-test isolation.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("QARTEZ_DEFER_COMPACTION", "1");
+    // We can't directly observe "checkpoint did not run" without hooking
+    // SQLite's internals, so we verify the behaviour by contract: the
+    // indexer succeeds, the meta table is populated, and a follow-up
+    // explicit checkpoint succeeds (i.e. the earlier-skipped one didn't
+    // leave the DB in a busy state).
+    //
+    // The flag is process-global, so a Drop guard resets it even if an
+    // assertion panics, keeping deferral from leaking into sibling tests in
+    // this binary.
+    struct DeferGuard;
+    impl Drop for DeferGuard {
+        fn drop(&mut self) {
+            index::set_defer_compaction(false);
+        }
     }
+    index::set_defer_compaction(true);
+    let _defer_guard = DeferGuard;
 
     let tmp = tempfile::tempdir().unwrap();
     write(&tmp.path().join("src/lib.rs"), "pub fn f() {}\n");
@@ -255,9 +263,4 @@ fn deferred_compaction_env_skips_inline_wal_truncate() {
         busy, 0,
         "post-deferred checkpoint should run cleanly with busy=0"
     );
-
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("QARTEZ_DEFER_COMPACTION");
-    }
 }

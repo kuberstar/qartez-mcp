@@ -118,7 +118,9 @@
 		</CardContent>
 	</Card>
 
-	{#if loadError && !data}
+	{#if loading && !data}
+		<EmptyState icon={Trash2} title="Loading dead code..." />
+	{:else if loadError && !data}
 		<EmptyState
 			icon={Trash2}
 			title="Could not load dead code"

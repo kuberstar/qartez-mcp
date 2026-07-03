@@ -154,13 +154,17 @@ async fn main() -> anyhow::Result<()> {
             // finishes see whatever the DB carried over from the previous
             // run (empty on first-ever start).
             //
-            // Workspace fingerprint short-circuit: when the stored
-            // fingerprint matches the freshly-computed one and the
-            // caller did not pass `--reindex`, we skip the full reindex
-            // entirely. The watcher still incrementally re-indexes any
-            // file that changed since the last run, so up-to-date
-            // semantics are preserved without a multi-minute DB rewrite
-            // on startup.
+            // Workspace fingerprint short-circuit: a matching fingerprint
+            // means the configuration inputs (version, roots, ignore files)
+            // are unchanged, so the expensive global derived tables (PageRank,
+            // co-change) can be left alone. It does NOT mean the source tree
+            // is unchanged: files added, modified, or deleted while this
+            // process was not running emit no watcher events, and a matching
+            // fingerprint must not let those downtime changes go unindexed.
+            // We therefore always run the reconciliation walk below (cheap:
+            // it re-parses only files whose mtime changed and drops vanished
+            // ones) and gate only the heavy recompute on whether that walk
+            // actually changed the indexed file set.
             let db_path = config.db_path.clone();
             let project_roots = config.project_roots.clone();
             let root_aliases = config.root_aliases.clone();
@@ -175,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
                 !reindex && stored_fingerprint.as_deref() == Some(new_fingerprint.as_str());
             if fingerprint_matches {
                 tracing::info!(
-                    "workspace fingerprint matches; skipping full reindex (use --reindex to force)"
+                    "workspace fingerprint matches; reconciling tree, skipping global recompute unless files changed (use --reindex to force)"
                 );
             }
             tokio::task::spawn_blocking(move || {
@@ -197,14 +201,9 @@ async fn main() -> anyhow::Result<()> {
                 // Defer per-root WAL checkpoints inside `full_index_root` and
                 // `incremental_index_with_prefix` so the cold-start path
                 // completes faster; one trailing checkpoint runs at the end.
-                // SAFETY: set_var requires a single-threaded process to be
-                // safe across all callers. The MCP-server startup path runs
-                // this once before any tool dispatch, so there is no
-                // concurrent reader at this point.
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::set_var("QARTEZ_DEFER_COMPACTION", "1");
-                }
+                // A process-global atomic flag (no `set_var`) so this is
+                // sound under the multi-threaded tokio runtime.
+                index::set_defer_compaction(true);
                 let conn = match storage::open_db(&db_path) {
                     Ok(c) => c,
                     Err(e) => {
@@ -212,14 +211,23 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                 };
-                if !fingerprint_matches
-                    && let Err(e) =
-                        index::full_index_multi(&conn, &project_roots, &root_aliases, reindex)
-                {
-                    tracing::error!("background indexer: full_index_multi failed: {e}");
-                    return;
-                }
-                if !fingerprint_matches {
+                // Always reconcile the on-disk tree, even when the fingerprint
+                // matched. This is what discovers files added/modified/deleted
+                // while the server was down - the case the watcher cannot see.
+                let outcome =
+                    match index::full_index_multi(&conn, &project_roots, &root_aliases, reindex) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::error!("background indexer: full_index_multi failed: {e}");
+                            return;
+                        }
+                    };
+                // Recompute the heavy global derived tables only when the
+                // fingerprint changed (config/version/roots) or the walk above
+                // actually touched the file set. A no-op walk leaves PageRank
+                // and co-change valid, preserving the fast-startup intent.
+                let recompute = !fingerprint_matches || outcome.changed();
+                if recompute {
                     if let Err(e) = graph::pagerank::compute_pagerank(&conn, &Default::default()) {
                         tracing::error!("background indexer: pagerank failed: {e}");
                     }

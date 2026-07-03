@@ -42,6 +42,8 @@ use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::{column_exists, table_exists};
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 /// Default node count when the caller omits `?limit=`. Chosen to render
@@ -158,7 +160,7 @@ pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<GraphQuery>,
 ) -> Result<Json<GraphResponse>, (StatusCode, Json<ApiError>)> {
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let with_cochanges = query.with_cochanges.unwrap_or(false);
     let neighbors_of = query.neighbors_of.clone();
     let root = state.project_root().to_path_buf();
@@ -193,13 +195,6 @@ pub async fn handler(
                 Json(ApiError { error: "internal" }),
             ))
         }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
     }
 }
 
@@ -605,31 +600,8 @@ fn load_neighbor_ids(conn: &Connection, target_id: i64) -> anyhow::Result<Vec<i6
     Ok(neighbors.into_iter().collect())
 }
 
-fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(exists.is_some())
-}
-
 fn file_clusters_exists(conn: &Connection) -> anyhow::Result<bool> {
     table_exists(conn, "file_clusters")
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn default_db_path(root: &Path) -> PathBuf {

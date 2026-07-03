@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::column_exists;
 use crate::state::AppState;
 
 /// Maximum number of callers and callees returned in each direction.
@@ -276,18 +277,6 @@ fn load_reference_count(conn: &Connection, symbol_id: i64) -> anyhow::Result<i64
         |r| r.get(0),
     )?;
     Ok(count)
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn default_db_path(root: &Path) -> PathBuf {

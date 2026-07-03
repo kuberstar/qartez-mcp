@@ -5,9 +5,10 @@
 	import '@fontsource/inter/latin-600.css';
 	import '@fontsource/jetbrains-mono/latin-400.css';
 	import favicon from '$lib/assets/favicon.svg';
+	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { dashboardSocket } from '$lib/ws.svelte';
-	import { triggerReindex } from '$lib/api';
+	import { fetchHealth, triggerReindex } from '$lib/api';
 	import Activity from '@lucide/svelte/icons/activity';
 	import Network from '@lucide/svelte/icons/network';
 	import Boxes from '@lucide/svelte/icons/boxes';
@@ -21,8 +22,17 @@
 
 	let { children } = $props();
 
-	const VERSION = '0.1.0';
+	let version = $state<string | null>(null);
 	const sock = dashboardSocket();
+
+	onMount(async () => {
+		try {
+			const health = await fetchHealth();
+			version = health.version;
+		} catch {
+			/* leave version null - badge falls back gracefully */
+		}
+	});
 
 	const navItems = [
 		{ href: '/', label: 'Project Pulse', icon: Activity },
@@ -85,7 +95,7 @@
 			<span class="qartez-wordmark font-mono text-lg">qartez</span>
 			<span
 				class="rounded-md border border-[var(--color-border)] bg-[var(--color-elevated)] px-2 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]"
-				>v{VERSION}</span
+				>{version ? `v${version}` : 'v-'}</span
 			>
 		</div>
 		<div class="flex items-center gap-3">
@@ -100,6 +110,9 @@
 				<RefreshCw size={14} strokeWidth={1.75} class={reindexActive ? 'spin' : ''} />
 				<span>{reindexActive ? 'reindexing...' : 'Reindex'}</span>
 			</button>
+			{#if reindexError}
+				<span class="reindex-error" role="alert">{reindexError}</span>
+			{/if}
 			<div
 				class="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-elevated)] px-3 py-1.5"
 			>
@@ -234,6 +247,20 @@
 		color: var(--color-amber);
 		border-color: var(--color-amber);
 		background: color-mix(in oklch, var(--color-amber) 10%, transparent);
+	}
+
+	.reindex-error {
+		font-family: 'JetBrains Mono', monospace;
+		font-size: 0.7rem;
+		max-width: 20rem;
+		padding: 0.3rem 0.55rem;
+		color: var(--color-amber);
+		background: color-mix(in oklch, var(--color-amber) 10%, transparent);
+		border: 1px solid var(--color-amber);
+		border-radius: 0.375rem;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	:global(.reindex-btn .spin) {

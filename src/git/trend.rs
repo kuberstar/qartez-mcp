@@ -162,6 +162,8 @@ fn commits_touching_file(
         let sha = oid.to_string();
         let summary = commit
             .summary()
+            .ok()
+            .flatten()
             .unwrap_or("")
             .chars()
             .take(60)

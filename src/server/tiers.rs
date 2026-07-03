@@ -50,6 +50,7 @@ pub(super) const TIER_ANALYSIS: &[&str] = &[
     "qartez_knowledge",
     "qartez_blame",
     "qartez_understand",
+    "qartez_path",
 ];
 
 /// Destructive refactoring tools unlocked on demand.

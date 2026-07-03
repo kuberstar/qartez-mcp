@@ -7,7 +7,7 @@
 //! Findings are scored by `severity_weight * file_pagerank * (1 + is_exported)`
 //! so vulnerabilities in high-impact, widely-imported files surface first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use regex::Regex;
@@ -94,6 +94,15 @@ pub struct Finding {
     pub risk_score: f64,
     pub snippet: Option<String>,
     pub description: String,
+    /// Id of the enclosing symbol this finding was raised in. Used by the
+    /// opt-in source->sink reachability pass to map a finding back onto the
+    /// `symbol_refs` graph. Defaults to the scanning symbol's row id.
+    pub symbol_id: i64,
+    /// Populated only by the opt-in [`annotate_sink_reachability`] pass when
+    /// this finding is a dangerous SINK whose enclosing symbol is
+    /// call-graph-reachable from a user-input SOURCE. `None` on the default
+    /// (regex-only) path, so default output is unchanged.
+    pub reachability: Option<SinkReachability>,
 }
 
 /// Options controlling the scan scope and filters.
@@ -858,6 +867,8 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
                     risk_score: compute_risk_score(cr.rule.severity, pr, sym.is_exported),
                     snippet,
                     description: cr.rule.description.clone(),
+                    symbol_id: sym.id,
+                    reachability: None,
                 });
             }
         }
@@ -869,6 +880,206 @@ pub fn scan(conn: &Connection, rules: &[SecurityRule], opts: &ScanOptions) -> Ve
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     findings
+}
+
+// ---------------------------------------------------------------------------
+// Source -> sink call-graph reachability (opt-in)
+// ---------------------------------------------------------------------------
+
+/// Coarse source->sink reachability annotation for a dangerous finding.
+///
+/// Records that a SINK finding's enclosing symbol is call-graph-reachable
+/// from a user-input SOURCE symbol, together with the connecting symbol-name
+/// path. This is REFERENCE-reachability, not variable-level taint:
+/// `symbol_refs` edges mean "symbol A references symbol B", so a hit says a
+/// source and this sink share a call path - not that attacker data provably
+/// flows into the sink. Treat it as a triage-confidence boost, never proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkReachability {
+    /// Name of the user-input source symbol the sink is reachable from.
+    pub source_symbol: String,
+    /// Symbol-name path from the source down to the sink's enclosing symbol,
+    /// inclusive of both ends. A single-element path means the sink symbol
+    /// is itself classified as a source (input handled in the same symbol).
+    pub path: Vec<String>,
+}
+
+/// Upper bound on nodes explored per sink during the backward BFS. Keeps the
+/// coarse heuristic bounded on large graphs; a source further than this many
+/// reference edges away is not worth reporting as a connecting path.
+const MAX_REACH_EXPLORE: usize = 4096;
+
+/// Identifier components that mark a symbol as a likely user-input SOURCE
+/// (HTTP request, CLI args, environment, query params, ...). Matched against
+/// the word components of the symbol name so `read_env` and `parse_params`
+/// hit without the `env` inside `prevent` matching as a substring.
+const SOURCE_NAME_TOKENS: &[&str] = &[
+    "request", "req", "params", "param", "argv", "args", "env", "environ", "query", "stdin",
+    "handler", "handle", "route", "router", "webhook", "body", "payload", "form", "input", "cgi",
+];
+
+/// Distinctive tokens safe to match as raw substrings (they do not occur
+/// inside unrelated identifiers). Catches camelCase names like
+/// `handleRequest` that the underscore/word split cannot decompose.
+const SOURCE_SUBSTR_TOKENS: &[&str] = &[
+    "request", "params", "argv", "webhook", "query", "payload", "stdin",
+];
+
+/// Substrings that mark a SOURCE when they appear in a symbol signature
+/// (parameter names / types). Kept conservative to limit false positives.
+const SOURCE_SIGNATURE_TOKENS: &[&str] = &[
+    "request",
+    "httprequest",
+    "params",
+    "argv",
+    "query",
+    "webhook",
+    "payload",
+];
+
+/// True when a finding is a dangerous SINK worth wiring to input sources:
+/// SQL execution (SEC003), command execution (SEC004), or arbitrary-code
+/// eval (SEC010). Custom rules may opt in via a `deserialization` category.
+fn is_sink_finding(f: &Finding) -> bool {
+    matches!(f.rule_id.as_str(), "SEC003" | "SEC004" | "SEC010")
+        || f.category.eq_ignore_ascii_case("deserialization")
+}
+
+/// Coarse classifier: is `sym` plausibly a user-input source? Splits the
+/// name into word components and also checks distinctive substrings plus the
+/// signature. Intentionally lenient - a false positive only over-annotates a
+/// finding on the opt-in path; it never suppresses or reorders findings.
+fn symbol_is_input_source(sym: &SymbolRow) -> bool {
+    let name = sym.name.to_ascii_lowercase();
+    if name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|comp| SOURCE_NAME_TOKENS.contains(&comp))
+    {
+        return true;
+    }
+    if SOURCE_SUBSTR_TOKENS.iter().any(|t| name.contains(t)) {
+        return true;
+    }
+    if let Some(sig) = sym.signature.as_deref() {
+        let sig = sig.to_ascii_lowercase();
+        if SOURCE_SIGNATURE_TOKENS.iter().any(|t| sig.contains(t)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reconstruct the source -> ... -> sink symbol-name path from the BFS
+/// parent map. `parent[node]` points one hop closer to the sink.
+fn reconstruct_path(
+    source: i64,
+    sink: i64,
+    parent: &HashMap<i64, i64>,
+    symbols: &HashMap<i64, SymbolRow>,
+) -> SinkReachability {
+    let mut ids = vec![source];
+    let mut cur = source;
+    while cur != sink {
+        match parent.get(&cur) {
+            Some(&next) => {
+                ids.push(next);
+                cur = next;
+            }
+            None => break,
+        }
+    }
+    let name_of = |id: i64| {
+        symbols
+            .get(&id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("#{id}"))
+    };
+    let source_symbol = name_of(source);
+    let path = ids.into_iter().map(name_of).collect();
+    SinkReachability {
+        source_symbol,
+        path,
+    }
+}
+
+/// Backward BFS from a sink symbol over reversed reference edges, returning
+/// the shortest connecting path to a user-input source when one exists.
+///
+/// `reverse_adj` maps a symbol to the symbols that reference it (its
+/// callers). The returned path runs source -> ... -> sink. When the sink
+/// symbol is itself a source the path is a single element.
+fn nearest_source_path(
+    sink_id: i64,
+    reverse_adj: &HashMap<i64, Vec<i64>>,
+    symbols: &HashMap<i64, SymbolRow>,
+) -> Option<SinkReachability> {
+    let mut visited: HashSet<i64> = HashSet::new();
+    // parent[node] is the node we reached `node` from, i.e. one hop closer
+    // to the sink; it lets us rebuild the source -> sink chain.
+    let mut parent: HashMap<i64, i64> = HashMap::new();
+    let mut queue: VecDeque<i64> = VecDeque::new();
+
+    visited.insert(sink_id);
+    queue.push_back(sink_id);
+
+    while let Some(cur) = queue.pop_front() {
+        if let Some(sym) = symbols.get(&cur)
+            && symbol_is_input_source(sym)
+        {
+            return Some(reconstruct_path(cur, sink_id, &parent, symbols));
+        }
+        if visited.len() >= MAX_REACH_EXPLORE {
+            break;
+        }
+        if let Some(callers) = reverse_adj.get(&cur) {
+            for &caller in callers {
+                if visited.insert(caller) {
+                    parent.insert(caller, cur);
+                    queue.push_back(caller);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Opt-in second pass: annotate dangerous SINK findings that are
+/// call-graph-reachable from a user-input SOURCE.
+///
+/// Layers coarse source->sink reachability onto the regex findings produced
+/// by [`scan`]. It never adds, removes, or reorders findings - it only sets
+/// [`Finding::reachability`] on SINK findings it can connect to a source, so
+/// the default (regex-only) output is unchanged. Callers opt in explicitly.
+///
+/// The reachability is REFERENCE-level, not taint-level (see
+/// [`SinkReachability`]). On any storage error the findings are left
+/// untouched.
+pub fn annotate_sink_reachability(conn: &Connection, findings: &mut [Finding]) {
+    if !findings.iter().any(is_sink_finding) {
+        return;
+    }
+    let symbols: HashMap<i64, SymbolRow> = match read::get_all_symbols_with_path(conn) {
+        Ok(rows) => rows.into_iter().map(|(sym, _)| (sym.id, sym)).collect(),
+        Err(_) => return,
+    };
+    let refs = match read::get_all_symbol_refs(conn) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Reverse adjacency: callee -> [callers]. Backward BFS from each sink
+    // finds the nearest source that transitively references it.
+    let mut reverse_adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (from, to) in refs {
+        reverse_adj.entry(to).or_default().push(from);
+    }
+
+    for finding in findings.iter_mut() {
+        if !is_sink_finding(finding) {
+            continue;
+        }
+        finding.reachability = nearest_source_path(finding.symbol_id, &reverse_adj, &symbols);
+    }
 }
 
 /// SEC007 allowlist: returns true when an `http://` match should NOT be
@@ -2270,6 +2481,166 @@ description = "AWS access key"
                 rule.id
             );
         }
+    }
+
+    // --- Source -> sink reachability (opt-in F3) -----------------------
+
+    fn mk_symbol(id: i64, name: &str, signature: Option<&str>) -> SymbolRow {
+        SymbolRow {
+            id,
+            file_id: 1,
+            name: name.to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: 2,
+            signature: signature.map(str::to_string),
+            is_exported: true,
+            shape_hash: None,
+            parent_id: None,
+            pagerank: 0.0,
+            complexity: None,
+            owner_type: None,
+        }
+    }
+
+    fn mk_finding(rule_id: &str, category: &str, symbol_id: i64) -> Finding {
+        Finding {
+            rule_id: rule_id.to_string(),
+            rule_name: "r".to_string(),
+            severity: Severity::High,
+            category: category.to_string(),
+            file_path: "src/x.rs".to_string(),
+            symbol_name: "s".to_string(),
+            line_start: 1,
+            line_end: 2,
+            pagerank: 0.0,
+            risk_score: 0.0,
+            snippet: None,
+            description: "d".to_string(),
+            symbol_id,
+            reachability: None,
+        }
+    }
+
+    fn symbols_map(rows: Vec<SymbolRow>) -> HashMap<i64, SymbolRow> {
+        rows.into_iter().map(|s| (s.id, s)).collect()
+    }
+
+    fn reverse_adjacency(edges: &[(i64, i64)]) -> HashMap<i64, Vec<i64>> {
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        for &(from, to) in edges {
+            adj.entry(to).or_default().push(from);
+        }
+        adj
+    }
+
+    #[test]
+    fn sink_classification_covers_exec_rules_only() {
+        assert!(is_sink_finding(&mk_finding("SEC003", "injection", 1)));
+        assert!(is_sink_finding(&mk_finding("SEC004", "injection", 1)));
+        assert!(is_sink_finding(&mk_finding("SEC010", "injection", 1)));
+        // Custom deserialization rule opts in via category.
+        assert!(is_sink_finding(&mk_finding("CUST01", "deserialization", 1)));
+        // Non-exec findings are not sinks.
+        assert!(!is_sink_finding(&mk_finding("SEC001", "secrets", 1)));
+        assert!(!is_sink_finding(&mk_finding("SEC005", "injection", 1)));
+        assert!(!is_sink_finding(&mk_finding("SEC008", "unsafe", 1)));
+    }
+
+    #[test]
+    fn source_classification_matches_input_names() {
+        assert!(symbol_is_input_source(&mk_symbol(
+            1,
+            "handle_request",
+            None
+        )));
+        assert!(symbol_is_input_source(&mk_symbol(1, "read_env", None)));
+        assert!(symbol_is_input_source(&mk_symbol(
+            1,
+            "parse_query_params",
+            None
+        )));
+        // camelCase caught by the distinctive substring set.
+        assert!(symbol_is_input_source(&mk_symbol(1, "handleRequest", None)));
+        // Signature-based match.
+        assert!(symbol_is_input_source(&mk_symbol(
+            1,
+            "process",
+            Some("fn process(req: HttpRequest) -> Response")
+        )));
+        // Plain compute helpers are not sources; `prevent` must not match
+        // the `env` token as a substring.
+        assert!(!symbol_is_input_source(&mk_symbol(
+            1,
+            "compute_total",
+            None
+        )));
+        assert!(!symbol_is_input_source(&mk_symbol(
+            1,
+            "prevent_default",
+            None
+        )));
+    }
+
+    #[test]
+    fn reachability_direct_edge_from_source() {
+        // handle_request (1) -> execute_sql (2, sink)
+        let symbols = symbols_map(vec![
+            mk_symbol(1, "handle_request", None),
+            mk_symbol(2, "execute_sql", None),
+        ]);
+        let reverse = reverse_adjacency(&[(1, 2)]);
+        let reach = nearest_source_path(2, &reverse, &symbols).expect("reachable");
+        assert_eq!(reach.source_symbol, "handle_request");
+        assert_eq!(reach.path, vec!["handle_request", "execute_sql"]);
+    }
+
+    #[test]
+    fn reachability_transitive_path() {
+        // handle_request (1) -> build_stmt (2) -> execute_sql (3, sink)
+        let symbols = symbols_map(vec![
+            mk_symbol(1, "handle_request", None),
+            mk_symbol(2, "build_stmt", None),
+            mk_symbol(3, "execute_sql", None),
+        ]);
+        let reverse = reverse_adjacency(&[(1, 2), (2, 3)]);
+        let reach = nearest_source_path(3, &reverse, &symbols).expect("reachable");
+        assert_eq!(
+            reach.path,
+            vec!["handle_request", "build_stmt", "execute_sql"]
+        );
+    }
+
+    #[test]
+    fn reachability_none_without_source() {
+        // compute (1) -> execute_sql (2, sink); no symbol is a source.
+        let symbols = symbols_map(vec![
+            mk_symbol(1, "compute_total", None),
+            mk_symbol(2, "execute_sql", None),
+        ]);
+        let reverse = reverse_adjacency(&[(1, 2)]);
+        assert!(nearest_source_path(2, &reverse, &symbols).is_none());
+    }
+
+    #[test]
+    fn reachability_sink_symbol_is_itself_a_source() {
+        // A request handler that builds the query inline: single-element path.
+        let symbols = symbols_map(vec![mk_symbol(1, "request_handler", None)]);
+        let reverse = reverse_adjacency(&[]);
+        let reach = nearest_source_path(1, &reverse, &symbols).expect("self source");
+        assert_eq!(reach.source_symbol, "request_handler");
+        assert_eq!(reach.path, vec!["request_handler"]);
+    }
+
+    #[test]
+    fn reachability_ignores_cycles() {
+        // Cycle 1 <-> 2 with no source must terminate and report nothing.
+        let symbols = symbols_map(vec![
+            mk_symbol(1, "node_a", None),
+            mk_symbol(2, "execute_sql", None),
+        ]);
+        let reverse = reverse_adjacency(&[(1, 2), (2, 1)]);
+        assert!(nearest_source_path(2, &reverse, &symbols).is_none());
     }
 
     #[test]

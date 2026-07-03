@@ -77,7 +77,7 @@ qartez_test_gaps mode=suggest base=main # which tests should you run?
 
 ## Unlocking tools
 
-By default, all 42 tools are available. With progressive disclosure
+By default, all 43 tools are available. With progressive disclosure
 (`QARTEZ_PROGRESSIVE=1`), start with core tools and unlock more as needed:
 
 ```
@@ -97,6 +97,7 @@ qartez_tools enable=["all"]             # unlock everything
 | Get a prioritized fix list for the repo | analysis (`qartez_health`) |
 | Plan a refactor on a specific file | analysis (`qartez_refactor_plan`) |
 | Find duplicate code | analysis (`qartez_clones`) |
+| Trace the shortest path between two symbols | analysis (`qartez_path`) |
 | Rename a symbol across the codebase | refactor (`qartez_rename`) |
 | Move a function to another file | refactor (`qartez_move`) |
 | Run tests or build the project | meta (`qartez_project`) |

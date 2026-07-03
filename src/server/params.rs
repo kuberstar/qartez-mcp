@@ -640,6 +640,11 @@ pub(super) struct SoulUnusedParams {
     #[schemars(description = "Pagination offset into the unused-exports list (default: 0)")]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub offset: Option<u32>,
+    #[schemars(
+        description = "When true, compute dead code by whole-program reachability instead of the default one-hop check: seed roots from `main`, exported public API, framework entry-points, and tests, then forward-walk the reference graph. Catches functions reachable only from other dead code that the one-hop scan reports as live (because they still have a direct importer). Default false."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub reachable: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1064,6 +1069,11 @@ pub(super) struct SoulSecurityParams {
     #[schemars(description = "Approximate token budget for output (default: 4000)")]
     #[serde(default, deserialize_with = "flexible::u32_opt")]
     pub token_budget: Option<u32>,
+    #[schemars(
+        description = "If true, run an opt-in second pass that annotates dangerous SINK findings (SQL/command exec, deserialization) with whether they are call-graph reachable from a user-input SOURCE and the connecting path. Coarse reference-level reachability, not variable taint (default: false)."
+    )]
+    #[serde(default, deserialize_with = "flexible::bool_opt")]
+    pub taint_reachability: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

@@ -2017,24 +2017,24 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
     let config_path = Ide::Continue.config_path();
     ensure_parent(&config_path)?;
 
-    let mut data: serde_yaml::Value = if config_path.is_file() {
+    let mut data: serde_yaml_ng::Value = if config_path.is_file() {
         let text = fs::read_to_string(&config_path)?;
-        serde_yaml::from_str(&text).unwrap_or(serde_yaml::Value::Mapping(Default::default()))
+        serde_yaml_ng::from_str(&text).unwrap_or(serde_yaml_ng::Value::Mapping(Default::default()))
     } else {
-        let mut m = serde_yaml::Mapping::new();
+        let mut m = serde_yaml_ng::Mapping::new();
         m.insert(
-            serde_yaml::Value::String("name".into()),
-            serde_yaml::Value::String("Local Config".into()),
+            serde_yaml_ng::Value::String("name".into()),
+            serde_yaml_ng::Value::String("Local Config".into()),
         );
         m.insert(
-            serde_yaml::Value::String("version".into()),
-            serde_yaml::Value::String("0.0.1".into()),
+            serde_yaml_ng::Value::String("version".into()),
+            serde_yaml_ng::Value::String("0.0.1".into()),
         );
         m.insert(
-            serde_yaml::Value::String("schema".into()),
-            serde_yaml::Value::String("v1".into()),
+            serde_yaml_ng::Value::String("schema".into()),
+            serde_yaml_ng::Value::String("v1".into()),
         );
-        serde_yaml::Value::Mapping(m)
+        serde_yaml_ng::Value::Mapping(m)
     };
 
     let mapping = data
@@ -2042,9 +2042,9 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
     // Ensure mcpServers is a sequence
-    let servers_key = serde_yaml::Value::String("mcpServers".into());
+    let servers_key = serde_yaml_ng::Value::String("mcpServers".into());
     if !mapping.contains_key(&servers_key) || !mapping[&servers_key].is_sequence() {
-        mapping.insert(servers_key.clone(), serde_yaml::Value::Sequence(vec![]));
+        mapping.insert(servers_key.clone(), serde_yaml_ng::Value::Sequence(vec![]));
     }
 
     let servers = mapping[&servers_key]
@@ -2052,11 +2052,11 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
         .expect("mcpServers must be a sequence");
 
     let desired = {
-        let mut m = serde_yaml::Mapping::new();
-        m.insert("name".into(), serde_yaml::Value::String("qartez".into()));
-        m.insert("command".into(), serde_yaml::Value::String(bin.into()));
-        m.insert("args".into(), serde_yaml::Value::Sequence(vec![]));
-        serde_yaml::Value::Mapping(m)
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert("name".into(), serde_yaml_ng::Value::String("qartez".into()));
+        m.insert("command".into(), serde_yaml_ng::Value::String(bin.into()));
+        m.insert("args".into(), serde_yaml_ng::Value::Sequence(vec![]));
+        serde_yaml_ng::Value::Mapping(m)
     };
 
     // Find existing entry by name
@@ -2090,7 +2090,7 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
         ));
     }
 
-    let out = serde_yaml::to_string(&data)?;
+    let out = serde_yaml_ng::to_string(&data)?;
     fs::write(&config_path, out)?;
     Ok(())
 }
@@ -2106,12 +2106,12 @@ fn uninstall_continue() -> anyhow::Result<()> {
     }
 
     let text = fs::read_to_string(&config_path)?;
-    let mut data: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)?;
     let mapping = data
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let servers_key = serde_yaml::Value::String("mcpServers".into());
+    let servers_key = serde_yaml_ng::Value::String("mcpServers".into());
     let Some(servers) = mapping
         .get_mut(&servers_key)
         .and_then(|v| v.as_sequence_mut())
@@ -2135,7 +2135,7 @@ fn uninstall_continue() -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     servers.remove(i);
-    let out = serde_yaml::to_string(&data)?;
+    let out = serde_yaml_ng::to_string(&data)?;
     fs::write(&config_path, out)?;
     info(&format!("Removed qartez from {}", config_path.display()));
     Ok(())
@@ -2556,22 +2556,22 @@ fn install_goose(bin: &str) -> anyhow::Result<()> {
     let config_path = Ide::Goose.config_path();
     ensure_parent(&config_path)?;
 
-    let mut data: serde_yaml::Value = if config_path.is_file() {
+    let mut data: serde_yaml_ng::Value = if config_path.is_file() {
         let text = fs::read_to_string(&config_path)?;
-        serde_yaml::from_str(&text).unwrap_or(serde_yaml::Value::Mapping(Default::default()))
+        serde_yaml_ng::from_str(&text).unwrap_or(serde_yaml_ng::Value::Mapping(Default::default()))
     } else {
-        serde_yaml::Value::Mapping(Default::default())
+        serde_yaml_ng::Value::Mapping(Default::default())
     };
 
     let mapping = data
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let ext_key = serde_yaml::Value::String("extensions".into());
+    let ext_key = serde_yaml_ng::Value::String("extensions".into());
     if !mapping.contains_key(&ext_key) || !mapping[&ext_key].is_mapping() {
         mapping.insert(
             ext_key.clone(),
-            serde_yaml::Value::Mapping(Default::default()),
+            serde_yaml_ng::Value::Mapping(Default::default()),
         );
     }
 
@@ -2579,13 +2579,13 @@ fn install_goose(bin: &str) -> anyhow::Result<()> {
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("Goose 'extensions' field is not a mapping"))?;
 
-    let qartez_key = serde_yaml::Value::String("qartez".into());
+    let qartez_key = serde_yaml_ng::Value::String("qartez".into());
 
     let desired = {
-        let mut m = serde_yaml::Mapping::new();
-        m.insert("command".into(), serde_yaml::Value::String(bin.into()));
-        m.insert("args".into(), serde_yaml::Value::Sequence(vec![]));
-        serde_yaml::Value::Mapping(m)
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert("command".into(), serde_yaml_ng::Value::String(bin.into()));
+        m.insert("args".into(), serde_yaml_ng::Value::Sequence(vec![]));
+        serde_yaml_ng::Value::Mapping(m)
     };
 
     if extensions.get(&qartez_key) == Some(&desired) {
@@ -2599,7 +2599,7 @@ fn install_goose(bin: &str) -> anyhow::Result<()> {
     backup_file(&config_path)?;
     extensions.insert(qartez_key, desired);
 
-    let out = serde_yaml::to_string(&data)?;
+    let out = serde_yaml_ng::to_string(&data)?;
     fs::write(&config_path, out)?;
 
     if existed {
@@ -2627,13 +2627,13 @@ fn uninstall_goose() -> anyhow::Result<()> {
     }
 
     let text = fs::read_to_string(&config_path)?;
-    let mut data: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)?;
     let mapping = data
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let ext_key = serde_yaml::Value::String("extensions".into());
-    let qartez_key = serde_yaml::Value::String("qartez".into());
+    let ext_key = serde_yaml_ng::Value::String("extensions".into());
+    let qartez_key = serde_yaml_ng::Value::String("qartez".into());
 
     let Some(extensions) = mapping.get_mut(&ext_key).and_then(|v| v.as_mapping_mut()) else {
         info("qartez not present in Goose config. Nothing to uninstall.");
@@ -2647,7 +2647,7 @@ fn uninstall_goose() -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     extensions.remove(&qartez_key);
-    let out = serde_yaml::to_string(&data)?;
+    let out = serde_yaml_ng::to_string(&data)?;
     fs::write(&config_path, out)?;
     info(&format!("Removed qartez from {}", config_path.display()));
     Ok(())
@@ -2674,6 +2674,19 @@ fn install_codex(bin: &str) -> anyhow::Result<()> {
     } else {
         String::new()
     };
+
+    // An external MCP-sync block (MegaClaude / MegaCoder) already mirrors
+    // qartez into this config from the Claude settings. Writing our own
+    // [mcp_servers.qartez] table on top of it would produce a duplicate TOML
+    // key and break Codex's parse, so leave the externally-managed entry
+    // alone and report success - qartez is already reachable from Codex.
+    if qartez_entry_is_externally_synced(&content) {
+        info(&format!(
+            "Codex already receives qartez via an external MCP-sync block (MegaClaude/MegaCoder) in {} (no changes).",
+            config_path.display()
+        ));
+        return Ok(());
+    }
 
     // Check for unmanaged entry
     if has_unmanaged_codex_entry(&content) {
@@ -2783,6 +2796,44 @@ fn has_unmanaged_codex_entry(content: &str) -> bool {
         }
     }
     false
+}
+
+/// Returns true if a `[mcp_servers.qartez]` table lives inside an external
+/// MCP-sync block - the markers MegaClaude (`# <megaclaude-mcp-sync>`) and
+/// MegaCoder (`# <megacoder-mcp-sync>`) wrap around the servers they mirror
+/// from the Claude config. When such a block already owns the qartez entry,
+/// qartez-setup must not add its own copy: TOML forbids duplicate keys, so a
+/// second `[mcp_servers.qartez]` table would make Codex fail to parse the
+/// file. Detection is generic over any `# <NAME-mcp-sync>` ... `# </NAME-mcp-sync>`
+/// pair so future syncers using the same convention are covered.
+fn qartez_entry_is_externally_synced(content: &str) -> bool {
+    let mut sync_depth: u32 = 0;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if is_external_sync_open(trimmed) {
+            sync_depth += 1;
+            continue;
+        }
+        if is_external_sync_close(trimmed) {
+            sync_depth = sync_depth.saturating_sub(1);
+            continue;
+        }
+        if sync_depth > 0 && trimmed == "[mcp_servers.qartez]" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Opening marker of an external MCP-sync block, e.g. `# <megaclaude-mcp-sync>`.
+/// Excludes closing markers (`# </...`) which share the `-mcp-sync>` suffix.
+fn is_external_sync_open(line: &str) -> bool {
+    line.starts_with("# <") && !line.starts_with("# </") && line.ends_with("-mcp-sync>")
+}
+
+/// Closing marker of an external MCP-sync block, e.g. `# </megaclaude-mcp-sync>`.
+fn is_external_sync_close(line: &str) -> bool {
+    line.starts_with("# </") && line.ends_with("-mcp-sync>")
 }
 
 fn current_codex_binary(content: &str) -> Option<String> {
@@ -3444,6 +3495,50 @@ fn parse_ide_list(names: &[String]) -> anyhow::Result<Vec<Ide>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn externally_synced_qartez_entry_detected_for_megaclaude_and_megacoder() {
+        let megaclaude = "\
+# <megaclaude-mcp-sync>
+[mcp_servers.brightdata]
+url = \"https://example\"
+
+[mcp_servers.qartez]
+command = \"/Users/x/.local/bin/qartez\"
+args = []
+# </megaclaude-mcp-sync>
+";
+        assert!(qartez_entry_is_externally_synced(megaclaude));
+
+        let megacoder = "\
+# <megacoder-mcp-sync>
+[mcp_servers.qartez]
+command = \"/usr/bin/qartez\"
+# </megacoder-mcp-sync>
+";
+        assert!(qartez_entry_is_externally_synced(megacoder));
+    }
+
+    #[test]
+    fn unmanaged_qartez_entry_outside_sync_block_is_not_externally_synced() {
+        // Hand-written entry with no sync markers: must NOT be treated as
+        // externally managed (so the unmanaged guard still fires).
+        let content = "\
+[mcp_servers.qartez]
+command = \"/usr/bin/qartez\"
+";
+        assert!(!qartez_entry_is_externally_synced(content));
+        assert!(has_unmanaged_codex_entry(content));
+    }
+
+    #[test]
+    fn qartez_own_block_is_not_mistaken_for_external_sync() {
+        // qartez-setup's own block uses `-begin`/`-end` markers, not
+        // `-mcp-sync`, so it is neither external-sync nor unmanaged.
+        let content = render_codex_block("/usr/bin/qartez");
+        assert!(!qartez_entry_is_externally_synced(&content));
+        assert!(!has_unmanaged_codex_entry(&content));
+    }
 
     #[test]
     fn parse_semver_strips_v_prefix_and_records_stability() {
@@ -4443,6 +4538,87 @@ mod tests {
                     cmd.contains("qartez-guard"),
                     "PreToolUse hook should reference qartez-guard: {cmd}"
                 );
+            }
+        }
+    }
+
+    /// Extracts the YAML frontmatter from a Markdown document.
+    ///
+    /// Returns the text between the opening `---` line and the next `---`
+    /// line, or `None` when the document does not begin with a frontmatter
+    /// block. Handles both `\n` and `\r\n` line endings.
+    fn yaml_frontmatter(markdown: &str) -> Option<&str> {
+        let body = markdown
+            .strip_prefix("---\n")
+            .or_else(|| markdown.strip_prefix("---\r\n"))?;
+        let end = body.find("\n---")?;
+        Some(&body[..end])
+    }
+
+    #[test]
+    fn embedded_skill_template_has_valid_yaml_frontmatter() {
+        // `install_skill` embeds `scripts/skill/SKILL.md` verbatim via
+        // `include_str!` and writes it into the user's skills directory. A
+        // folded block scalar written inline (e.g. `description: >- text` on
+        // a single line) is invalid YAML, so the host silently skips the
+        // skill at load time. Parsing the frontmatter here fails the build
+        // before such a template can ship. Unknown keys (e.g. a future
+        // `model:`) are intentionally ignored by serde.
+        #[derive(serde::Deserialize)]
+        struct SkillFrontmatter {
+            name: String,
+            description: String,
+        }
+
+        let frontmatter = yaml_frontmatter(SKILL_MD)
+            .expect("SKILL.md template must open with a `---` YAML frontmatter block");
+        let parsed: SkillFrontmatter = serde_yaml_ng::from_str(frontmatter)
+            .unwrap_or_else(|e| panic!("SKILL.md frontmatter is not valid YAML: {e}"));
+
+        assert!(
+            !parsed.name.trim().is_empty(),
+            "SKILL.md frontmatter must define a non-empty `name`"
+        );
+        assert!(
+            !parsed.description.trim().is_empty(),
+            "SKILL.md frontmatter must define a non-empty `description`"
+        );
+    }
+
+    #[test]
+    fn embedded_skill_docs_have_parseable_frontmatter() {
+        // Defense in depth across the whole embedded `scripts/skill/` tree:
+        // any document that opens with a `---` block must carry valid YAML
+        // frontmatter. Documents without a frontmatter block are skipped, so
+        // this stays correct as reference docs are added or removed.
+        let skill_docs = [
+            ("SKILL.md", SKILL_MD),
+            ("references/tools.md", SKILL_TOOLS_MD),
+            ("references/guard.md", SKILL_GUARD_MD),
+            ("references/runtime-contract.md", SKILL_RUNTIME_CONTRACT_MD),
+            (
+                "references/subagent-contract.md",
+                SKILL_SUBAGENT_CONTRACT_MD,
+            ),
+            ("references/host-matrix.md", SKILL_HOST_MATRIX_MD),
+            ("references/confidence-model.md", SKILL_CONFIDENCE_MODEL_MD),
+            ("references/doctrine-explore.md", SKILL_DOCTRINE_EXPLORE_MD),
+            ("references/doctrine-debug.md", SKILL_DOCTRINE_DEBUG_MD),
+            ("references/doctrine-review.md", SKILL_DOCTRINE_REVIEW_MD),
+            (
+                "references/doctrine-refactor.md",
+                SKILL_DOCTRINE_REFACTOR_MD,
+            ),
+            (
+                "references/doctrine-premerge.md",
+                SKILL_DOCTRINE_PREMERGE_MD,
+            ),
+        ];
+
+        for (name, body) in skill_docs {
+            if let Some(frontmatter) = yaml_frontmatter(body) {
+                serde_yaml_ng::from_str::<serde_yaml_ng::Value>(frontmatter)
+                    .unwrap_or_else(|e| panic!("{name} frontmatter is not valid YAML: {e}"));
             }
         }
     }

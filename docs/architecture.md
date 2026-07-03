@@ -26,7 +26,7 @@ source files
                                           ▼
                                    ┌────────────┐
                                    │ MCP Server │◀── JSON-RPC (stdio)
-                                   │  42 tools  │
+                                   │  43 tools  │
                                    └────────────┘
 ```
 

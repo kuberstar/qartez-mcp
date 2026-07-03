@@ -21,6 +21,9 @@ use axum::http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::column_exists;
+use crate::api::handler_util::{ApiError, run_blocking};
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 const MIN_CC: i64 = 15;
@@ -64,47 +67,13 @@ pub struct SmellsResponse {
     pub indexed: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ApiError {
-    pub error: &'static str,
-}
-
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<SmellsQuery>,
 ) -> Result<Json<SmellsResponse>, (StatusCode, Json<ApiError>)> {
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let root = state.project_root().to_path_buf();
-
-    let result = tokio::task::spawn_blocking(move || compute_smells_at_root(&root, limit))
-        .await
-        .map_err(|error| {
-            tracing::error!(?error, "smells.join.failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "join error",
-                }),
-            )
-        })?;
-
-    match result {
-        Ok(response) => Ok(Json(response)),
-        Err(error) => {
-            tracing::error!(?error, "smells.query.failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: "internal" }),
-            ))
-        }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
-    }
+    run_blocking(root, limit, "smells", compute_smells_at_root).await
 }
 
 fn compute_smells_at_root(root: &Path, limit: i64) -> anyhow::Result<SmellsResponse> {
@@ -267,18 +236,6 @@ fn count_signature_params(sig: &str) -> usize {
             !matches!(base, "self" | "&self" | "&mut self" | "mut self" | "cls")
         })
         .count()
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn default_db_path(root: &Path) -> PathBuf {

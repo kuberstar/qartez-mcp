@@ -11,7 +11,7 @@ Qartez is a code-intelligence MCP server. Use its tools INSTEAD of built-in file
 
 ## Tool tiers
 
-Qartez organizes its 42 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
+Qartez organizes its 43 tools into tiers. Core tools are always available. Additional tiers can be unlocked on demand via `qartez_tools`.
 
 ### Core (always available)
 
@@ -44,6 +44,7 @@ Deep investigation for debugging, review, and architecture:
 - `qartez_blame` - symbol-scoped git blame (line authorship; hunk + aggregate modes; requires git_depth > 0)
 - `qartez_security` - scan for OWASP-style vulnerabilities and insecure patterns
 - `qartez_semantic` - semantic code search via embedding similarity (requires `semantic` feature)
+- `qartez_path` - shortest call/reference path between two symbols
 
 ### Refactor (unlock via `qartez_tools enable: ["refactor"]`)
 

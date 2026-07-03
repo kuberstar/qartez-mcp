@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::auth;
-use crate::state::{AppState, Event};
+use crate::state::AppState;
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -74,10 +74,4 @@ async fn run(mut socket: WebSocket, state: AppState) {
             }
         }
     }
-}
-
-/// Helper to publish an `Event` from anywhere with access to `AppState`.
-/// Drops silently when there are no subscribers; that is intentional.
-pub fn broadcast(state: &AppState, event: Event) {
-    let _ = state.events().send(event);
 }

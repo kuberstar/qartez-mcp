@@ -107,7 +107,9 @@
 		</CardContent>
 	</Card>
 
-	{#if loadError && !data}
+	{#if loading && !data}
+		<EmptyState icon={Flame} title="Loading hotspots..." />
+	{:else if loadError && !data}
 		<EmptyState
 			icon={Flame}
 			title="Could not load hotspots"

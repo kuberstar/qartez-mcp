@@ -11,10 +11,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use axum::extract::State;
+use axum_extra::extract::cookie::CookieJar;
 use http::{HeaderValue, Request, StatusCode, header};
 use rand::TryRngCore;
 
 use crate::paths;
+use crate::state::AppState;
 
 /// Session token length in bytes before hex encoding.
 ///
@@ -117,6 +120,52 @@ pub async fn require_loopback_origin(
     }
 }
 
+/// Middleware enforcing a valid session cookie on protected routes.
+///
+/// The loopback-origin check alone is trivially spoofable by any local
+/// process (`curl -H 'Origin: http://localhost'`), so it cannot stand in for
+/// authentication. This layer requires the `qartez_session` cookie to
+/// constant-time-equal the daemon's session token (the same value the browser
+/// received from the 0600 token file via the `/auth` handshake).
+///
+/// It gates every `/api/*`, `/ws`, and data route. The `/auth` handshake and
+/// the static-asset fallback are intentionally left ungated: the browser must
+/// be able to reach `/auth` to obtain the cookie and to load the SPA shell
+/// before it holds one. Chain this AFTER [`require_loopback_origin`].
+///
+/// Returns `401 Unauthorized` when the cookie is absent or does not match.
+pub async fn require_session_cookie(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let jar = CookieJar::from_headers(req.headers());
+    let Some(cookie) = jar.get(SESSION_COOKIE) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if constant_time_eq(cookie.value().as_bytes(), state.auth_token().as_bytes()) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Constant-time byte-slice equality.
+///
+/// Compares every byte regardless of where the first mismatch occurs, so the
+/// running time does not leak how many leading bytes matched. Unequal lengths
+/// return `false` immediately - the token length is fixed and not secret.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +199,157 @@ mod tests {
     #[test]
     fn missing_origin_header_rejected() {
         assert!(!origin_is_allowed(None));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"same-token", b"same-token"));
+        assert!(!constant_time_eq(b"same-token", b"diff-token"));
+        // Length mismatch is rejected without panicking on the shorter slice.
+        assert!(!constant_time_eq(b"short", b"short-and-then-some"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn session_cookie_gate_rejects_and_accepts() {
+        use std::future::poll_fn;
+
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use tokio_util::sync::CancellationToken;
+        use tower::Service;
+
+        let token = "s3cr3t-session-token-value";
+        let state = AppState::new(
+            std::path::PathBuf::from("."),
+            token.to_string(),
+            CancellationToken::new(),
+        );
+        let build = || {
+            Router::new()
+                .route("/protected", get(|| async { StatusCode::OK }))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    require_session_cookie,
+                ))
+                .with_state(state.clone())
+        };
+
+        let status_for = |cookie: Option<String>| {
+            let mut app = build();
+            async move {
+                let mut builder = Request::builder().uri("/protected");
+                if let Some(cookie) = cookie {
+                    builder = builder.header(header::COOKIE, cookie);
+                }
+                let req = builder.body(Body::empty()).unwrap();
+                poll_fn(|cx| <axum::Router as Service<Request<Body>>>::poll_ready(&mut app, cx))
+                    .await
+                    .unwrap();
+                app.call(req).await.unwrap().status()
+            }
+        };
+
+        // No cookie at all: rejected before the handler runs.
+        assert_eq!(status_for(None).await, StatusCode::UNAUTHORIZED);
+        // Wrong cookie value: rejected.
+        assert_eq!(
+            status_for(Some(format!("{SESSION_COOKIE}=not-the-token"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Correct cookie value: passes through to the handler.
+        assert_eq!(
+            status_for(Some(format!("{SESSION_COOKIE}={token}"))).await,
+            StatusCode::OK
+        );
+    }
+
+    // End-to-end gate check against the REAL production router (not a synthetic
+    // one): proves /api/* are session-gated while /auth and the SPA fallback
+    // stay reachable so the browser can bootstrap the cookie and load the app.
+    #[tokio::test]
+    async fn real_router_gates_api_but_not_auth_or_fallback() {
+        use std::future::poll_fn;
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use tokio_util::sync::CancellationToken;
+        use tower::Service;
+
+        let token = "real-router-session-token";
+        let state = AppState::new(
+            std::path::PathBuf::from("."),
+            token.to_string(),
+            CancellationToken::new(),
+        );
+
+        let status_of = |req: Request<Body>| {
+            let mut app = crate::server::router(state.clone());
+            async move {
+                poll_fn(|cx| <axum::Router as Service<Request<Body>>>::poll_ready(&mut app, cx))
+                    .await
+                    .unwrap();
+                app.call(req).await.unwrap().status()
+            }
+        };
+
+        // Protected data route, no cookie -> rejected by the session gate.
+        let no_cookie = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(no_cookie).await,
+            StatusCode::UNAUTHORIZED,
+            "/api/* must require the session cookie"
+        );
+
+        // Same route with the correct cookie -> gate passes (health needs no
+        // index, so the handler returns 200).
+        let with_cookie = Request::builder()
+            .uri("/api/health")
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(with_cookie).await,
+            StatusCode::OK,
+            "/api/* must pass with the correct session cookie"
+        );
+
+        // /auth handshake is reachable WITHOUT a cookie (it mints one). Correct
+        // token -> redirect + Set-Cookie, never a session 401.
+        let auth_ok = Request::builder()
+            .uri(format!("/auth?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let auth_ok_status = status_of(auth_ok).await;
+        assert!(
+            auth_ok_status.is_redirection(),
+            "/auth with the correct token should redirect to mint the cookie, got {auth_ok_status}"
+        );
+
+        // Wrong token at /auth -> rejected by the handshake (403), not the gate.
+        let auth_bad = Request::builder()
+            .uri("/auth?token=wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(auth_bad).await,
+            StatusCode::FORBIDDEN,
+            "/auth with a wrong token must be rejected by the handshake"
+        );
+
+        // The SPA fallback must load WITHOUT a cookie so the browser can reach
+        // /auth. It is 200 when the bundle is embedded or 404 in a bare test
+        // build, but must never be a session 401.
+        let spa = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let spa_status = status_of(spa).await;
+        assert_ne!(
+            spa_status,
+            StatusCode::UNAUTHORIZED,
+            "the SPA fallback must not be session-gated, got {spa_status}"
+        );
     }
 }

@@ -76,16 +76,22 @@ pub fn symbol_blame(
         let Some(hunk) = blame.get_index(i) else {
             continue;
         };
+        // git2 0.21 returns Option here: the signature pointer is null when the
+        // commit metadata is unavailable, so absent means "unknown author".
         let sig = hunk.final_signature();
-        let raw_name = sig.name().unwrap_or("unknown").to_string();
+        let raw_name = sig
+            .as_ref()
+            .and_then(|s| s.name().ok())
+            .unwrap_or("unknown")
+            .to_string();
         // Collapse author aliases through .mailmap when the repo has one.
-        let author = match &mailmap {
-            Some(mm) => mm
-                .resolve_signature(&sig)
+        let author = match (&mailmap, &sig) {
+            (Some(mm), Some(s)) => mm
+                .resolve_signature(s)
                 .ok()
-                .and_then(|resolved| resolved.name().map(String::from))
+                .and_then(|resolved| resolved.name().ok().map(String::from))
                 .unwrap_or(raw_name),
-            None => raw_name,
+            _ => raw_name,
         };
         let full = hunk.final_commit_id().to_string();
         let commit = full
@@ -95,7 +101,7 @@ pub fn symbol_blame(
         lines.push(BlameLine {
             commit,
             author,
-            time: sig.when().seconds(),
+            time: sig.as_ref().map_or(0, |s| s.when().seconds()),
             line_start: hunk.final_start_line() as u32,
             line_count: hunk.lines_in_hunk() as u32,
         });

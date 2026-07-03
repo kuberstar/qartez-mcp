@@ -10,7 +10,8 @@ use rmcp::{RoleServer, tool, tool_router};
 use super::super::QartezServer;
 use super::super::params::*;
 use super::refactor_common::{
-    join_lines_with_trailing, resolve_unique_symbol, validate_range, write_atomic,
+    content_uses_crlf, join_lines_with_trailing, resolve_unique_symbol, validate_range,
+    write_atomic,
 };
 
 #[tool_router(router = qartez_replace_symbol_router, vis = "pub(super)")]
@@ -226,14 +227,20 @@ impl QartezServer {
         // below via `join_lines_with_trailing`.
         let new_code = new_code_sanitized.trim_end_matches('\n');
         let preserve_trailing_newline = content.ends_with('\n');
+        // Preserve the source file's line-ending convention. The
+        // surrounding lines come from `content.lines()` (which strips
+        // `\r`), so rejoining them with `\r\n` restores CRLF; strip a
+        // trailing `\r` from each spliced `new_code` line too so a caller
+        // that pasted CRLF text does not yield `\r\r\n` at the seam.
+        let use_crlf = content_uses_crlf(&content);
 
         let mut rewritten: Vec<&str> = Vec::with_capacity(lines.len());
         rewritten.extend_from_slice(&lines[..start_idx]);
         for line in new_code.split('\n') {
-            rewritten.push(line);
+            rewritten.push(line.trim_end_matches('\r'));
         }
         rewritten.extend_from_slice(&lines[end_idx..]);
-        let new_content = join_lines_with_trailing(&rewritten, preserve_trailing_newline);
+        let new_content = join_lines_with_trailing(&rewritten, preserve_trailing_newline, use_crlf);
 
         if new_content == content {
             return Ok(format!(
@@ -1013,6 +1020,15 @@ fn extract_defined_identifier(line: &str) -> Option<String> {
 /// the trailing-content gate. Other languages keep the original
 /// char-literal logic because their `'...'` is a single-quoted string
 /// (JS/Python) or a char literal (Java/C/C++/Go) that always closes.
+///
+/// A brace-terminated item whose closing `}` is followed by a mandatory
+/// `;` (a const/static with a struct or block initializer, e.g.
+/// `const CONFIG: Config = Config { timeout: 30 };`, `static X: T = T {};`,
+/// or `const X: u32 = { 1 + 2 };`) is accepted: the boundary is recorded
+/// at the closing brace and the trailing scan is permitted to consume
+/// exactly one `;` before treating anything else as trailing content. The
+/// two-item guard is unaffected because `struct Foo;\npub fn bar() {}`
+/// picks the earlier semicolon as the boundary, not the brace.
 fn check_trailing_content(new_code: &str, language: &str) -> Option<String> {
     let trimmed_end = new_code.trim_end_matches('\n');
     let bytes = trimmed_end.as_bytes();
@@ -1106,18 +1122,36 @@ fn check_trailing_content(new_code: &str, language: &str) -> Option<String> {
     // the first-item boundary. Otherwise `struct Foo;\npub fn bar() {}`
     // would walk past the struct's semicolon to the fn's closing brace
     // and let the trailing fn through silently.
-    let end = match (closed_at, semicolon_at) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(e), None) => e,
-        (None, Some(e)) => e,
+    //
+    // `allow_trailing_semicolon` is set when the chosen boundary came from
+    // a closing brace. A brace-terminated const/static ends with a
+    // mandatory `;` after the `}` that the walker never records in
+    // `semicolon_at` (its `!saw_open_brace` guard is already false by
+    // then), so the trailing scan below is permitted to consume a single
+    // `;` before rejecting. When the boundary is a semicolon (either a
+    // plain `;`-terminated item or the first item of a two-item input),
+    // the flag stays false and the historical anti-two-item behaviour is
+    // preserved.
+    let (end, allow_trailing_semicolon) = match (closed_at, semicolon_at) {
+        (Some(a), Some(b)) if a <= b => (a, true),
+        (Some(_), Some(b)) => (b, false),
+        (Some(e), None) => (e, true),
+        (None, Some(e)) => (e, false),
         (None, None) => return None,
     };
 
-    // Inspect what follows `end`; allow whitespace and comments only.
+    // Inspect what follows `end`; allow whitespace and comments only, plus
+    // at most one `;` when the boundary was a closing brace.
     let mut j = end;
+    let mut consumed_semicolon = false;
     while j < n {
         let b = bytes[j];
         if b.is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        if b == b';' && allow_trailing_semicolon && !consumed_semicolon {
+            consumed_semicolon = true;
             j += 1;
             continue;
         }
@@ -1313,6 +1347,33 @@ mod tests {
         // Trailing comment only is fine.
         assert!(
             check_trailing_content("fn foo() {}\n// trailing explanation only", "rust").is_none(),
+        );
+    }
+
+    #[test]
+    fn trailing_content_accepts_brace_terminated_item_with_semicolon() {
+        // A const/static whose initializer is brace-delimited ends with a
+        // mandatory `;` after the closing `}`. That single semicolon must
+        // not be mistaken for trailing content.
+        assert!(
+            check_trailing_content("const CONFIG: Config = Config { timeout: 30 };", "rust")
+                .is_none(),
+        );
+        assert!(check_trailing_content("static REGISTRY: Map = Map {};", "rust").is_none());
+        assert!(check_trailing_content("const X: u32 = { 1 + 2 };", "rust").is_none());
+        // A trailing comment after the mandatory `;` is still fine.
+        assert!(
+            check_trailing_content(
+                "const CONFIG: Config = Config { timeout: 30 }; // note",
+                "rust"
+            )
+            .is_none(),
+        );
+        // A genuine two-item input must still be rejected: only one
+        // trailing `;` is allowed, never a second definition.
+        assert!(check_trailing_content("struct Foo;\npub fn bar() {}", "rust").is_some());
+        assert!(
+            check_trailing_content("const X: u32 = { 1 + 2 };\npub fn bar() {}", "rust").is_some(),
         );
     }
 

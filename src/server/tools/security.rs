@@ -38,7 +38,8 @@ impl QartezServer {
     ) -> Result<String, String> {
         reject_mermaid(&params.format, "qartez_security")?;
         use crate::graph::security::{
-            ScanOptions, Severity, apply_config, builtin_rules, load_custom_config, scan,
+            ScanOptions, Severity, annotate_sink_reachability, apply_config, builtin_rules,
+            load_custom_config, scan,
         };
 
         let concise = is_concise(&params.format);
@@ -46,6 +47,13 @@ impl QartezServer {
         let offset = params.offset.unwrap_or(0) as usize;
         let include_tests = params.include_tests.unwrap_or(false);
         let token_budget = params.token_budget.unwrap_or(DEFAULT_OUTPUT_TOKEN_BUDGET) as usize;
+
+        // Opt-in source->sink reachability (feature F3). Layers coarse
+        // call-graph reachability from user-input SOURCES onto dangerous
+        // exec/injection SINKS. Deliberately OFF by default so the regex-only
+        // report and its tests stay byte-identical. `annotate_sink_reachability`
+        // and the rendering below are wired and unit-tested.
+        let taint_reachability = params.taint_reachability.unwrap_or(false);
 
         // Case-insensitive severity comparison. Previously `CRITICAL`
         // (the natural shout form for importance) was rejected as
@@ -136,7 +144,10 @@ impl QartezServer {
             root_aliases: self.root_aliases.read().map_err(|e| e.to_string())?.clone(),
         };
 
-        let findings = scan(&conn, &rules, &opts);
+        let mut findings = scan(&conn, &rules, &opts);
+        if taint_reachability {
+            annotate_sink_reachability(&conn, &mut findings);
+        }
         drop(conn);
 
         if findings.is_empty() {
@@ -248,6 +259,31 @@ impl QartezServer {
                     .collect();
                 budget_render(&mut out, &snippet_rows, token_budget);
             }
+        }
+
+        // Opt-in source->sink reachability notes (F3). Only present when the
+        // analysis was enabled AND a dangerous sink connected to a user-input
+        // source, so the default regex-only report is byte-identical.
+        let reach_rows: Vec<String> = page
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.reachability.as_ref().map(|r| (i, f, r)))
+            .map(|(i, f, r)| {
+                format!(
+                    "  #{} [{}] {} reachable from source `{}` via {}\n",
+                    offset + i + 1,
+                    f.rule_id,
+                    f.symbol_name,
+                    r.source_symbol,
+                    r.path.join(" -> "),
+                )
+            })
+            .collect();
+        if !reach_rows.is_empty() {
+            out.push_str(
+                "\n## Source -> Sink Reachability (reference-level, coarse; not variable taint)\n\n",
+            );
+            budget_render(&mut out, &reach_rows, token_budget);
         }
 
         if total > offset + limit {

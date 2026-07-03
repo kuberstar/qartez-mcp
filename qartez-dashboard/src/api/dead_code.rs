@@ -15,9 +15,12 @@ use std::path::{Path, PathBuf};
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::table_exists;
+use crate::api::handler_util::{ApiError, run_blocking};
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 const DEFAULT_LIMIT: i64 = 1000;
@@ -46,47 +49,13 @@ pub struct DeadCodeResponse {
     pub available: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ApiError {
-    pub error: &'static str,
-}
-
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<DeadCodeQuery>,
 ) -> Result<Json<DeadCodeResponse>, (StatusCode, Json<ApiError>)> {
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let root = state.project_root().to_path_buf();
-
-    let result = tokio::task::spawn_blocking(move || compute_dead_code_at_root(&root, limit))
-        .await
-        .map_err(|error| {
-            tracing::error!(?error, "dead_code.join.failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "join error",
-                }),
-            )
-        })?;
-
-    match result {
-        Ok(response) => Ok(Json(response)),
-        Err(error) => {
-            tracing::error!(?error, "dead_code.query.failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: "internal" }),
-            ))
-        }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
-    }
+    run_blocking(root, limit, "dead_code", compute_dead_code_at_root).await
 }
 
 fn compute_dead_code_at_root(root: &Path, limit: i64) -> anyhow::Result<DeadCodeResponse> {
@@ -223,17 +192,6 @@ fn is_framework_convention_basename(name: &str) -> bool {
         }
         _ => false,
     }
-}
-
-fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(exists.is_some())
 }
 
 fn default_db_path(root: &Path) -> PathBuf {

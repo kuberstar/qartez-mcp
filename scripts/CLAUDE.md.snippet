@@ -2,7 +2,9 @@
 ## Qartez MCP
 
 Before code exploration, invoke the `qartez` skill for workflows and tool reference.
-Before editing a load-bearing file, call `qartez_impact` first.
-Use `Glob`/`Grep`/`Read` only for non-code content.
+`qartez_read` is for exploration. For structural/symbol edits prefer the qartez mutators (`qartez_replace_symbol`, `qartez_insert_after_symbol`, `qartez_insert_before_symbol`, `qartez_rename`, `qartez_move`, `qartez_safe_delete`, `qartez_rename_file`) - they need no prior `Read` and skip the load-bearing ack gate.
+For a non-symbol built-in `Edit` (imports, partial lines, config, multi-block), do a built-in `Read` of the target range first - the harness requires it in `readFileState` and `qartez_read` does not populate that.
+Before editing a load-bearing file with built-in `Edit`, call `qartez_impact` first.
+Use `Glob`/`Grep` only for non-code content.
 If a built-in code tool is denied, parse the embedded qartez JSON payload and retry using `replacement` tools.
 <!-- /qartez-mcp-instructions -->

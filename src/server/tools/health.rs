@@ -152,14 +152,26 @@ impl QartezServer {
             }
         }
 
+        // Group complexity values by file_id from the already-loaded
+        // `all_symbols` bulk load, so the per-file max CC is a HashMap lookup
+        // rather than an uncached get_symbols_for_file query per file (an
+        // O(files) N+1 fan-out of fresh SQL compiles).
+        let mut cc_by_file: HashMap<i64, Vec<u32>> = HashMap::new();
+        for (sym, _) in &all_symbols {
+            if let Some(cc) = sym.complexity {
+                cc_by_file.entry(sym.file_id).or_default().push(cc);
+            }
+        }
+
         let mut rows: Vec<FileHealthRow> = Vec::new();
         for file in &all_files {
             if helpers::is_test_path(&file.path) {
                 continue;
             }
-            let symbols = read::get_symbols_for_file(&conn, file.id).unwrap_or_default();
-            let complexities: Vec<u32> = symbols.iter().filter_map(|s| s.complexity).collect();
-            let max_cc = complexities.iter().copied().max().unwrap_or(0);
+            let max_cc = cc_by_file
+                .get(&file.id)
+                .and_then(|c| c.iter().copied().max())
+                .unwrap_or(0);
             let smell_entries = smells_by_file.remove(&file.path).unwrap_or_default();
             if max_cc == 0 && smell_entries.is_empty() {
                 continue;

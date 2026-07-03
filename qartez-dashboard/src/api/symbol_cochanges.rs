@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::table_exists;
 use crate::state::AppState;
 
 /// Maximum number of partner symbols returned. Matches the size of the
@@ -205,17 +206,6 @@ fn load_partner_symbols(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<C
         out.push(row?);
     }
     Ok(out)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(exists.is_some())
 }
 
 fn default_db_path(root: &Path) -> PathBuf {

@@ -20,6 +20,9 @@ use axum::http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::api::db_introspect::column_exists;
+use crate::api::handler_util::{ApiError, run_blocking};
+use crate::api::limits::clamp_limit;
 use crate::state::AppState;
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -48,47 +51,13 @@ pub struct HotspotsResponse {
     pub indexed: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ApiError {
-    pub error: &'static str,
-}
-
 pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<HotspotsQuery>,
 ) -> Result<Json<HotspotsResponse>, (StatusCode, Json<ApiError>)> {
-    let limit = clamp_limit(query.limit);
+    let limit = clamp_limit(query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     let root = state.project_root().to_path_buf();
-
-    let result = tokio::task::spawn_blocking(move || compute_hotspots_at_root(&root, limit))
-        .await
-        .map_err(|error| {
-            tracing::error!(?error, "hotspots.join.failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "join error",
-                }),
-            )
-        })?;
-
-    match result {
-        Ok(response) => Ok(Json(response)),
-        Err(error) => {
-            tracing::error!(?error, "hotspots.query.failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: "internal" }),
-            ))
-        }
-    }
-}
-
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
-        Some(value) if (1..=MAX_LIMIT).contains(&value) => value,
-        _ => DEFAULT_LIMIT,
-    }
+    run_blocking(root, limit, "hotspots", compute_hotspots_at_root).await
 }
 
 fn compute_hotspots_at_root(root: &Path, limit: i64) -> anyhow::Result<HotspotsResponse> {
@@ -194,18 +163,6 @@ fn health_score(max_cc: f64, coupling: f64, churn: i64) -> f64 {
     )]
     let churn_h = 10.0 / (1.0 + churn as f64 / 8.0);
     (cc_h + coupling_h + churn_h) / 3.0
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn default_db_path(root: &Path) -> PathBuf {
