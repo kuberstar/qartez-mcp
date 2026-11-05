@@ -30,12 +30,18 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.xz
+          # Linux gnu binaries link against the builder's glibc and need at
+          # least that version at runtime, so build on the oldest supported
+          # Ubuntu (22.04, glibc 2.35). `ubuntu-latest` produced binaries
+          # requiring GLIBC_2.39 that did not start on 22.04 (issue #50).
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.xz
+            max_glibc: "2.35"
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             archive: tar.xz
+            max_glibc: "2.35"
           # musl targets disabled: libgit2-sys/libssh2-sys pull openssl-sys,
           # which cannot find OpenSSL on the default musl builder. Users on
           # Alpine/musl hit install.sh's source-build fallback automatically.
@@ -108,6 +114,31 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: "thin"
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" --bins
+
+      - name: Verify glibc floor (Linux gnu targets)
+        if: matrix.max_glibc
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MAX_GLIBC: ${{ matrix.max_glibc }}
+        run: |
+          set -euo pipefail
+          for bin in qartez qartez-guard qartez-setup; do
+            file="target/$TARGET/release/$bin"
+            # objdump failing must fail the step, not read as "no symbols".
+            syms=$(objdump -T "$file")
+            need=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$syms" | sed 's/^GLIBC_//' | sort -uV | tail -n1 || true)
+            if [ -z "$need" ]; then
+              echo "::error::$bin: no GLIBC symbol versions found, cannot verify the glibc floor"
+              exit 1
+            fi
+            top=$(printf '%s\n%s\n' "$need" "$MAX_GLIBC" | sort -V | tail -n1)
+            if [ "$top" != "$MAX_GLIBC" ]; then
+              echo "::error::$bin requires GLIBC_$need, above the supported floor GLIBC_$MAX_GLIBC"
+              exit 1
+            fi
+            echo "$bin requires at most GLIBC_$need (floor GLIBC_$MAX_GLIBC)"
+          done
 
       - name: Stage archive contents
         id: stage

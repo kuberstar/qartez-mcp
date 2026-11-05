@@ -100,11 +100,16 @@ The `extract` method produces a `ParseResult` containing:
 - **References** — symbol-to-symbol call/use/type edges within the file
 - **Type relations** — implements/extends relationships for type hierarchy
 
-**37 languages supported:** Bash, C, C++, Caddyfile, C#, CSS, Dart,
+**38 languages supported:** Bash, C, C++, Caddyfile, C#, CSS, Dart,
 Dockerfile, Elixir, Go, Haskell, HCL (Terraform), Helm, Java, Jenkinsfile,
 Jsonnet, Kotlin, Lua, Makefile, Nginx, Nix, OCaml, PHP, Protobuf, Python, R,
-Ruby, Rust, Scala, SQL, Starlark, Swift, systemd, TOML, TypeScript/JavaScript,
-YAML, Zig.
+Ruby, Rust, Scala, SQL, Starlark, Svelte, Swift, systemd, TOML,
+TypeScript/JavaScript, YAML, Zig.
+
+Svelte is the one file type that holds several languages at once (`<script>`,
+`<style>`, markup). It opts out of the single-grammar path via
+`LanguageSupport::parse_and_extract` and parses each embedded region over a
+masked copy of the source, so line numbers stay those of the real file.
 
 ### Tree-sitter parsing (`src/index/symbols.rs`, `src/index/parser.rs`)
 
@@ -113,7 +118,7 @@ on source bytes without requiring compilation or type-checking. This gives
 qartez several properties:
 
 - **Fast** — parses thousands of files per second
-- **Language-agnostic** — same pipeline for all 37 languages
+- **Language-agnostic** — same pipeline for all 38 languages
 - **Partial-file resilient** — tree-sitter produces a tree even for files with
   syntax errors
 - **No build system dependency** — no need for `cargo build`, `npm install`,

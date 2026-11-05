@@ -23,7 +23,7 @@
   <p align="center">
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg"></a>
     <img alt="MSRV 1.88" src="https://img.shields.io/badge/MSRV-1.88-orange.svg">
-    <img alt="37 languages" src="https://img.shields.io/badge/languages-37-green.svg">
+    <img alt="38 languages" src="https://img.shields.io/badge/languages-38-green.svg">
     <img alt="43 MCP tools" src="https://img.shields.io/badge/MCP_tools-43-purple.svg">
   </p>
 </p>
@@ -400,14 +400,15 @@ Qartez communicates over **stdio** (stdin/stdout JSON-RPC), the standard MCP tra
 
 ## Supported languages
 
-One binary. No per-language setup. All 37 languages parsed by tree-sitter (with regex fallbacks for formats lacking a compatible grammar). 21 imperative languages also get cyclomatic complexity per function, powering `qartez_hotspots`.
+One binary. No per-language setup. All 38 languages parsed by tree-sitter (with regex fallbacks for formats lacking a compatible grammar). 21 imperative languages also get cyclomatic complexity per function, powering `qartez_hotspots`.
 
 <details>
-<summary>Full language table (37 languages)</summary>
+<summary>Full language table (38 languages)</summary>
 
 | Language | Extensions / Filenames |
 |---|---|
 | TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` `.mts` `.cts` `.mjs` `.cjs` |
+| Svelte | `.svelte` - the component, its `<script>` (TS/JS) symbols, its `<style>` (CSS) rules, and components used in markup; `$lib` imports resolved |
 | Rust | `.rs` |
 | Go | `.go` |
 | Python | `.py` `.pyi` |
@@ -447,7 +448,7 @@ One binary. No per-language setup. All 37 languages parsed by tree-sitter (with 
 
 </details>
 
-**Highlights:** TypeScript, Rust, Go, Python, Java, Kotlin, Swift, C#, C/C++, Ruby, PHP, Dart, Scala, Elixir, Zig, Lua, Haskell, OCaml, R, and 17 more. All 21 imperative languages include cyclomatic complexity scoring.
+**Highlights:** TypeScript, Svelte, Rust, Go, Python, Java, Kotlin, Swift, C#, C/C++, Ruby, PHP, Dart, Scala, Elixir, Zig, Lua, Haskell, OCaml, R, and 17 more. All 21 imperative languages include cyclomatic complexity scoring.
 
 ---
 
@@ -616,7 +617,7 @@ src/
     walker.rs              File discovery (respects .gitignore + .qartezignore)
     parser.rs              Tree-sitter parser pool
     symbols.rs             Symbols / imports / references + AST shape hashing
-    languages/             37 language adapters (21 with cyclomatic complexity)
+    languages/             38 language adapters (21 with cyclomatic complexity)
   graph/
     mod.rs                 Graph module root
     pagerank.rs            PageRank on import graph

@@ -135,11 +135,55 @@ fn extract_from_node(
                 new_enclosing = Some(parent_idx);
             }
         }
+        // A union is a struct with overlapping fields; index it as one so its
+        // fields, references, and outline entry behave the same.
+        "union_item" => {
+            if let Some(sym) = extract_named_item(node, source, SymbolKind::Struct) {
+                let parent_idx = symbols.len();
+                symbols.push(sym);
+                extract_struct_fields(node, source, symbols, parent_idx);
+                new_enclosing = Some(parent_idx);
+            }
+        }
         "enum_item" => {
             if let Some(sym) = extract_named_item(node, source, SymbolKind::Enum) {
                 let idx = symbols.len();
+                let enum_is_pub = sym.is_exported;
                 symbols.push(sym);
+                extract_enum_variants(node, source, symbols, idx, enum_is_pub);
                 new_enclosing = Some(idx);
+            }
+        }
+        // `mod foo { .. }`. A bodyless `mod foo;` names a file, which the
+        // import edge to that file already records - emitting a symbol for it
+        // too would make every `pub mod` look like an unreferenced export.
+        "mod_item" => {
+            if node.child_by_field_name("body").is_some()
+                && let Some(mut sym) = extract_named_item(node, source, SymbolKind::Module)
+            {
+                // Modules are reached by path, never by a symbol reference.
+                sym.unused_excluded = true;
+                symbols.push(sym);
+            }
+        }
+        // `type Output;` in a trait body.
+        "associated_type" => {
+            if let Some(mut sym) = extract_named_item(node, source, SymbolKind::Type) {
+                sym.unused_excluded = true;
+                sym.owner_type = enclosing_trait_name(node, source);
+                symbols.push(sym);
+            }
+        }
+        // `fn run(&self) -> Self::Output;` - a trait method with no body. It is
+        // the declaration every impl answers to, so `qartez_find`/`qartez_refs`
+        // on the trait's method name must land here.
+        "function_signature_item" => {
+            if let Some(mut sym) = extract_named_item(node, source, SymbolKind::Method) {
+                // Implemented elsewhere and dispatched dynamically: never a
+                // dead export on its own.
+                sym.unused_excluded = true;
+                sym.owner_type = enclosing_trait_name(node, source);
+                symbols.push(sym);
             }
         }
         "trait_item" => {
@@ -1058,6 +1102,63 @@ fn extract_struct_fields(
     }
 }
 
+/// Enum variants: `enum Mode { Fast, Slow { ms: u64 }, Tagged(String) }`.
+///
+/// Emitted as `Field` symbols parented to the enum, exactly like struct fields,
+/// so `qartez_outline` groups them under the enum and `qartez_find Slow` lands
+/// on the variant. A variant has no visibility of its own - it is as public as
+/// its enum.
+fn extract_enum_variants(
+    enum_node: Node,
+    source: &[u8],
+    symbols: &mut Vec<ExtractedSymbol>,
+    parent_idx: usize,
+    enum_is_pub: bool,
+) {
+    let Some(body) = enum_node.child_by_field_name("body") else {
+        return;
+    };
+    for child in children(body) {
+        if child.kind() != "enum_variant" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let name = node_text(name_node, source);
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Field,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            signature: extract_signature(child, source),
+            is_exported: enum_is_pub,
+            parent_idx: Some(parent_idx),
+            // The enum's own export status drives the dead-code check.
+            unused_excluded: true,
+            complexity: None,
+            owner_type: None,
+        });
+    }
+}
+
+/// Name of the `trait` whose body contains `node`, for the `owner_type` of a
+/// trait's associated items. `None` outside a trait body.
+fn enclosing_trait_name(node: Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "trait_item" {
+            let name = node_text(parent.child_by_field_name("name")?, source);
+            return (!name.is_empty()).then_some(name);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 /// Named struct fields: `struct Foo { pub x: f64, y: String }`.
 fn extract_named_struct_fields(
     body: Node,
@@ -1229,6 +1330,22 @@ fn extract_impl_methods(
     }
 
     for child in children(body) {
+        // Associated items of the impl: `type Output = usize;`, `const KIND: u8 = 1;`.
+        // They carry the impl's type as their owner, and are reached through
+        // the trait or the type - never as a standalone export.
+        if matches!(child.kind(), "type_item" | "const_item") {
+            let kind = if child.kind() == "const_item" {
+                SymbolKind::Const
+            } else {
+                SymbolKind::Type
+            };
+            if let Some(mut sym) = extract_named_item(child, source, kind) {
+                sym.owner_type = owner.clone();
+                sym.unused_excluded = true;
+                symbols.push(sym);
+            }
+            continue;
+        }
         if child.kind() == "function_item"
             && let Some(name_node) = child.child_by_field_name("name")
         {
@@ -1485,6 +1602,107 @@ mod tests {
         support.extract(source.as_bytes(), &tree)
     }
 
+    fn find_sym<'a>(result: &'a ParseResult, name: &str) -> &'a ExtractedSymbol {
+        result
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol `{name}` not extracted; got {:?}",
+                    result.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[test]
+    fn test_union_and_its_fields() {
+        let result = parse_rust("pub union Raw { int: u32, float: f32 }");
+
+        let raw = find_sym(&result, "Raw");
+        assert!(matches!(raw.kind, SymbolKind::Struct));
+        assert!(raw.is_exported);
+
+        let int = find_sym(&result, "int");
+        assert!(matches!(int.kind, SymbolKind::Field));
+        assert_eq!(int.parent_idx, Some(0), "union fields parent to the union");
+        find_sym(&result, "float");
+    }
+
+    #[test]
+    fn test_enum_variants_are_fields_of_the_enum() {
+        let result = parse_rust("pub enum Mode { Fast, Slow { ms: u64 }, Tagged(String) }");
+
+        let mode_idx = result
+            .symbols
+            .iter()
+            .position(|s| s.name == "Mode")
+            .expect("enum");
+        for variant in ["Fast", "Slow", "Tagged"] {
+            let sym = find_sym(&result, variant);
+            assert!(matches!(sym.kind, SymbolKind::Field));
+            assert_eq!(sym.parent_idx, Some(mode_idx));
+            assert!(sym.is_exported, "variants of a pub enum are public");
+            assert!(sym.unused_excluded, "the enum drives the dead-code check");
+        }
+    }
+
+    #[test]
+    fn test_private_enum_variants_are_not_exported() {
+        let result = parse_rust("enum Mode { Fast }");
+        assert!(!find_sym(&result, "Fast").is_exported);
+    }
+
+    #[test]
+    fn test_trait_method_signature_and_associated_type() {
+        let result = parse_rust(
+            "pub trait Runner { type Output; const KIND: u8; fn run(&self) -> Self::Output; }",
+        );
+
+        let run = find_sym(&result, "run");
+        assert!(matches!(run.kind, SymbolKind::Method));
+        assert_eq!(run.owner_type.as_deref(), Some("Runner"));
+        assert!(run.unused_excluded, "implemented via dynamic dispatch");
+
+        let output = find_sym(&result, "Output");
+        assert!(matches!(output.kind, SymbolKind::Type));
+        assert_eq!(output.owner_type.as_deref(), Some("Runner"));
+
+        find_sym(&result, "KIND");
+    }
+
+    #[test]
+    fn test_impl_associated_const_and_type() {
+        let result = parse_rust(
+            "impl Runner for Named { type Output = usize; const KIND: u8 = 1; fn run(&self) -> usize { 0 } }",
+        );
+
+        let output = find_sym(&result, "Output");
+        assert!(matches!(output.kind, SymbolKind::Type));
+        assert_eq!(output.owner_type.as_deref(), Some("Named"));
+
+        let kind = find_sym(&result, "KIND");
+        assert!(matches!(kind.kind, SymbolKind::Const));
+        assert_eq!(kind.owner_type.as_deref(), Some("Named"));
+    }
+
+    #[test]
+    fn test_inline_module_is_a_symbol_but_a_mod_declaration_is_not() {
+        let inline = parse_rust("mod tests { fn it_works() {} }");
+        let module = find_sym(&inline, "tests");
+        assert!(matches!(module.kind, SymbolKind::Module));
+        assert!(module.unused_excluded, "modules are reached by path");
+        find_sym(&inline, "it_works");
+
+        // `pub mod inner;` names a file: the import edge already records it,
+        // and a symbol here would read as an unreferenced export.
+        let declaration = parse_rust("pub mod inner;");
+        assert!(
+            declaration.symbols.iter().all(|s| s.name != "inner"),
+            "a bodyless mod declaration must not emit a symbol"
+        );
+    }
+
     #[test]
     fn test_function_item() {
         let result = parse_rust("fn helper(x: i32) -> i32 { x * 2 }");
@@ -1542,7 +1760,8 @@ mod tests {
     #[test]
     fn test_enum_item() {
         let result = parse_rust("pub enum Status { Active, Inactive, Pending }");
-        assert_eq!(result.symbols.len(), 1);
+        // The enum plus its three variants (see `test_enum_variants_are_fields_of_the_enum`).
+        assert_eq!(result.symbols.len(), 4);
         assert_eq!(result.symbols[0].name, "Status");
         assert!(matches!(result.symbols[0].kind, SymbolKind::Enum));
         assert!(result.symbols[0].is_exported);
@@ -1555,10 +1774,12 @@ mod tests {
     fn serialize(&self) -> Vec<u8>;
 }",
         );
-        assert_eq!(result.symbols.len(), 1);
+        // The trait plus the `serialize` method declaration it contains.
+        assert_eq!(result.symbols.len(), 2);
         assert_eq!(result.symbols[0].name, "Serializable");
         assert!(matches!(result.symbols[0].kind, SymbolKind::Trait));
         assert!(result.symbols[0].is_exported);
+        assert_eq!(result.symbols[1].name, "serialize");
     }
 
     #[test]
@@ -2492,15 +2713,22 @@ impl Greet for Bar {
 }
 "#,
         );
-        let greet = result
+        // Two symbols are named `greet`: the trait's declaration and Bar's
+        // implementation of it. Each carries its own owner.
+        let owners: Vec<Option<&str>> = result
             .symbols
             .iter()
-            .find(|s| s.name == "greet" && matches!(s.kind, SymbolKind::Method))
-            .expect("greet method from trait impl");
-        assert_eq!(
-            greet.owner_type.as_deref(),
-            Some("Bar"),
-            "impl Greet for Bar {{ fn greet() }} should have owner_type = Bar"
+            .filter(|s| s.name == "greet" && matches!(s.kind, SymbolKind::Method))
+            .map(|s| s.owner_type.as_deref())
+            .collect();
+
+        assert!(
+            owners.contains(&Some("Bar")),
+            "impl Greet for Bar {{ fn greet() }} should have owner_type = Bar, got {owners:?}"
+        );
+        assert!(
+            owners.contains(&Some("Greet")),
+            "the trait's own `fn greet(&self);` declaration should have owner_type = Greet, got {owners:?}"
         );
     }
 

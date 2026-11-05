@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::event::{ModifyKind, RenameMode};
-use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify::{EventKind, RecursiveMode, Watcher as _};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 
@@ -18,12 +16,17 @@ use crate::lock::RepoLock;
 const QARTEZIGNORE_FILENAME: &str = ".qartezignore";
 const GITIGNORE_FILENAME: &str = ".gitignore";
 
-/// Inner debounce window for `notify-debouncer-full`. Coalesces the burst
-/// of `ReadDirectoryChangesW` / `inotify` / FSEvents events that every
-/// editor emits per save (metadata + content + close, plus the macOS
-/// coalesced rename pair) so the callback fires once per logical save
-/// instead of three or four times. Mirrors the dashboard watcher.
+/// Quiet window of the watcher's own debouncer. Coalesces the burst of
+/// `ReadDirectoryChangesW` / `inotify` / FSEvents events that every editor
+/// emits per save (metadata + content + close, plus the macOS coalesced
+/// rename pair) so one logical save yields one batch instead of three or
+/// four.
 const DEBOUNCE_MS: u64 = 200;
+
+/// Upper bound on how long a pending batch may keep growing while events
+/// keep arriving inside the quiet window. Without it a steady trickle of
+/// indexable writes would postpone the re-index forever.
+const DEBOUNCE_MAX_WAIT_MS: u64 = 2_000;
 
 /// Outer batch drain window. After a debounced batch arrives, this loop
 /// keeps draining additional batches that land inside the same window so
@@ -195,7 +198,7 @@ impl Watcher {
             let mut changed = batch.changed;
             let mut deleted = batch.deleted;
 
-            // The OS-side debouncer already collapses per-save bursts.
+            // The debounce thread already collapses per-save bursts.
             // A short outer drain still folds successive batches that
             // arrive while a multi-file save (formatter, codemod) is
             // landing, so the re-index runs once per logical unit of
@@ -441,6 +444,10 @@ impl QartezIgnoreCache {
     /// hard-skip directory (`.git`, `.qartez`). The hard-skip mirrors
     /// `walker::walk_source_files`'s `filter_entry` so the watcher cannot
     /// resurrect tool-cache rows the indexer already excludes.
+    ///
+    /// A path outside the matcher root counts as ignored: it is never
+    /// indexable, and `matched_path_or_any_parents` panics on it, which inside
+    /// the notify FFI callback would abort the server.
     fn is_ignored(&self, path: &Path) -> bool {
         for component in path.components() {
             if let Component::Normal(name) = component
@@ -448,6 +455,9 @@ impl QartezIgnoreCache {
             {
                 return true;
             }
+        }
+        if !path.starts_with(self.matcher.path()) {
+            return true;
         }
         self.matcher
             .matched_path_or_any_parents(path, path.is_dir())
@@ -508,124 +518,125 @@ fn is_indexable_path(
     false
 }
 
+/// Start the recursive OS watcher on `root` and the debounce thread behind it.
+///
+/// Raw events are filtered in the notify callback itself, before anything is
+/// queued: a path that is not indexable or is ignored (`.gitignore`,
+/// `.qartezignore`, hard-skipped `.git` / `.qartez`) is dropped right there.
+/// A build tree such as `DerivedData/` or `target/` can emit hundreds of
+/// events per second; filtering after a debouncer meant every one of them
+/// still went through its queue, rename tracking and file-id cache, which
+/// cost 35-90% of a core per server process on macOS.
+///
+/// The survivors are coalesced by [`debounce_paths`] and classified by
+/// existence on disk at flush time, which also covers every rename shape the
+/// backends emit (`Name::Both`, split `From`/`To`, `Any`) and the macOS case
+/// where a `Remove` is coalesced into a trailing `Modify`.
 fn start_notify_watcher(
     root: PathBuf,
     supported_ext: HashSet<&'static str>,
     supported_names: HashSet<&'static str>,
     supported_prefixes: Vec<&'static str>,
     tx: mpsc::Sender<WatchBatch>,
-) -> anyhow::Result<Debouncer<notify::RecommendedWatcher, RecommendedCache>> {
-    let ignore_cache = Arc::new(Mutex::new(QartezIgnoreCache::new(&root)));
+) -> anyhow::Result<notify::RecommendedWatcher> {
+    let mut ignore_cache = QartezIgnoreCache::new(&root);
     let ignore_root = root.clone();
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<PathBuf>();
 
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(DEBOUNCE_MS),
-        None,
-        move |result: DebounceEventResult| {
-            let events = match result {
-                Ok(events) => events,
-                Err(errors) => {
-                    for error in errors {
-                        tracing::warn!("watch error: {error}");
-                    }
-                    return;
-                }
-            };
-
-            let mut guard = match ignore_cache.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.refresh_if_changed(&ignore_root);
-
-            let mut all_changed: Vec<PathBuf> = Vec::new();
-            let mut all_deleted: Vec<PathBuf> = Vec::new();
-
-            for debounced in events {
-                let event = &debounced.event;
-                let dominated = matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                );
-                if !dominated {
-                    continue;
-                }
-
-                let filtered: Vec<PathBuf> = event
-                    .paths
-                    .iter()
-                    .filter(|p| {
-                        is_indexable_path(p, &supported_ext, &supported_names, &supported_prefixes)
-                    })
-                    .filter(|p| !guard.is_ignored(p))
-                    .cloned()
-                    .collect();
-
-                if filtered.is_empty() {
-                    continue;
-                }
-
-                // Translate rename events into a remove+create pair. On
-                // platforms where `notify` emits `Modify(Name::Both)` the
-                // event carries both the old and new path; on platforms
-                // that split into `Modify(Name::From)` + `Modify(Name::To)`
-                // each side arrives as a separate event. `RenameMode::Any`
-                // is the fallback used by some backends - we split by
-                // existence on disk at observation time.
-                //
-                // For the catch-all branch we ALSO existence-check the
-                // path. macOS FSEvents under `notify-debouncer-full`
-                // sometimes coalesces a `Remove(File)` into the trailing
-                // `Modify(Metadata)` / `Modify(Data)` events; the file is
-                // gone from disk but the surviving event is `Modify`, not
-                // `Remove`. Without the existence check the watcher would
-                // reindex a missing file instead of dropping it.
-                match event.kind {
-                    EventKind::Remove(_) => all_deleted.extend(filtered),
-                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                        all_deleted.extend(filtered)
-                    }
-                    EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                        all_changed.extend(filtered)
-                    }
-                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
-                        if filtered.len() == 2 =>
-                    {
-                        // `notify` emits exactly two paths for a `Both`
-                        // rename: `[from, to]`. Anything else is backend
-                        // noise, not a real rename, so fall through to the
-                        // existence-check branch instead of treating every
-                        // non-first entry as a new destination.
-                        all_deleted.push(filtered[0].clone());
-                        all_changed.push(filtered[1].clone());
-                    }
-                    _ => {
-                        for p in filtered {
-                            if p.exists() {
-                                all_changed.push(p);
-                            } else {
-                                all_deleted.push(p);
-                            }
-                        }
-                    }
-                }
-            }
-
-            drop(guard);
-
-            if all_changed.is_empty() && all_deleted.is_empty() {
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        let event = match result {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!("watch error: {error}");
                 return;
             }
+        };
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
 
-            let _ = tx.blocking_send(WatchBatch {
-                changed: all_changed,
-                deleted: all_deleted,
-            });
-        },
-    )?;
+        let mut refreshed = false;
+        for path in event.paths {
+            // The extension test is pure string work, so it runs first
+            // and rejects most build output without touching the
+            // ignore matcher or the filesystem.
+            if !is_indexable_path(&path, &supported_ext, &supported_names, &supported_prefixes) {
+                continue;
+            }
+            if !refreshed {
+                ignore_cache.refresh_if_changed(&ignore_root);
+                refreshed = true;
+            }
+            if ignore_cache.is_ignored(&path) {
+                continue;
+            }
+            if raw_tx.send(path).is_err() {
+                return;
+            }
+        }
+    })?;
 
-    debouncer.watch(&root, RecursiveMode::Recursive)?;
-    Ok(debouncer)
+    std::thread::Builder::new()
+        .name("qartez-watch-debounce".into())
+        .spawn(move || {
+            debounce_paths(
+                &raw_rx,
+                &tx,
+                Duration::from_millis(DEBOUNCE_MS),
+                Duration::from_millis(DEBOUNCE_MAX_WAIT_MS),
+            );
+        })?;
+
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+/// Coalesce raw paths into batches: a batch is flushed once no new path has
+/// arrived for `quiet`, or once it has been open for `max_wait`. Returns when
+/// the watcher drops its sender or the consumer drops the batch receiver.
+fn debounce_paths(
+    raw_rx: &std::sync::mpsc::Receiver<PathBuf>,
+    tx: &mpsc::Sender<WatchBatch>,
+    quiet: Duration,
+    max_wait: Duration,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    while let Ok(first) = raw_rx.recv() {
+        let opened = Instant::now();
+        let mut pending: HashSet<PathBuf> = HashSet::from([first]);
+        let mut disconnected = false;
+        loop {
+            let Some(left) = max_wait.checked_sub(opened.elapsed()) else {
+                break;
+            };
+            match raw_rx.recv_timeout(quiet.min(left)) {
+                Ok(path) => {
+                    pending.insert(path);
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if tx.blocking_send(classify_by_existence(pending)).is_err() || disconnected {
+            return;
+        }
+    }
+}
+
+/// Split debounced paths into changed (still on disk) and deleted (gone).
+/// Sorted so a batch is deterministic regardless of event arrival order.
+fn classify_by_existence(paths: HashSet<PathBuf>) -> WatchBatch {
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+    paths.sort();
+    let (changed, deleted) = paths.into_iter().partition(|p| p.exists());
+    WatchBatch { changed, deleted }
 }
 
 #[cfg(test)]
@@ -972,6 +983,152 @@ mod tests {
         assert!(
             !cache.is_ignored(&root.join("first/file.rs")),
             "old pattern must be replaced after reload"
+        );
+    }
+
+    /// `matched_path_or_any_parents` panics on a path outside the matcher
+    /// root, and `is_ignored` runs inside the notify FFI callback, where a
+    /// panic aborts the whole server. A path outside the root is never
+    /// indexable, so it must read as ignored instead.
+    #[test]
+    fn ignore_cache_treats_paths_outside_root_as_ignored_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(GITIGNORE_FILENAME), "target/\n").unwrap();
+        let cache = QartezIgnoreCache::new(&root);
+        assert!(cache.is_ignored(&tmp.path().join("elsewhere/src/lib.rs")));
+        assert!(!cache.is_ignored(&root.join("src/lib.rs")));
+        assert!(cache.is_ignored(&root.join("target/debug/x.rs")));
+    }
+
+    #[test]
+    fn debounce_coalesces_a_burst_into_one_batch() {
+        let tmp = TempDir::new().unwrap();
+        let kept = tmp.path().join("kept.rs");
+        std::fs::write(&kept, "").unwrap();
+        let gone = tmp.path().join("gone.rs");
+
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(8);
+        for p in [&kept, &gone, &kept, &kept] {
+            raw_tx.send(p.clone()).unwrap();
+        }
+        drop(raw_tx);
+        debounce_paths(
+            &raw_rx,
+            &tx,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+
+        let batch = rx.try_recv().expect("one batch is flushed");
+        assert_eq!(batch.changed, vec![kept]);
+        assert_eq!(batch.deleted, vec![gone]);
+        assert!(
+            rx.try_recv().is_err(),
+            "a burst must yield exactly one batch"
+        );
+    }
+
+    #[test]
+    fn debounce_flushes_at_max_wait_under_a_steady_trickle() {
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (tx, mut rx) = mpsc::channel(64);
+        let producer = thread::spawn(move || {
+            // One path every 20 ms for ~600 ms: never quiet for 100 ms.
+            for i in 0..30 {
+                if raw_tx
+                    .send(PathBuf::from(format!("/nonexistent/{i}.rs")))
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        debounce_paths(
+            &raw_rx,
+            &tx,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        producer.join().unwrap();
+
+        let mut batches = 0;
+        let mut paths = 0;
+        while let Ok(b) = rx.try_recv() {
+            batches += 1;
+            paths += b.deleted.len() + b.changed.len();
+        }
+        assert_eq!(paths, 30, "no path may be lost across flushes");
+        assert!(
+            batches >= 2,
+            "max_wait must force a flush during a trickle, got {batches} batch(es)"
+        );
+    }
+
+    #[test]
+    fn debounce_stops_when_consumer_is_gone() {
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        raw_tx.send(PathBuf::from("/nonexistent/a.rs")).unwrap();
+        // The sender stays alive: only the closed consumer can end the loop.
+        debounce_paths(
+            &raw_rx,
+            &tx,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        drop(raw_tx);
+    }
+
+    /// Events under a gitignored directory must be dropped before they are
+    /// queued, while a real source edit still comes through.
+    #[test]
+    fn notify_watcher_drops_ignored_paths_before_debouncing() {
+        let tmp = TempDir::new().unwrap();
+        // Canonical path: FSEvents reports `/private/var/...` for `/var/...`.
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(GITIGNORE_FILENAME), "DerivedData/\n").unwrap();
+        std::fs::create_dir_all(root.join("DerivedData/Build")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let _watcher =
+            start_notify_watcher(root.clone(), ext_set(), name_set(), Vec::new(), tx).unwrap();
+        // Let the backend register the stream before writing.
+        thread::sleep(Duration::from_millis(300));
+
+        for i in 0..50 {
+            std::fs::write(root.join(format!("DerivedData/Build/gen{i}.rs")), "x").unwrap();
+        }
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(b) => {
+                    seen.extend(b.changed);
+                    seen.extend(b.deleted);
+                    if seen.iter().any(|p| p.ends_with("src/lib.rs")) {
+                        break;
+                    }
+                }
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            seen.iter().any(|p| p.ends_with("src/lib.rs")),
+            "the source edit must reach the indexer, saw {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "DerivedData")),
+            "ignored paths must never be batched, saw {seen:?}"
         );
     }
 }

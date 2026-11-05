@@ -35,6 +35,12 @@ impl ParserPool {
                 message: format!("unsupported file: {filename}"),
             })?;
 
+        // Multi-language files (`.svelte`) own their whole parse: one tree
+        // cannot cover a script block, a style block, and markup at once.
+        if let Some(result) = support.parse_and_extract(path, source) {
+            return Ok((result, support.language_name().to_string()));
+        }
+
         let lang: Language = support.tree_sitter_language(ext);
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         parser.set_language(&lang).map_err(|e| QartezError::Parse {
