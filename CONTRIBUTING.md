@@ -40,7 +40,7 @@ src/
     mod.rs         # Full and incremental indexing pipelines
     walker.rs      # File discovery (respects .gitignore)
     symbols.rs     # Tree-sitter symbol extraction
-    languages/     # Per-language parsing rules (37 languages)
+    languages/     # Per-language parsing rules (38 languages)
   graph/
     pagerank.rs    # File and symbol PageRank computation
     blast.rs       # Transitive blast radius analysis

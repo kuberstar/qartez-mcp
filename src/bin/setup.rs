@@ -1385,15 +1385,17 @@ fn uninstall_gemini_one(gemini_dir: &Path) -> anyhow::Result<()> {
         if let Some(hooks) = settings.get("hooks")
             && hooks.as_object().is_some_and(|o| o.is_empty())
         {
-            settings.as_object_mut().map(|o| o.remove("hooks"));
+            settings.as_object_mut().map(|o| o.shift_remove("hooks"));
         }
 
         if let Some(servers) = settings.get_mut("mcpServers")
             && let Some(obj) = servers.as_object_mut()
         {
-            obj.remove("qartez");
+            obj.shift_remove("qartez");
             if obj.is_empty() {
-                settings.as_object_mut().map(|o| o.remove("mcpServers"));
+                settings
+                    .as_object_mut()
+                    .map(|o| o.shift_remove("mcpServers"));
             }
         }
 
@@ -1757,16 +1759,18 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         if let Some(hooks) = settings.get("hooks")
             && hooks.as_object().is_some_and(|o| o.is_empty())
         {
-            settings.as_object_mut().map(|o| o.remove("hooks"));
+            settings.as_object_mut().map(|o| o.shift_remove("hooks"));
         }
 
         // Remove MCP server
         if let Some(servers) = settings.get_mut("mcpServers")
             && let Some(obj) = servers.as_object_mut()
         {
-            obj.remove("qartez");
+            obj.shift_remove("qartez");
             if obj.is_empty() {
-                settings.as_object_mut().map(|o| o.remove("mcpServers"));
+                settings
+                    .as_object_mut()
+                    .map(|o| o.shift_remove("mcpServers"));
             }
         }
 
@@ -1782,7 +1786,7 @@ fn uninstall_claude_one(claude_dir: &Path) -> anyhow::Result<()> {
         if let Some(servers) = state.get_mut("mcpServers")
             && let Some(obj) = servers.as_object_mut()
         {
-            obj.remove("qartez");
+            obj.shift_remove("qartez");
         }
         write_json(&state_path, &state)?;
         info(&format!("State cleaned up: {}", state_path.display()));
@@ -1817,7 +1821,7 @@ fn remove_hook_entries_containing(
             .collect();
         if filtered.is_empty() {
             if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-                hooks.remove(hook_type);
+                hooks.shift_remove(hook_type);
             }
         } else {
             settings["hooks"][hook_type] = serde_json::Value::Array(filtered);
@@ -1909,7 +1913,7 @@ fn uninstall_json_mcp_servers(ide: Ide) -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     if let Some(servers) = data.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-        servers.remove("qartez");
+        servers.shift_remove("qartez");
     }
     write_json(&config_path, &data)?;
     info(&format!("Removed qartez from {}", config_path.display()));
@@ -2004,7 +2008,7 @@ fn uninstall_zed() -> anyhow::Result<()> {
         .get_mut("context_servers")
         .and_then(|s| s.as_object_mut())
     {
-        servers.remove("qartez");
+        servers.shift_remove("qartez");
     }
     write_json(&config_path, &data)?;
     info(&format!("Removed qartez from {}", config_path.display()));
@@ -2017,56 +2021,44 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
     let config_path = Ide::Continue.config_path();
     ensure_parent(&config_path)?;
 
-    let mut data: serde_yaml_ng::Value = if config_path.is_file() {
+    let mut data = if config_path.is_file() {
         let text = fs::read_to_string(&config_path)?;
-        serde_yaml_ng::from_str(&text).unwrap_or(serde_yaml_ng::Value::Mapping(Default::default()))
+        parse_yaml_config(&text).map_err(|e| unparseable_yaml_config(&config_path, &e))?
     } else {
-        let mut m = serde_yaml_ng::Mapping::new();
-        m.insert(
-            serde_yaml_ng::Value::String("name".into()),
-            serde_yaml_ng::Value::String("Local Config".into()),
-        );
-        m.insert(
-            serde_yaml_ng::Value::String("version".into()),
-            serde_yaml_ng::Value::String("0.0.1".into()),
-        );
-        m.insert(
-            serde_yaml_ng::Value::String("schema".into()),
-            serde_yaml_ng::Value::String("v1".into()),
-        );
-        serde_yaml_ng::Value::Mapping(m)
+        serde_json::json!({
+            "name": "Local Config",
+            "version": "0.0.1",
+            "schema": "v1",
+        })
     };
 
     let mapping = data
-        .as_mapping_mut()
+        .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
     // Ensure mcpServers is a sequence
-    let servers_key = serde_yaml_ng::Value::String("mcpServers".into());
-    if !mapping.contains_key(&servers_key) || !mapping[&servers_key].is_sequence() {
-        mapping.insert(servers_key.clone(), serde_yaml_ng::Value::Sequence(vec![]));
+    if !mapping
+        .get("mcpServers")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        mapping.insert("mcpServers".into(), serde_json::json!([]));
     }
 
-    let servers = mapping[&servers_key]
-        .as_sequence_mut()
-        .expect("mcpServers must be a sequence");
+    let servers = mapping
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("Continue 'mcpServers' field is not a sequence"))?;
 
-    let desired = {
-        let mut m = serde_yaml_ng::Mapping::new();
-        m.insert("name".into(), serde_yaml_ng::Value::String("qartez".into()));
-        m.insert("command".into(), serde_yaml_ng::Value::String(bin.into()));
-        m.insert("args".into(), serde_yaml_ng::Value::Sequence(vec![]));
-        serde_yaml_ng::Value::Mapping(m)
-    };
+    let desired = serde_json::json!({
+        "name": "qartez",
+        "command": bin,
+        "args": [],
+    });
 
     // Find existing entry by name
-    let idx = servers.iter().position(|entry| {
-        entry
-            .as_mapping()
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("qartez")
-    });
+    let idx = servers
+        .iter()
+        .position(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("qartez"));
 
     if let Some(i) = idx {
         if servers[i] == desired {
@@ -2090,8 +2082,7 @@ fn install_continue(bin: &str) -> anyhow::Result<()> {
         ));
     }
 
-    let out = serde_yaml_ng::to_string(&data)?;
-    fs::write(&config_path, out)?;
+    fs::write(&config_path, render_yaml_config(&data)?)?;
     Ok(())
 }
 
@@ -2106,27 +2097,22 @@ fn uninstall_continue() -> anyhow::Result<()> {
     }
 
     let text = fs::read_to_string(&config_path)?;
-    let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)?;
+    let mut data = parse_yaml_config(&text)?;
     let mapping = data
-        .as_mapping_mut()
+        .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let servers_key = serde_yaml_ng::Value::String("mcpServers".into());
     let Some(servers) = mapping
-        .get_mut(&servers_key)
-        .and_then(|v| v.as_sequence_mut())
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_array_mut)
     else {
         info("qartez not present in Continue config. Nothing to uninstall.");
         return Ok(());
     };
 
-    let idx = servers.iter().position(|entry| {
-        entry
-            .as_mapping()
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("qartez")
-    });
+    let idx = servers
+        .iter()
+        .position(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("qartez"));
 
     let Some(i) = idx else {
         info("qartez not present in Continue config. Nothing to uninstall.");
@@ -2135,10 +2121,46 @@ fn uninstall_continue() -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     servers.remove(i);
-    let out = serde_yaml_ng::to_string(&data)?;
-    fs::write(&config_path, out)?;
+    fs::write(&config_path, render_yaml_config(&data)?)?;
     info(&format!("Removed qartez from {}", config_path.display()));
     Ok(())
+}
+
+/// Parse a YAML IDE config into a JSON value tree.
+///
+/// The Continue and Goose configs are plain string-keyed mappings, so a
+/// `serde_json::Value` (insertion-ordered via `preserve_order`) holds them
+/// losslessly enough for an edit-and-write-back, and keeps the YAML backend
+/// free of an unsafe C translation. An empty document parses to an empty
+/// mapping rather than `null`. Only `true` / `false` are booleans (YAML 1.2,
+/// as `serde_yaml_ng` read them): with the YAML 1.1 default an unquoted
+/// `yes` / `no` / `on` / `off` would be written back as `true` / `false`.
+fn parse_yaml_config(text: &str) -> anyhow::Result<serde_json::Value> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let options = serde_saphyr::options! { strict_booleans: true };
+    let value: serde_json::Value = serde_saphyr::from_str_with_options(text, options)?;
+    Ok(if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    })
+}
+
+/// Error for an existing YAML config that cannot be read. Install refuses to
+/// touch it: falling back to an empty mapping would replace the user's whole
+/// config with a lone qartez entry. `serde-saphyr` rejects a few rare forms
+/// (`.inf`, a `~` or sequence key) and drops custom tags such as `!Ref`.
+fn unparseable_yaml_config(path: &Path, err: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot parse {}: {err}; left unchanged, fix it or add qartez by hand",
+        path.display()
+    )
+}
+
+fn render_yaml_config(data: &serde_json::Value) -> anyhow::Result<String> {
+    Ok(serde_saphyr::to_string(data)?)
 }
 
 // -- OpenCode (JSON with mcp key, command is array) --------------------------
@@ -2231,7 +2253,7 @@ fn uninstall_opencode_at(path: &Path) -> anyhow::Result<bool> {
 
     backup_file(path)?;
     if let Some(mcp) = data.get_mut("mcp").and_then(|m| m.as_object_mut()) {
-        mcp.remove("qartez");
+        mcp.shift_remove("qartez");
     }
     write_json(path, &data)?;
     Ok(true)
@@ -2392,7 +2414,7 @@ fn uninstall_copilot_cli() -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     if let Some(servers) = data.get_mut("servers").and_then(|s| s.as_object_mut()) {
-        servers.remove("qartez");
+        servers.shift_remove("qartez");
     }
     write_json(&config_path, &data)?;
     info(&format!("Removed qartez from {}", config_path.display()));
@@ -2469,7 +2491,7 @@ fn uninstall_amp() -> anyhow::Result<()> {
         .get_mut("amp.mcpServers")
         .and_then(|s| s.as_object_mut())
     {
-        servers.remove("qartez");
+        servers.shift_remove("qartez");
     }
     write_json(&config_path, &data)?;
     info(&format!("Removed qartez from {}", config_path.display()));
@@ -2543,7 +2565,7 @@ fn uninstall_augment() -> anyhow::Result<()> {
 
     backup_file(&config_path)?;
     if let Some(servers) = data.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-        servers.remove("qartez");
+        servers.shift_remove("qartez");
     }
     write_json(&config_path, &data)?;
     info(&format!("Removed qartez from {}", config_path.display()));
@@ -2556,51 +2578,46 @@ fn install_goose(bin: &str) -> anyhow::Result<()> {
     let config_path = Ide::Goose.config_path();
     ensure_parent(&config_path)?;
 
-    let mut data: serde_yaml_ng::Value = if config_path.is_file() {
+    let mut data = if config_path.is_file() {
         let text = fs::read_to_string(&config_path)?;
-        serde_yaml_ng::from_str(&text).unwrap_or(serde_yaml_ng::Value::Mapping(Default::default()))
+        parse_yaml_config(&text).map_err(|e| unparseable_yaml_config(&config_path, &e))?
     } else {
-        serde_yaml_ng::Value::Mapping(Default::default())
+        serde_json::json!({})
     };
 
     let mapping = data
-        .as_mapping_mut()
+        .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let ext_key = serde_yaml_ng::Value::String("extensions".into());
-    if !mapping.contains_key(&ext_key) || !mapping[&ext_key].is_mapping() {
-        mapping.insert(
-            ext_key.clone(),
-            serde_yaml_ng::Value::Mapping(Default::default()),
-        );
+    if !mapping
+        .get("extensions")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        mapping.insert("extensions".into(), serde_json::json!({}));
     }
 
-    let extensions = mapping[&ext_key]
-        .as_mapping_mut()
+    let extensions = mapping
+        .get_mut("extensions")
+        .and_then(serde_json::Value::as_object_mut)
         .ok_or_else(|| anyhow::anyhow!("Goose 'extensions' field is not a mapping"))?;
 
-    let qartez_key = serde_yaml_ng::Value::String("qartez".into());
+    let desired = serde_json::json!({
+        "command": bin,
+        "args": [],
+    });
 
-    let desired = {
-        let mut m = serde_yaml_ng::Mapping::new();
-        m.insert("command".into(), serde_yaml_ng::Value::String(bin.into()));
-        m.insert("args".into(), serde_yaml_ng::Value::Sequence(vec![]));
-        serde_yaml_ng::Value::Mapping(m)
-    };
-
-    if extensions.get(&qartez_key) == Some(&desired) {
+    if extensions.get("qartez") == Some(&desired) {
         info(&format!(
             "Goose already has qartez pointing at {bin} (no changes)."
         ));
         return Ok(());
     }
 
-    let existed = extensions.contains_key(&qartez_key);
+    let existed = extensions.contains_key("qartez");
     backup_file(&config_path)?;
-    extensions.insert(qartez_key, desired);
+    extensions.insert("qartez".into(), desired);
 
-    let out = serde_yaml_ng::to_string(&data)?;
-    fs::write(&config_path, out)?;
+    fs::write(&config_path, render_yaml_config(&data)?)?;
 
     if existed {
         info(&format!(
@@ -2627,28 +2644,27 @@ fn uninstall_goose() -> anyhow::Result<()> {
     }
 
     let text = fs::read_to_string(&config_path)?;
-    let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)?;
+    let mut data = parse_yaml_config(&text)?;
     let mapping = data
-        .as_mapping_mut()
+        .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("YAML config is not a mapping"))?;
 
-    let ext_key = serde_yaml_ng::Value::String("extensions".into());
-    let qartez_key = serde_yaml_ng::Value::String("qartez".into());
-
-    let Some(extensions) = mapping.get_mut(&ext_key).and_then(|v| v.as_mapping_mut()) else {
+    let Some(extensions) = mapping
+        .get_mut("extensions")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
         info("qartez not present in Goose config. Nothing to uninstall.");
         return Ok(());
     };
 
-    if !extensions.contains_key(&qartez_key) {
+    if !extensions.contains_key("qartez") {
         info("qartez not present in Goose config. Nothing to uninstall.");
         return Ok(());
     }
 
     backup_file(&config_path)?;
-    extensions.remove(&qartez_key);
-    let out = serde_yaml_ng::to_string(&data)?;
-    fs::write(&config_path, out)?;
+    extensions.shift_remove("qartez");
+    fs::write(&config_path, render_yaml_config(&data)?)?;
     info(&format!("Removed qartez from {}", config_path.display()));
     Ok(())
 }
@@ -4572,7 +4588,7 @@ command = \"/usr/bin/qartez\"
 
         let frontmatter = yaml_frontmatter(SKILL_MD)
             .expect("SKILL.md template must open with a `---` YAML frontmatter block");
-        let parsed: SkillFrontmatter = serde_yaml_ng::from_str(frontmatter)
+        let parsed: SkillFrontmatter = serde_saphyr::from_str(frontmatter)
             .unwrap_or_else(|e| panic!("SKILL.md frontmatter is not valid YAML: {e}"));
 
         assert!(
@@ -4617,9 +4633,46 @@ command = \"/usr/bin/qartez\"
 
         for (name, body) in skill_docs {
             if let Some(frontmatter) = yaml_frontmatter(body) {
-                serde_yaml_ng::from_str::<serde_yaml_ng::Value>(frontmatter)
+                serde_saphyr::from_str::<serde_json::Value>(frontmatter)
                     .unwrap_or_else(|e| panic!("{name} frontmatter is not valid YAML: {e}"));
             }
         }
+    }
+
+    #[test]
+    fn yaml_config_empty_or_null_parses_to_empty_mapping() {
+        for text in ["", "  \n", "~\n", "null\n"] {
+            assert_eq!(
+                parse_yaml_config(text).unwrap(),
+                serde_json::json!({}),
+                "{text:?} must read as an empty mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_config_keeps_yaml11_booleans_as_strings_on_round_trip() {
+        let input = "flag: yes\noff_value: off\nreal: true\nversion: 0.0.1\n";
+        let data = parse_yaml_config(input).unwrap();
+        assert_eq!(data["flag"], serde_json::json!("yes"));
+        assert_eq!(data["off_value"], serde_json::json!("off"));
+        assert_eq!(data["real"], serde_json::json!(true));
+        assert_eq!(data["version"], serde_json::json!("0.0.1"));
+
+        // The written file must read back to the same values.
+        let out = render_yaml_config(&data).unwrap();
+        assert_eq!(parse_yaml_config(&out).unwrap(), data, "rendered: {out}");
+    }
+
+    #[test]
+    fn yaml_config_preserves_key_order() {
+        let data = parse_yaml_config("zeta: 1\nalpha: 2\nmid: 3\n").unwrap();
+        let keys: Vec<&str> = data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
     }
 }

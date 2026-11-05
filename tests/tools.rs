@@ -1442,13 +1442,18 @@ fn test_qartez_read_split_preserves_all_modes() {
         "filter must exclude a.rs alpha, got: {filtered}"
     );
 
-    // 5. All-missing batch returns Err (no partial hits to fall back on).
-    let err = server
+    // 5. All-missing batch is Ok with a not-found notice, not an Err: a
+    // batch read reports per-name misses in its footer, so `symbols=[miss]`
+    // and `symbols=[hit, miss]` answer in the same shape (see read.rs). A
+    // single-name lookup is the one that still errors - that is point 6.
+    let all_missing = server
         .call_tool_by_name("qartez_read", json!({ "symbols": ["nope1", "nope2"] }))
-        .unwrap_err();
+        .expect("all-missing batch answers with a notice, not an error");
     assert!(
-        err.contains("No symbol found") || err.contains("not found"),
-        "all-missing batch should error, got: {err}"
+        all_missing.contains("No symbol found")
+            && all_missing.contains("nope1")
+            && all_missing.contains("nope2"),
+        "all-missing batch must name every missing symbol, got: {all_missing}"
     );
 
     // 6. Missing both symbols and file_path is a clear error.
@@ -2355,6 +2360,13 @@ fn test_security_scan_line_points_at_match_not_symbol_header() {
     // 8. The enclosing fn header is on line 2, so an old-behavior report
     // would print `Line 2` with the snippet showing L8. The new report
     // must print `Line 8`.
+    //
+    // The call has to be one SEC004 actually flags today: a dynamic exec
+    // path alone is argv exec (no shell), which the allowlist deliberately
+    // treats as safe - see `is_sec004_static_command`. Passing the shell's
+    // `-c` flag is what makes it an injection vector, and that is what the
+    // rule fires on. The line-number assertions below are the point of the
+    // test; the finding is only the vehicle.
     use qartez_mcp::server::QartezServer;
     use serde_json::json;
 
@@ -2364,15 +2376,15 @@ fn test_security_scan_line_points_at_match_not_symbol_header() {
     // Craft the file so the fn spans lines 1-10 and the Command::new call
     // lands on line 8. Each `\n` advances one line; the first line is 1.
     let body = "// Leading comment\n\
-                pub fn run_something(exec_path: &str) {\n    \
+                pub fn run_something(exec_path: &str, payload: &str) {\n    \
                 let mut acc = Vec::new();\n    \
                 acc.push(1);\n    \
                 acc.push(2);\n    \
                 acc.push(3);\n    \
                 // next line spawns the process\n    \
-                let _ = std::process::Command::new(exec_path)\n        \
-                .arg(\"--help\")\n        \
-                .output();\n\
+                let _ = std::process::Command::new(exec_path).arg(\"-c\").arg(payload).output();\n    \
+                acc.push(4);\n    \
+                acc.push(5);\n\
                 }\n";
     fs::write(src.join("run.rs"), body).unwrap();
 
@@ -2436,24 +2448,27 @@ fn test_security_scan_line_points_at_real_match_when_allowlisted_precedes() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
+    // The flagged call passes the shell's `-c` flag: a dynamic exec path on
+    // its own is argv exec, which the allowlist treats as safe by design.
+    //
     // Line layout:
-    //   1: pub fn spawn_stuff(dyn_path: &str) {
+    //   1: pub fn spawn_stuff(dyn_path: &str, payload: &str) {
     //   2:     // static literal - allowlisted
     //   3:     let _ = std::process::Command::new("git").arg("log").output();
     //   4:     let mut acc = Vec::new();
     //   5:     acc.push(1);
     //   6:     acc.push(2);
-    //   7:     // dynamic - REAL finding
-    //   8:     let _ = std::process::Command::new(dyn_path).arg("--help").output();
+    //   7:     // dynamic exec + shell flag - REAL finding
+    //   8:     let _ = std::process::Command::new(dyn_path).arg("-c").arg(payload).output();
     //   9: }
-    let body = "pub fn spawn_stuff(dyn_path: &str) {\n    \
+    let body = "pub fn spawn_stuff(dyn_path: &str, payload: &str) {\n    \
                 // static literal - allowlisted\n    \
                 let _ = std::process::Command::new(\"git\").arg(\"log\").output();\n    \
                 let mut acc = Vec::new();\n    \
                 acc.push(1);\n    \
                 acc.push(2);\n    \
-                // dynamic - REAL finding\n    \
-                let _ = std::process::Command::new(dyn_path).arg(\"--help\").output();\n\
+                // dynamic exec + shell flag - REAL finding\n    \
+                let _ = std::process::Command::new(dyn_path).arg(\"-c\").arg(payload).output();\n\
                 }\n";
     fs::write(src.join("run.rs"), body).unwrap();
 
@@ -3273,7 +3288,7 @@ fn test_gaps_fixture() -> (qartez_mcp::server::QartezServer, TempDir) {
 
     // Source file A: has a test file importing it
     let file_a = insert_file(&conn, "src/core.rs");
-    write::insert_symbols(
+    let core_symbols = write::insert_symbols(
         &conn,
         file_a,
         &[SymbolInsert {
@@ -3330,7 +3345,7 @@ fn test_gaps_fixture() -> (qartez_mcp::server::QartezServer, TempDir) {
 
     // Test file that imports file_a
     let test_file = insert_file(&conn, "tests/test_core.rs");
-    write::insert_symbols(
+    let test_symbols = write::insert_symbols(
         &conn,
         test_file,
         &[SymbolInsert {
@@ -3349,6 +3364,10 @@ fn test_gaps_fixture() -> (qartez_mcp::server::QartezServer, TempDir) {
 
     // Edge: test file imports source file A
     write::insert_edge(&conn, test_file, file_a, "import", None).unwrap();
+    // Symbol edge: `test_process` actually calls `process`. `include_symbols`
+    // reports the symbols the mapped tests exercise, not every export of the
+    // source file, so without this edge the map has nothing to show.
+    write::insert_symbol_refs(&conn, &[(test_symbols[0], core_symbols[0], "call")]).unwrap();
     // Edge: engine imports utils (for blast radius)
     write::insert_edge(&conn, file_c, file_b, "import", None).unwrap();
 
@@ -3499,9 +3518,20 @@ fn test_gaps_gaps_mode_pagerank_filter() {
         )
         .expect("pagerank filter should succeed");
 
+    // "Nothing passed the filter" and "nothing is untested" are different
+    // answers, and the tool must not collapse the first into the second: it
+    // says the gaps exist but rank below the cutoff, and names the cutoff.
     assert!(
-        result.contains("No untested source files found"),
-        "high pagerank filter should exclude all, got: {result}"
+        result.contains("min_pagerank=100"),
+        "the filter that excluded everything must be named, got: {result}"
+    );
+    assert!(
+        result.contains("testable file(s) exist"),
+        "an empty filtered result must not read as 'no gaps', got: {result}"
+    );
+    assert!(
+        !result.contains("src/utils.rs") && !result.contains("src/engine.rs"),
+        "no gap may survive a filter that excludes everything, got: {result}"
     );
 }
 
@@ -3861,13 +3891,15 @@ fn test_gaps_map_mode_include_symbols() {
         )
         .expect("include_symbols should succeed");
 
+    // `include_symbols` lists what the mapped tests actually reach, not every
+    // export - listing all exports implied every export was covered.
     assert!(
-        result.contains("process"),
-        "should list exported symbols, got: {result}"
+        result.contains("symbol(s) referenced by tests"),
+        "should have a referenced-symbols section, got: {result}"
     );
     assert!(
-        result.contains("exported symbols"),
-        "should have exported symbols section, got: {result}"
+        result.contains("process"),
+        "should name the symbol the test calls, got: {result}"
     );
 }
 
@@ -4067,7 +4099,7 @@ fn test_gaps_params_null_and_extra_fields() {
         )
         .expect("string bool should work");
     assert!(
-        result.contains("exported symbols"),
+        result.contains("symbol(s) referenced by tests"),
         "string 'true' should enable include_symbols, got: {result}"
     );
 }
@@ -4292,13 +4324,23 @@ fn knowledge_author_filter_via_call_tool_by_name() {
         "should find file by author, got: {result}"
     );
 
-    // Filter to non-existent author
+    // Filter to non-existent author. An empty result is not an error: the
+    // tool reports the miss and names the authors it does know, so the
+    // caller can correct the query instead of guessing.
     let result = server
         .call_tool_by_name("qartez_knowledge", json!({"author": "NonExistentPerson"}))
         .expect("should succeed even with no matches");
     assert!(
-        result.contains("No blame data"),
-        "should report no data for unknown author, got: {result}"
+        result.contains("No files touched by author") && result.contains("NonExistentPerson"),
+        "should report the miss for the queried author, got: {result}"
+    );
+    assert!(
+        result.contains("SpecificPerson"),
+        "the miss message must name the authors that do exist, got: {result}"
+    );
+    assert!(
+        !result.contains("a.rs"),
+        "an unmatched author must not return files, got: {result}"
     );
 }
 

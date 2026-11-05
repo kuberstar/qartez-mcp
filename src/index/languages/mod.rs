@@ -30,6 +30,7 @@ pub mod rust_lang;
 pub mod scala;
 pub mod sql;
 pub mod starlark;
+pub mod svelte;
 pub mod swift;
 pub mod systemd;
 pub mod toml_lang;
@@ -37,6 +38,7 @@ pub mod typescript;
 pub mod yaml;
 pub mod zig;
 
+use std::path::Path;
 use std::sync::LazyLock;
 use tree_sitter::Language;
 
@@ -57,6 +59,18 @@ pub trait LanguageSupport: Send + Sync {
     fn language_name(&self) -> &str;
     fn tree_sitter_language(&self, ext: &str) -> Language;
     fn extract(&self, source: &[u8], tree: &tree_sitter::Tree) -> ParseResult;
+
+    /// Opt-in escape hatch for files that hold more than one language, where
+    /// the single `tree_sitter_language` + `extract` path cannot describe the
+    /// file (a `.svelte` component is a script block, a style block, and
+    /// markup at once). Returning `Some` makes the parser skip that path and
+    /// hand the whole file to the language, which parses each embedded region
+    /// with the grammar it needs.
+    ///
+    /// Default `None` keeps every single-grammar language on the normal path.
+    fn parse_and_extract(&self, _path: &Path, _source: &[u8]) -> Option<ParseResult> {
+        None
+    }
 }
 
 struct LangEntry {
@@ -113,8 +127,9 @@ static PREFIX_REGISTRY: LazyLock<Vec<PrefixEntry>> = LazyLock::new(|| {
     entries
 });
 
-const ALL_LANGUAGES: [&dyn LanguageSupport; 37] = [
+const ALL_LANGUAGES: [&dyn LanguageSupport; 38] = [
     &typescript::TypeScriptSupport,
+    &svelte::SvelteSupport,
     &rust_lang::RustSupport,
     &go::GoSupport,
     &python::PythonSupport,

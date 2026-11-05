@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0] - 2026-11-05
+
+### Added
+
+- **Svelte components are indexed (38 languages)** - `.svelte` files were walked but never parsed, because tree-sitter binds one grammar per file. A new multi-language hook parses each `<script>` and `<style>` region over a masked copy of the source, so every symbol keeps its real line number, and reuses the TypeScript and CSS extractors verbatim. The component itself is indexed under its file stem; script symbols include Svelte 5 runes, the `generics` attribute and module plus instance blocks; style rules are excluded from dead-code; markup usages such as `<Button />` become references; and SvelteKit's `$lib` alias resolves against the nearest ancestor `src/lib`.
+- **Rust constructs the extractor was skipping** - `union` items and their fields, enum variants (as fields of the enum), associated `type` and `const` items in trait and impl bodies, trait method declarations, and inline `mod foo { .. }` modules are now symbols, so `find`, `refs` and `outline` see them. On qartez's own sources this raised symbols from 5062 to 5352 and resolved references by 15%. A bodyless `mod foo;` stays symbol-less on purpose, since the import edge already records it.
+
+### Changed
+
+- **YAML backend moved to `serde-saphyr`** - `serde_yaml_ng` pulled `unsafe-libyaml`, an archived c2rust translation of libyaml (RUSTSEC-2024-0449). `qartez-setup` now reads and writes the Continue and Goose YAML configs through `serde-saphyr` (pure safe Rust) over a `serde_json::Value` tree. `serde_json` now enables `preserve_order`, so every JSON and YAML IDE config `qartez-setup` rewrites keeps the user's key order instead of being sorted, and uninstall removes the qartez entry with `shift_remove` so the remaining keys stay in place; an empty YAML config is treated as an empty mapping. An existing YAML config that cannot be parsed is now left untouched with an error, instead of being replaced by a config holding only the qartez entry.
+- **Dependency security refresh** - `libz-sys` 1.1.29 -> 1.1.31 (RUSTSEC-2026-0418, build script printed the build environment), `tokio` 1.52.3 -> 1.54.1 (RUSTSEC-2026-0386), `webpki-root-certs` 1.0.8 -> 1.0.11 (RUSTSEC-2026-0383), `crossbeam-epoch` 0.9.18 -> 0.9.21 (RUSTSEC-2026-0204) and the yanked `der` 0.8.0 -> 0.8.3.
+- **Dashboard frontend** - `@sveltejs/kit` 2.60.1 -> 2.70.3 (prototype pollution on deleted file inputs, ReDoS in content negotiation) and `vite` 8.1.3 -> 8.3.5, plus `pnpm-workspace.yaml` overrides lifting the transitive `devalue` (5.9.4), `postcss` (8.5.32), `nanoid` (3.3.20) and `source-map-js` (1.2.2) past their advisories. `pnpm audit` goes from 18 high / 12 moderate / 6 low to 3 low, which need SvelteKit 3 or have no fix (`deepmerge`). The immutable bundle stays inside its 120 KiB gzip budget; a blanket `pnpm update` would have pushed it to ~131 KiB.
+
+### Fixed
+
+- **File watcher no longer burns CPU on churning ignored directories** - ignored and non-indexable paths were dropped only after `notify-debouncer-full` had queued, rename-tracked and file-id-cached every raw event, so a build tree such as `DerivedData/` or `target/` under the root cost 35-90% of a core per server process on macOS (#52). The MCP watcher and the dashboard daemon's watcher now filter in the raw notify callback and coalesce the survivors on their own debounce thread (200 ms / 50 ms quiet window), classifying each MCP path by whether it still exists at flush time; `notify-debouncer-full` is gone from the tree. A path outside the project root now counts as ignored instead of panicking in the `ignore` matcher, which inside the notify callback would abort the process, and the dashboard's global gitignore is rooted at the project rather than at the cwd.
+- **Linux release binaries run on Ubuntu 22.04 again** - they were built on `ubuntu-latest` and required `GLIBC_2.39` (#50). The x86_64 and aarch64 gnu builds now run on Ubuntu 22.04 runners, and the release fails if any binary needs a glibc newer than 2.35.
+
 ## [0.11.0] - 2026-07-03
 
 ### Added

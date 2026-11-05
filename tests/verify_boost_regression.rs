@@ -2,7 +2,7 @@
 //!
 //! (1) Proves the hotspots/health N+1 -> bulk-group refactor produces
 //!     byte-identical per-file avg_cc/max_cc as the old per-file query.
-//! (2) Proves the serde_yaml -> serde_yaml_ng migration preserves the
+//! (2) Proves the serde-saphyr YAML backend preserves the
 //!     read-modify-write YAML round-trip that setup.rs performs.
 
 use std::collections::HashMap;
@@ -112,48 +112,52 @@ fn bulk_group_matches_per_file_avg_and_max_cc() {
 }
 
 /// Reproduces the exact read-modify-write that `install_continue` in
-/// src/bin/setup.rs performs: parse an existing YAML doc, edit the
-/// `mcpServers` sequence, re-serialize, and re-parse. Asserts structure and
-/// values survive the serde_yaml_ng round-trip.
+/// src/bin/setup.rs performs: parse an existing YAML doc into a
+/// `serde_json::Value`, edit the `mcpServers` sequence, re-serialize, and
+/// re-parse. Asserts structure, values and key order survive the
+/// serde-saphyr round-trip.
 #[test]
-fn serde_yaml_ng_mcp_config_roundtrip() {
+fn serde_saphyr_mcp_config_roundtrip() {
     let input = "name: Local Config\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: other\n    command: /usr/bin/other\n    args: []\n";
 
-    let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(input).unwrap();
-    let mapping = data.as_mapping_mut().unwrap();
+    let mut data: serde_json::Value = serde_saphyr::from_str(input).unwrap();
+    let servers = data["mcpServers"].as_array_mut().unwrap();
+    servers.push(serde_json::json!({
+        "name": "qartez",
+        "command": "/opt/qartez",
+        "args": [],
+    }));
 
-    let servers_key = serde_yaml_ng::Value::String("mcpServers".into());
-    let servers = mapping[&servers_key].as_sequence_mut().unwrap();
+    let out = serde_saphyr::to_string(&data).unwrap();
+    let reparsed: serde_json::Value = serde_saphyr::from_str(&out).unwrap();
 
-    let mut m = serde_yaml_ng::Mapping::new();
-    m.insert("name".into(), serde_yaml_ng::Value::String("qartez".into()));
-    m.insert(
-        "command".into(),
-        serde_yaml_ng::Value::String("/opt/qartez".into()),
-    );
-    m.insert("args".into(), serde_yaml_ng::Value::Sequence(vec![]));
-    servers.push(serde_yaml_ng::Value::Mapping(m));
-
-    let out = serde_yaml_ng::to_string(&data).unwrap();
-    let reparsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
-
-    // Top-level scalars preserved.
+    // Top-level scalars preserved; `0.0.1` stays a string, not a number.
     assert_eq!(reparsed["name"].as_str(), Some("Local Config"));
+    assert_eq!(reparsed["version"].as_str(), Some("0.0.1"));
     assert_eq!(reparsed["schema"].as_str(), Some("v1"));
 
+    // The user's key order survives the write-back.
+    let keys: Vec<&str> = reparsed
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["name", "version", "schema", "mcpServers"]);
+
     // Both servers present, qartez appended with the right command.
-    let servers = reparsed["mcpServers"].as_sequence().unwrap();
+    let servers = reparsed["mcpServers"].as_array().unwrap();
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"].as_str(), Some("other"));
     assert_eq!(servers[1]["name"].as_str(), Some("qartez"));
     assert_eq!(servers[1]["command"].as_str(), Some("/opt/qartez"));
-    assert!(servers[1]["args"].as_sequence().unwrap().is_empty());
+    assert!(servers[1]["args"].as_array().unwrap().is_empty());
 }
 
-/// Reproduces the skill-frontmatter parse path (setup.rs ~line 4575/4620):
-/// deserialize a YAML frontmatter block into a typed struct.
+/// Reproduces the skill-frontmatter parse path in setup.rs: deserialize a
+/// YAML frontmatter block into a typed struct.
 #[test]
-fn serde_yaml_ng_frontmatter_parse() {
+fn serde_saphyr_frontmatter_parse() {
     #[derive(serde::Deserialize)]
     struct Frontmatter {
         name: String,
@@ -162,12 +166,12 @@ fn serde_yaml_ng_frontmatter_parse() {
 
     let frontmatter =
         "name: qartez\ndescription: |\n  Semantic code intelligence.\n  Multi-line body.\n";
-    let parsed: Frontmatter = serde_yaml_ng::from_str(frontmatter).unwrap();
+    let parsed: Frontmatter = serde_saphyr::from_str(frontmatter).unwrap();
     assert_eq!(parsed.name, "qartez");
     assert!(parsed.description.contains("Semantic code intelligence."));
     assert!(parsed.description.contains("Multi-line body."));
 
     // Untyped Value parse of the same block also succeeds (the fallback path).
-    let val: serde_yaml_ng::Value = serde_yaml_ng::from_str(frontmatter).unwrap();
+    let val: serde_json::Value = serde_saphyr::from_str(frontmatter).unwrap();
     assert_eq!(val["name"].as_str(), Some("qartez"));
 }

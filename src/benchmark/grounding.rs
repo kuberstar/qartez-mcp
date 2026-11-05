@@ -1458,9 +1458,11 @@ src/b.rs:30-40
 
     #[test]
     fn verify_side_file_exists() {
-        // Point project_root at this very worktree, assert Cargo.toml
-        // lands as verified.
-        let project_root = find_project_root();
+        // Own the tree instead of borrowing the crate's own checkout: a bare
+        // basename only verifies when it is unambiguous, so a test that points
+        // at the repo answers to the repo's layout, not to this code.
+        let project = temp_project_with_unique_cargo_toml();
+        let project_root = project.path().to_path_buf();
         let mut file_cache: HashMap<String, Option<FileFacts>> = HashMap::new();
         let mut symbol_cache: HashMap<String, bool> = HashMap::new();
         let mut basename_index: Option<HashMap<String, Vec<PathBuf>>> = None;
@@ -1478,6 +1480,40 @@ src/b.rs:30-40
         assert_eq!(result.total_claims, 1);
         assert_eq!(result.verified_claims, 1);
         assert!((result.score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn verify_side_ambiguous_basename_stays_unverified() {
+        // The rule that broke the two tests above when the workspace gained a
+        // second `Cargo.toml`: a bare basename matching several files cannot
+        // be resolved, so it must not count as verified. Pin it here.
+        let project = temp_project_with_unique_cargo_toml();
+        std::fs::create_dir_all(project.path().join("member")).expect("member dir");
+        std::fs::write(
+            project.path().join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\n",
+        )
+        .expect("second Cargo.toml");
+
+        let project_root = project.path().to_path_buf();
+        let mut file_cache: HashMap<String, Option<FileFacts>> = HashMap::new();
+        let mut symbol_cache: HashMap<String, bool> = HashMap::new();
+        let mut basename_index: Option<HashMap<String, Vec<PathBuf>>> = None;
+        let mut ctx = make_ctx(
+            &project_root,
+            None,
+            &mut file_cache,
+            &mut symbol_cache,
+            &mut basename_index,
+        );
+        let result = verify_side("the file `Cargo.toml` defines the workspace", &mut ctx)
+            .expect("one claim extracted");
+
+        assert_eq!(result.verified_claims, 0);
+        assert!(
+            result.unverified.iter().any(|u| u.contains("Cargo.toml")),
+            "an ambiguous basename belongs in the unverified list: {result:?}"
+        );
     }
 
     #[test]
@@ -1509,7 +1545,8 @@ src/b.rs:30-40
 
     #[test]
     fn verify_side_degraded_no_conn() {
-        let project_root = find_project_root();
+        let project = temp_project_with_unique_cargo_toml();
+        let project_root = project.path().to_path_buf();
         let mut file_cache: HashMap<String, Option<FileFacts>> = HashMap::new();
         let mut symbol_cache: HashMap<String, bool> = HashMap::new();
         let mut basename_index: Option<HashMap<String, Vec<PathBuf>>> = None;
@@ -1616,5 +1653,25 @@ src/b.rs:30-40
         // `CARGO_MANIFEST_DIR` is the crate root at compile time.
         let manifest = env!("CARGO_MANIFEST_DIR");
         PathBuf::from(manifest)
+    }
+
+    /// A throwaway project tree holding exactly one `Cargo.toml`.
+    ///
+    /// A file claim written as a bare basename resolves through
+    /// [`verify_file_basename`], which - by design - refuses to verify a name
+    /// that matches more than one file. The tests that assert a verified
+    /// `Cargo.toml` used to point at this crate's own checkout, which held a
+    /// single one when they were written; the workspace has since grown
+    /// `qartez-dashboard/Cargo.toml` and `fuzz/Cargo.toml`, and the claim went
+    /// ambiguous. They were asserting on the repository's layout rather than on
+    /// this module, so they own their tree now.
+    fn temp_project_with_unique_cargo_toml() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        dir
     }
 }

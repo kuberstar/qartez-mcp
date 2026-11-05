@@ -10,13 +10,12 @@ tokio = { version = "1.51.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 notify = "8"
-notify-debouncer-full = "0.7"
 thiserror = "2.0.18"
 ignore = "0.4.25"
 
 [package]
 name = "qartez-mcp"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.88"
 description = "MCP server for codebase intelligence - tree-sitter indexing, PageRank, blast radius"
@@ -63,14 +62,17 @@ glob = { version = "0.3", optional = true }
 globset = "0.4"
 ignore = "0.4.25"
 notify = "8"
-notify-debouncer-full = "0.7"
 regex = "1.11"
 rmcp = { version = "1.4.0", features = ["server", "transport-async-rw"] }
 rusqlite = { version = "0.39.0", features = ["bundled-full"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yaml_ng = "0.10"
+# `preserve_order` keeps a user's key order when setup rewrites their
+# JSON/YAML IDE configs; without it `Map` is a `BTreeMap` and sorts keys.
+# With it `Map::remove` is `swap_remove` and moves the last key into the
+# hole, so delete user-config keys with `shift_remove`.
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+serde-saphyr = "1.1.0"
 thiserror = "2.0.18"
 tiktoken-rs = { version = "0.6", optional = true }
 tokio = { version = "1.51.1", features = ["full"] }

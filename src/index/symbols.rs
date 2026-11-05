@@ -49,6 +49,10 @@ pub enum SymbolKind {
     Network,
     /// Named volume definition (docker-compose `volumes:`).
     Volume,
+    /// Single-file UI component (a `.svelte` file). The component is the file's
+    /// export: other files import it by path, not by a named declaration, so it
+    /// has no in-source definition node to attach to.
+    Component,
 }
 
 impl SymbolKind {
@@ -79,6 +83,7 @@ impl SymbolKind {
             Self::Task => "task",
             Self::Network => "network",
             Self::Volume => "volume",
+            Self::Component => "component",
         }
     }
 }

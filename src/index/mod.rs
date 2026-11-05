@@ -1427,7 +1427,7 @@ fn resolve_infra_import(
     Vec::new()
 }
 
-// --- TypeScript / JavaScript ---
+// --- TypeScript / JavaScript / Svelte ---
 
 fn resolve_import(
     importing_file: &Path,
@@ -1435,11 +1435,57 @@ fn resolve_import(
     root: &Path,
     known_files: &HashSet<String>,
 ) -> Option<String> {
+    // SvelteKit's `$lib` alias is the dominant import form in a Svelte project;
+    // without it every `$lib/...` import - components included - stays
+    // unresolved and the dependency graph of a SvelteKit app comes out empty.
+    if let Some(rest) = specifier.strip_prefix("$lib/") {
+        return resolve_kit_lib_import(importing_file, rest, root, known_files);
+    }
+
     if !specifier.starts_with('.') && !specifier.starts_with('/') {
         return None;
     }
 
     let base_dir = importing_file.parent()?;
+    resolve_import_from(base_dir, specifier, root, known_files)
+}
+
+/// Resolve SvelteKit's `$lib` alias, which points at `<app>/src/lib` (the
+/// default `kit.files.lib`).
+///
+/// `<app>` is the directory holding `svelte.config.js`. That is the project
+/// root only in a standalone SvelteKit app - in the Tauri and monorepo layouts
+/// that dominate real projects it is a subdirectory (`web/`, `frontend/`, ...).
+/// Rather than guess it, walk up from the importing file and take the first
+/// ancestor whose `src/lib/<rest>` is a file we actually indexed: the importing
+/// file always lives inside its own app, so the nearest match is that app's
+/// `src/lib` even when several apps share one repo.
+fn resolve_kit_lib_import(
+    importing_file: &Path,
+    rest: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+) -> Option<String> {
+    let mut dir = importing_file.parent();
+    while let Some(current) = dir {
+        let lib_dir = current.join("src").join("lib");
+        if let Some(hit) = resolve_import_from(&lib_dir, rest, root, known_files) {
+            return Some(hit);
+        }
+        if current == root {
+            break;
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+fn resolve_import_from(
+    base_dir: &Path,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+) -> Option<String> {
     let resolved = base_dir.join(specifier);
     let resolved = normalize_path(&resolved);
     let resolved_str = resolved.to_string_lossy();
@@ -1473,7 +1519,7 @@ fn resolve_import(
         }
     }
 
-    let extensions = &["", ".ts", ".tsx", ".js", ".jsx"];
+    let extensions = &["", ".ts", ".tsx", ".js", ".jsx", ".svelte"];
     let index_files = &["/index.ts", "/index.tsx", "/index.js", "/index.jsx"];
 
     for ext in extensions {
