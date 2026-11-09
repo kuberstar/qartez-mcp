@@ -336,7 +336,7 @@ fi
 
 # --- Rust ---
 # Must match `rust-version` in Cargo.toml. Edition 2024 needs >= 1.85.
-RUST_MIN="1.88.0"
+RUST_MIN="1.90.0"
 
 if command -v cargo >/dev/null 2>&1; then
     CARGO="$(command -v cargo)"

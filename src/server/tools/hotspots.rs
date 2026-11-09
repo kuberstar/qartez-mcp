@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -149,7 +149,7 @@ impl QartezServer {
                     HotspotSortBy::Health => scored.sort_by(|a, b| cmp_f64(&a.6, &b.6)),
                     HotspotSortBy::Complexity => scored.sort_by(|a, b| cmp_f64(&b.3, &a.3)),
                     HotspotSortBy::Coupling => scored.sort_by(|a, b| cmp_f64(&b.5, &a.5)),
-                    HotspotSortBy::Churn => scored.sort_by(|a, b| b.4.cmp(&a.4)),
+                    HotspotSortBy::Churn => scored.sort_by_key(|a| std::cmp::Reverse(a.4)),
                 }
                 scored.truncate(limit);
 
@@ -284,10 +284,10 @@ impl QartezServer {
                     HotspotSortBy::Score => scored.sort_by(|a, b| cmp_f64(&b.3, &a.3)),
                     HotspotSortBy::Health => scored.sort_by(|a, b| cmp_f64(&a.7, &b.7)),
                     HotspotSortBy::Complexity => {
-                        scored.sort_by(|a, b| b.4.cmp(&a.4));
+                        scored.sort_by_key(|a| std::cmp::Reverse(a.4));
                     }
                     HotspotSortBy::Coupling => scored.sort_by(|a, b| cmp_f64(&b.5, &a.5)),
-                    HotspotSortBy::Churn => scored.sort_by(|a, b| b.6.cmp(&a.6)),
+                    HotspotSortBy::Churn => scored.sort_by_key(|a| std::cmp::Reverse(a.6)),
                 }
                 scored.truncate(limit);
 

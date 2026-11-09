@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import Flame from '@lucide/svelte/icons/flame';
-	import { fetchHotspots } from '$lib/api';
-	import type { HotspotItem, HotspotsResponse } from '$lib/types';
+	import { fetchHotspots } from '#lib/api.js';
+	import type { HotspotItem, HotspotsResponse } from '#lib/types.js';
 
 	type SortKey = 'score' | 'health' | 'max_cc' | 'avg_cc' | 'churn' | 'pagerank' | 'path';
 	type SortDir = 'asc' | 'desc';

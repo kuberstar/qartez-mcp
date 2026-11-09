@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -1219,7 +1219,7 @@ fn split_callee(node: tree_sitter::Node, source: &[u8]) -> (String, Option<Strin
                     if count == 0 {
                         return String::new();
                     }
-                    node.child((count - 1) as u32)
+                    node.child(count - 1)
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("")
                         .to_string()

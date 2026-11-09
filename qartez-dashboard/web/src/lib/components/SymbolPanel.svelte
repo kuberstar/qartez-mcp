@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchFocusedSymbol, fetchSymbolCochanges } from '$lib/api';
-	import type { FocusedSymbol, SymbolCochange } from '$lib/types';
+	import { fetchFocusedSymbol, fetchSymbolCochanges } from '#lib/api.js';
+	import type { FocusedSymbol, SymbolCochange } from '#lib/types.js';
 
 	type Props = {
 		symbolId: number | null;

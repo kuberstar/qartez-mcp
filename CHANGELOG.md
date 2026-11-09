@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.13.0] - 2026-11-09
+
+### Added
+
+- **Core tools load upfront in Claude Code** - Claude Code defers every MCP tool behind its `ToolSearch` step, so a session saw only qartez's tool names and, across a month of real sessions, read and searched code through `grep`/`sed -n`/`cat` roughly 40 times for every qartez call. `qartez_map`, `qartez_find`, `qartez_grep`, `qartez_read`, `qartez_outline` and `qartez_impact` now carry `_meta: {"anthropic/alwaysLoad": true}`, so their schemas are in context from the first turn (about 3.5k tokens; marking every tool would cost about 23k). The flag is only set when a project is open, and other MCP hosts ignore it. In a controlled comparison the share of sessions that called qartez rose from 4 of 8 to 7 of 8, with equal answer quality and no cost increase.
+- **Shell guard in `qartez-guard`** - Claude Code has no Grep/Glob tools any more, so the existing Glob/Grep guard never fired and code exploration went through `Bash`. A new `PreToolUse` entry on `Bash|mcp__qartez__.*` counts consecutive shell reads and searches of source code inside the project (`grep`/`rg`, `sed -n`, `cat`/`head`/`tail`, `awk`, `find -name '*.rs'`) and, on the third, denies it with the exact qartez replacement (for example `qartez_read file_path="src/main.rs" start_line=120 limit=61`). The block holds until a qartez call: a plain retry or the next shell read of code is denied too, because with a one-shot denial 21% of denials were followed by the identical command. A `QARTEZ_SHELL=1 ` prefix (the shell really is the right tool) or three denials in a row let the command through and start a two-minute cooldown; an unresolved block expires after 15 minutes. Pipe filters, non-code files, paths outside the project and vendored or build directories never count; a command that also writes, builds or installs is never denied and gets the advice as context instead; any qartez call resets the count. `QARTEZ_GUARD_BASH_STREAK` (0 disables) and `QARTEZ_GUARD_BASH_COOLDOWN_SECS` tune it; `qartez-setup` installs the entry.
+- **Node subpath imports (`#lib`, `#utils/*`) resolve** - SvelteKit 3 replaced the built-in `$lib` alias with a `#lib` entry in the `imports` field of `package.json`, so every component import of a Kit 3 app stayed unresolved and its dependency graph came out empty. TS/JS/Svelte imports starting with `#` now resolve through the nearest `package.json` `imports` map (exact keys, `*` patterns with longest-prefix match, condition objects and fallback arrays, with `types` tried last), stopping at that manifest as Node does. An undeclared `#lib` falls back to the app's `src/lib`, like `$lib`.
+
+### Changed
+
+- **Server instructions fit Claude Code's 4,096-character limit** - they were 5,549 characters, so the client cut them mid-workflow and the modification-guard rule never reached the model. The rewrite is 2,600 characters, leads with the shell-to-qartez mapping (`rg`/`grep`, `sed -n`, `cat`, `find`) instead of the Grep/Glob/Read tools current Claude Code no longer has, and a test keeps it under the limit and checks that every tool it names exists.
+- **Agent snippets and the skill name the shell commands qartez replaces** - `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` and Cursor snippets and the skill's tool table now map `grep`/`rg`/`sed -n`/`cat` to qartez tools, and the Glob/Grep guard's denial no longer sends the agent to `Bash grep`.
+- **`make install` replaces binaries by rename** - copying over a running `qartez` rewrote the pages each open session's server was executing; the new binary is now copied to a temporary name, signed and moved into place.
+- **Dependency refresh to the latest stable releases (2026-11)** - every direct Rust dependency is on its newest version, including the majors rmcp 3.9, rusqlite 0.41, tree-sitter 0.27 with new grammar majors (bash, c, css, dart, haskell, ocaml, php, proto, scala), tiktoken-rs 0.12, tokenizers 0.23, axum-extra 0.12, tower-http 0.7, rand 0.10, nix 0.31, toml_edit 0.25, serde-saphyr 2, console 0.16 and dialoguer 0.12. `ort` stays on 2.0.0-rc.13 (no stable 2.0; rc.15 needs Rust 1.92). The dashboard frontend moves to the latest npm releases and pnpm 12; TypeScript stays on 6.x because SvelteKit 3 and svelte-check do not accept 7.
+- **MSRV 1.88 -> 1.90** - the new tree-sitter core and grammars require it. The development toolchain is pinned to 1.99.1.
+- **`fs4` removed** - the index lock and the self-update lock use `std::fs::File::try_lock`, stable since Rust 1.89.
+- **Dart extractor rewritten for tree-sitter-dart 0.3**, whose tree is a different shape (`function_declaration`, `member_declaration`, `call_expression`). Symbols, references and edges match the old extractor on a parity corpus, with two fixes: top-level `const` declarations are now `const` instead of `variable`, and `&&`/`||` count toward cyclomatic complexity again.
+- **Haskell `type` synonyms** - tree-sitter-haskell 0.24 renamed the `type_synomym` node to `type_synonym`.
+- **CI** - every GitHub Action is re-pinned to the commit of its latest release, Node 20 (end of life) is replaced by Node 26, and the MSRV job runs 1.90. The website image moves to nginx 1.30 (stable branch) and the GitLab deploy jobs to Alpine 3.24.
+
+### Fixed
+
+- **MCP `initialize` no longer waits seconds on large indexes** - server construction counted the body FTS rows with `COUNT(*)` on the FTS5 table, which walks the whole content store: 3-6 s on a 2.5 GB index, all before `serve()`, so qartez's tools arrived late in every session. The count now reads the `_docsize` shadow table (0.05 s on the same index) and falls back to the old query only when that table is absent.
+- **The shell guard ignores an index at the home directory** - an index at `~/.qartez` made every path under home look like project code, so a `grep` through `~/Library` counted as code exploration.
+
+### Security
+
+- **rmcp 1.8 -> 3.9** - clears GHSA-33f5-2c5q-wgwj, GHSA-9pj6-vhgr-3mwh, GHSA-c9xm-49cp-xcr9 and GHSA-9g45-5xwm-f3wc. The 2.x model follows the MCP 2025-11-25 schema (`Content` is now `ContentBlock`, resources are plain `Resource` values, prompt roles use `Role`); the wire format of tools, prompts and resources is unchanged. The later dependency refresh moved on to rmcp 3.9; tool, prompt and resource payloads on the wire are unchanged.
+- **Dashboard `graph-diff` cannot pass an option to git** - `?against=` values starting with `-` are rejected, and `git rev-parse` now runs with `--verify --end-of-options`, so a revision such as `--git-dir` or `--output=...` is never read as a flag.
+- **Dashboard frontend on SvelteKit 3** - clears the two SvelteKit 2 advisories (enhanced-form open redirect, prerender cache-control XSS). Config moved from `svelte.config.js` into the `sveltekit()` Vite plugin, `$lib` imports became `#lib` subpath imports declared in `package.json`, and `$app/stores` became `$app/state`. The immutable bundle grew by about 6.7 KB gzipped, and with the later dependency refresh the warning budget is now 140 KB. `deepmerge` (via `@sveltejs/vite-plugin-svelte`, build-time only) has no fixed release yet.
+
 ## [0.12.0] - 2026-11-05
 
 ### Added

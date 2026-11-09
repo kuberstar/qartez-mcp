@@ -6,6 +6,7 @@ pub mod walker;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 
@@ -1441,6 +1442,11 @@ fn resolve_import(
     if let Some(rest) = specifier.strip_prefix("$lib/") {
         return resolve_kit_lib_import(importing_file, rest, root, known_files);
     }
+    // Node subpath imports (`#lib/...` in SvelteKit 3, `#utils` anywhere)
+    // are declared in the `imports` field of the nearest package.json.
+    if specifier.starts_with('#') {
+        return resolve_subpath_import(importing_file, specifier, root, known_files);
+    }
 
     if !specifier.starts_with('.') && !specifier.starts_with('/') {
         return None;
@@ -1478,6 +1484,149 @@ fn resolve_kit_lib_import(
         dir = current.parent();
     }
     None
+}
+
+/// Resolve a Node subpath import (`#name` or `#name/rest`) through the
+/// `imports` field of the nearest `package.json` at or above the importing
+/// file, never above `root`.
+///
+/// A package.json that does not map the specifier is the scope boundary:
+/// Node does not keep walking up, so neither do we. The one fallback is
+/// `#lib`, which SvelteKit 3 scaffolds as `./src/lib/*`: an app that imports
+/// it without declaring it is resolved like the old `$lib` alias.
+fn resolve_subpath_import(
+    importing_file: &Path,
+    specifier: &str,
+    root: &Path,
+    known_files: &HashSet<String>,
+) -> Option<String> {
+    let mut dir = importing_file.parent();
+    while let Some(current) = dir {
+        if let Some(imports) = package_json_imports(&current.join("package.json")) {
+            let hit = match_subpath_import(&imports, specifier)
+                .iter()
+                .find_map(|target| resolve_import_from(current, target, root, known_files));
+            if hit.is_some() {
+                return hit;
+            }
+            break;
+        }
+        if current == root {
+            break;
+        }
+        dir = current.parent();
+    }
+    if specifier == "#lib" {
+        return resolve_kit_lib_import(importing_file, "index", root, known_files);
+    }
+    let rest = specifier.strip_prefix("#lib/")?;
+    resolve_kit_lib_import(importing_file, rest, root, known_files)
+}
+
+/// Read the `imports` map of a package.json. `None` when the file is absent
+/// or unparsable, `Some` (possibly empty) when a package.json exists, so the
+/// caller can tell "no manifest here" from "manifest without imports".
+///
+/// Every import of a SvelteKit 3 app is `#lib/...`, so the parsed map is
+/// cached per path and revalidated on mtime and size.
+fn package_json_imports(path: &Path) -> Option<Arc<serde_json::Map<String, serde_json::Value>>> {
+    type Entry = (
+        std::time::SystemTime,
+        u64,
+        Option<Arc<serde_json::Map<String, serde_json::Value>>>,
+    );
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, Entry>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    let len = meta.len();
+    if let Ok(cache) = CACHE.lock()
+        && let Some((m, l, parsed)) = cache.get(path)
+        && *m == mtime
+        && *l == len
+    {
+        return parsed.clone();
+    }
+    let parsed = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map(|value| match value.get("imports") {
+            Some(serde_json::Value::Object(map)) => Arc::new(map.clone()),
+            _ => Arc::new(serde_json::Map::new()),
+        });
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(path.to_path_buf(), (mtime, len, parsed.clone()));
+    }
+    parsed
+}
+
+/// Match `specifier` against a package.json `imports` map and return every
+/// candidate target with `*` substituted, most preferred first. Exact keys win
+/// over patterns; among patterns the longest prefix wins, as in Node.
+fn match_subpath_import(
+    imports: &serde_json::Map<String, serde_json::Value>,
+    specifier: &str,
+) -> Vec<String> {
+    if let Some(value) = imports.get(specifier) {
+        let mut out = Vec::new();
+        collect_subpath_targets(value, &mut out);
+        return out;
+    }
+    let mut best: Option<(usize, &str, &serde_json::Value)> = None;
+    for (key, value) in imports {
+        let Some((prefix, suffix)) = key.split_once('*') else {
+            continue;
+        };
+        let Some(middle) = specifier
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if best.is_none_or(|(len, _, _)| prefix.len() > len) {
+            best = Some((prefix.len(), middle, value));
+        }
+    }
+    let Some((_, middle, value)) = best else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_subpath_targets(value, &mut out);
+    out.into_iter().map(|t| t.replace('*', middle)).collect()
+}
+
+/// Collect the file targets of an `imports` value: a string, every entry of
+/// an array, or the branches of a conditions object. Source-facing conditions
+/// come first; `types` is last because it usually names a built `.d.ts`.
+fn collect_subpath_targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(target) if target.starts_with("./") => out.push(target.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_subpath_targets(item, out);
+            }
+        }
+        serde_json::Value::Object(conditions) => {
+            const ORDER: [&str; 7] = [
+                "svelte", "import", "module", "default", "node", "require", "types",
+            ];
+            for name in ORDER {
+                if let Some(branch) = conditions.get(name) {
+                    collect_subpath_targets(branch, out);
+                }
+            }
+            for (name, branch) in conditions {
+                if !ORDER.contains(&name.as_str()) {
+                    collect_subpath_targets(branch, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn resolve_import_from(
@@ -2760,6 +2909,146 @@ mod tests {
         assert!(
             paths.iter().any(|p| p == "nested/inside/deep.rs"),
             "paths: {paths:?}"
+        );
+    }
+
+    // --- SvelteKit `$lib` and Node subpath imports (`#lib`) ---
+
+    /// A SvelteKit app nested at `web/` with `src/lib/{api.ts,ui/card/index.ts,
+    /// Button.svelte}`; `package_json` is written to `web/package.json` when set.
+    fn kit_app(package_json: Option<&str>) -> (TempDir, HashSet<String>) {
+        let tmp = TempDir::new().unwrap();
+        let web = tmp.path().join("web");
+        std::fs::create_dir_all(web.join("src/lib/ui/card")).unwrap();
+        std::fs::create_dir_all(web.join("src/routes")).unwrap();
+        if let Some(json) = package_json {
+            std::fs::write(web.join("package.json"), json).unwrap();
+        }
+        let known: HashSet<String> = [
+            "web/src/lib/api.ts",
+            "web/src/lib/index.ts",
+            "web/src/lib/ui/card/index.ts",
+            "web/src/lib/Button.svelte",
+            "web/src/routes/+page.svelte",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        (tmp, known)
+    }
+
+    const KIT3_PACKAGE_JSON: &str =
+        r##"{"imports": {"#lib": "./src/lib/index.js", "#lib/*": "./src/lib/*"}}"##;
+
+    #[test]
+    fn test_resolve_kit_dollar_lib_nested_app() {
+        let (tmp, known) = kit_app(None);
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        let resolve = |spec| resolve_import(&importing, spec, tmp.path(), &known);
+        assert_eq!(resolve("$lib/api"), Some("web/src/lib/api.ts".into()));
+        assert_eq!(
+            resolve("$lib/Button.svelte"),
+            Some("web/src/lib/Button.svelte".into())
+        );
+        assert_eq!(
+            resolve("$lib/ui/card"),
+            Some("web/src/lib/ui/card/index.ts".into())
+        );
+        assert_eq!(resolve("$lib/missing"), None);
+    }
+
+    #[test]
+    fn test_resolve_hash_lib_through_package_json_imports() {
+        let (tmp, known) = kit_app(Some(KIT3_PACKAGE_JSON));
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        let resolve = |spec| resolve_import(&importing, spec, tmp.path(), &known);
+        // Kit 3 spells the extension: `.js` maps back to the `.ts` source.
+        assert_eq!(resolve("#lib/api.js"), Some("web/src/lib/api.ts".into()));
+        assert_eq!(resolve("#lib/api"), Some("web/src/lib/api.ts".into()));
+        assert_eq!(
+            resolve("#lib/Button.svelte"),
+            Some("web/src/lib/Button.svelte".into())
+        );
+        assert_eq!(
+            resolve("#lib/ui/card/index.js"),
+            Some("web/src/lib/ui/card/index.ts".into())
+        );
+        // The exact `#lib` key, not the pattern.
+        assert_eq!(resolve("#lib"), Some("web/src/lib/index.ts".into()));
+        assert_eq!(resolve("#lib/missing.js"), None);
+    }
+
+    #[test]
+    fn test_resolve_hash_lib_without_declaration_falls_back_to_src_lib() {
+        // No package.json anywhere: `#lib` still means SvelteKit's src/lib.
+        let (tmp, known) = kit_app(None);
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        let resolve = |spec| resolve_import(&importing, spec, tmp.path(), &known);
+        assert_eq!(resolve("#lib/api.js"), Some("web/src/lib/api.ts".into()));
+        assert_eq!(resolve("#lib"), Some("web/src/lib/index.ts".into()));
+        // Any other undeclared `#name` stays unresolved.
+        assert_eq!(resolve("#utils/api"), None);
+    }
+
+    #[test]
+    fn test_resolve_subpath_import_custom_map_and_conditions() {
+        let json = r##"{"imports": {
+            "#utils/*": "./src/lib/*.ts",
+            "#utils/ui/*": {"types": "./dist/ui/*.d.ts", "import": "./src/lib/ui/*/index.ts"},
+            "#api": ["./missing.js", "./src/lib/api.ts"],
+            "#pkg": "some-npm-package"
+        }}"##;
+        let (tmp, known) = kit_app(Some(json));
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        let resolve = |spec| resolve_import(&importing, spec, tmp.path(), &known);
+        assert_eq!(resolve("#utils/api"), Some("web/src/lib/api.ts".into()));
+        // Longest pattern prefix wins; `types` points at unindexed dist and
+        // the `import` branch resolves instead.
+        assert_eq!(
+            resolve("#utils/ui/card"),
+            Some("web/src/lib/ui/card/index.ts".into())
+        );
+        // Array fallbacks are tried in order.
+        assert_eq!(resolve("#api"), Some("web/src/lib/api.ts".into()));
+        // A bare package target is external, not a file.
+        assert_eq!(resolve("#pkg"), None);
+    }
+
+    #[test]
+    fn test_resolve_subpath_import_stops_at_nearest_package_json() {
+        // The nearest package.json declares no `#lib`, so Node would not look
+        // further up; only the SvelteKit src/lib fallback applies, and an
+        // undeclared `#name` the outer manifest maps stays unresolved.
+        let (tmp, known) = kit_app(Some(r#"{"name": "web"}"#));
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r##"{"imports": {"#api": "./web/src/lib/api.ts"}}"##,
+        )
+        .unwrap();
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        let resolve = |spec| resolve_import(&importing, spec, tmp.path(), &known);
+        assert_eq!(resolve("#api"), None);
+        assert_eq!(resolve("#lib/api.js"), Some("web/src/lib/api.ts".into()));
+    }
+
+    #[test]
+    fn test_package_json_imports_cache_sees_edits() {
+        let (tmp, known) = kit_app(Some(r##"{"imports": {"#a": "./src/lib/api.ts"}}"##));
+        let importing = tmp.path().join("web/src/routes/+page.svelte");
+        assert_eq!(
+            resolve_import(&importing, "#a", tmp.path(), &known),
+            Some("web/src/lib/api.ts".into())
+        );
+        // Different length, so the size half of the cache key changes even
+        // when the filesystem mtime granularity does not.
+        std::fs::write(
+            tmp.path().join("web/package.json"),
+            r##"{"imports": {"#a": "./src/lib/Button.svelte"}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_import(&importing, "#a", tmp.path(), &known),
+            Some("web/src/lib/Button.svelte".into())
         );
     }
 
@@ -4949,7 +5238,8 @@ mod tests {
         // prefix, and confirm the existing prefixed row is the one updated
         // (no orphan "foo.ts" row is created).
         fs::write(&file, "export const x = 2;\n").unwrap();
-        incremental_index_with_prefix(&conn, &root, &prefix, &[file.clone()], &[]).unwrap();
+        incremental_index_with_prefix(&conn, &root, &prefix, std::slice::from_ref(&file), &[])
+            .unwrap();
 
         assert!(
             read::get_file_by_path(&conn, &format!("{prefix}/foo.ts"))
@@ -5063,7 +5353,14 @@ mod tests {
         // resolve_symbol_references will NOT re-parse it. The only way the
         // (run -> do_work) ref survives is via snapshot_cross_file_refs.
         fs::write(&helper_path, "pub fn do_work() { /* edited */ }\n").unwrap();
-        incremental_index_with_prefix(&conn, &root, &prefix, &[helper_path.clone()], &[]).unwrap();
+        incremental_index_with_prefix(
+            &conn,
+            &root,
+            &prefix,
+            std::slice::from_ref(&helper_path),
+            &[],
+        )
+        .unwrap();
 
         // The cross-ref MUST survive.
         let final_refs: Vec<(String, String)> = {

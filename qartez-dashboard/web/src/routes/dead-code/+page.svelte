@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import { fetchDeadCode } from '$lib/api';
-	import type { DeadCodeItem, DeadCodeResponse } from '$lib/types';
+	import { fetchDeadCode } from '#lib/api.js';
+	import type { DeadCodeItem, DeadCodeResponse } from '#lib/types.js';
 
 	let data = $state<DeadCodeResponse | null>(null);
 	let loadError = $state<string | null>(null);

@@ -114,23 +114,20 @@ fn extract_from_node(
             }
             return;
         }
-        "function_signature" => {
+        "function_declaration" => {
             if is_top_level(node)
-                && let Some(sym) = extract_function(node, source)
+                && let Some(sig) = node.child_by_field_name("signature")
+                && let Some(sym) = extract_function(node, sig, source)
             {
                 let idx = symbols.len();
                 symbols.push(sym);
-                // Sweep the signature (for param/return type refs) and
-                // the adjacent function_body sibling (for call and
-                // type refs in the body). Using the shared source_file
-                // parent here would bleed references from unrelated
-                // top-level declarations into this function.
+                // Sweep the signature (for param/return type refs) and the
+                // body (for call and type refs) separately, so the typed
+                // parameters are in scope for the body's receiver hints.
                 let mut env = ScopeEnv::new();
-                collect_param_types(node, source, &mut env);
-                collect_references_scoped(node, source, Some(idx), references, &[], Some(&env));
-                if let Some(body) = node.next_sibling()
-                    && body.kind() == "function_body"
-                {
+                collect_param_types(sig, source, &mut env);
+                collect_references_scoped(sig, source, Some(idx), references, &[], Some(&env));
+                if let Some(body) = node.child_by_field_name("body") {
                     collect_local_types(body, source, &mut env);
                     collect_references_scoped(body, source, Some(idx), references, &[], Some(&env));
                 }
@@ -149,19 +146,24 @@ fn extract_from_node(
             }
             return;
         }
-        "static_final_declaration_list" => {
-            if is_top_level(node) {
-                let kind = resolve_variable_kind(node);
-                extract_variable_list(node, source, kind, symbols);
-                collect_references(node, source, enclosing, references);
+        "top_level_variable_declaration" => {
+            let kind = if children(node).any(|c| c.kind() == "const") {
+                SymbolKind::Const
+            } else {
+                SymbolKind::Variable
+            };
+            for list in children(node) {
+                match list.kind() {
+                    "static_final_declaration_list" => {
+                        extract_variable_list(list, source, kind.clone(), symbols);
+                    }
+                    "initialized_identifier_list" => {
+                        extract_initialized_list(list, source, symbols);
+                    }
+                    _ => {}
+                }
             }
-            return;
-        }
-        "initialized_identifier_list" => {
-            if is_top_level(node) {
-                extract_initialized_list(node, source, symbols);
-                collect_references(node, source, enclosing, references);
-            }
+            collect_references(node, source, enclosing, references);
             return;
         }
         _ => {}
@@ -178,13 +180,29 @@ fn is_top_level(node: Node) -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_variable_kind(node: Node) -> SymbolKind {
-    if let Some(prev) = node.prev_sibling()
-        && prev.kind() == "const"
-    {
-        return SymbolKind::Const;
-    }
-    SymbolKind::Variable
+/// The body of a class member: on the `method_declaration` a method member
+/// wraps (`member_declaration > method_declaration{signature, body}`), or
+/// directly on the member for shapes that carry it there.
+fn member_body(member: Node) -> Option<Node> {
+    member.child_by_field_name("body").or_else(|| {
+        children(member)
+            .find(|c| c.kind() == "method_declaration")
+            .and_then(|m| m.child_by_field_name("body"))
+    })
+}
+
+/// The annotated type name of a declaration, parameter or local. The grammar
+/// wraps it as `type > type_identifier`; a bare `type_identifier` child is
+/// accepted too.
+fn declared_type_name(node: Node, source: &[u8]) -> Option<String> {
+    children(node)
+        .find(|c| c.kind() == "type_identifier")
+        .or_else(|| {
+            children(node)
+                .find(|c| c.kind() == "type")
+                .and_then(|t| children(t).find(|c| c.kind() == "type_identifier"))
+        })
+        .map(|c| node_text(c, source))
 }
 
 fn extract_class(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
@@ -220,6 +238,7 @@ fn count_complexity(node: Node, source: &[u8]) -> u32 {
         "for_statement" | "while_statement" | "do_statement" => 1,
         "catch_clause" => 1,
         "conditional_expression" => 1,
+        "logical_and_expression" | "logical_or_expression" => 1,
         "binary_expression" => {
             let op = node
                 .child_by_field_name("operator")
@@ -277,16 +296,14 @@ fn extract_type_alias(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
     })
 }
 
-fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
-    let name_node = node.child_by_field_name("name")?;
+fn extract_function(decl: Node, sig: Node, source: &[u8]) -> Option<ExtractedSymbol> {
+    let name_node = sig.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     if name.is_empty() {
         return None;
     }
-    let body_node = node.next_sibling().filter(|s| s.kind() == "function_body");
-    let line_end = body_node
-        .map(|b| b.end_position().row as u32 + 1)
-        .unwrap_or(node.end_position().row as u32 + 1);
+    let body_node = decl.child_by_field_name("body");
+    let line_end = decl.end_position().row as u32 + 1;
     let body_cc = body_node
         .map(|body| count_complexity(body, source))
         .unwrap_or(0);
@@ -294,9 +311,9 @@ fn extract_function(node: Node, source: &[u8]) -> Option<ExtractedSymbol> {
         is_exported: is_dart_exported(&name),
         name,
         kind: SymbolKind::Function,
-        line_start: node.start_position().row as u32 + 1,
+        line_start: decl.start_position().row as u32 + 1,
         line_end,
-        signature: extract_signature(node, source),
+        signature: extract_signature(sig, source),
         parent_idx: None,
         unused_excluded: false,
         complexity: Some(1 + body_cc),
@@ -322,7 +339,7 @@ fn extract_class_body(
     let mut class_fields = ScopeEnv::new();
     collect_class_field_types(class_node, source, &mut class_fields);
     for member in children(body) {
-        if member.kind() != "class_member" {
+        if member.kind() != "member_declaration" {
             continue;
         }
         if let Some(sym) = extract_member(member, source, class_idx) {
@@ -330,9 +347,7 @@ fn extract_class_body(
             symbols.push(sym);
             // Walk this method's body (and signature) for call + type
             // references attributed to the method itself, not the class.
-            let method_body = member
-                .child_by_field_name("body")
-                .or_else(|| children(member).find(|c| c.kind() == "function_body"));
+            let method_body = member_body(member);
             let mut method_env = class_fields.clone();
             collect_param_types(member, source, &mut method_env);
             if let Some(b) = method_body {
@@ -376,8 +391,9 @@ fn extract_class_body(
 fn extract_member(member: Node, source: &[u8], parent_idx: usize) -> Option<ExtractedSymbol> {
     for child in children(member) {
         match child.kind() {
-            "method_signature" => {
-                return extract_method_from_signature(child, source, parent_idx, member);
+            "method_declaration" => {
+                let sig = child.child_by_field_name("signature")?;
+                return extract_method_from_signature(sig, source, parent_idx, member);
             }
             "declaration" => {
                 for inner in children(child) {
@@ -391,9 +407,7 @@ fn extract_member(member: Node, source: &[u8], parent_idx: usize) -> Option<Extr
                             if name.is_empty() {
                                 return None;
                             }
-                            let member_cc = member
-                                .child_by_field_name("body")
-                                .or_else(|| children(member).find(|c| c.kind() == "function_body"))
+                            let member_cc = member_body(member)
                                 .map(|body| count_complexity(body, source))
                                 .unwrap_or(0);
                             return Some(ExtractedSymbol {
@@ -437,9 +451,7 @@ fn extract_method_from_signature(
                 if name.is_empty() {
                     return None;
                 }
-                let sig_cc = member
-                    .child_by_field_name("body")
-                    .or_else(|| children(member).find(|c| c.kind() == "function_body"))
+                let sig_cc = member_body(member)
                     .map(|body| count_complexity(body, source))
                     .unwrap_or(0);
                 return Some(ExtractedSymbol {
@@ -572,11 +584,8 @@ fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
     common::brace_or_first_line_signature(node, source)
 }
 
-/// Walks `root` and records call-site and type-reference edges. Dart's
-/// tree-sitter grammar exposes call sites under a handful of parent kinds
-/// (`function_expression_invocation`, `method_invocation`,
-/// `invocation_expression`, `selector`) where the callee lives in an
-/// `identifier` child. We treat a `type_identifier` as a TypeRef unless its
+/// Walks `root` and records call-site and type-reference edges. Calls are
+/// `call_expression` nodes (see `record_reference`). We treat a `type_identifier` as a TypeRef unless its
 /// parent is itself a declaration header (class/mixin/enum/extension/type
 /// alias), to avoid recording a class as a reference to itself.
 ///
@@ -639,82 +648,38 @@ fn record_reference(
 ) {
     let line = node.start_position().row as u32 + 1;
     match node.kind() {
-        // Tree-sitter-dart emits calls as two sibling nodes under the
-        // parent: an `identifier` for the callee and a `selector` that
-        // contains an `argument_part`. Detect the shape by looking at the
-        // selector: if it wraps an argument_part, the previous sibling's
-        // identifier text is the callee.
-        "selector" => {
-            // Calls in tree-sitter-dart show up as a `selector` whose child
-            // is an `argument_part`. The callee lives in the previous
-            // sibling. Two shapes:
-            //
-            //   bare/constructor call    `Foo(args)`
-            //     identifier "Foo"         <-- prev sibling
-            //     selector "(args)"        <-- this node
-            //
-            //   method call              `obj.method(args)`
-            //     identifier "obj"
-            //     selector ".method"       <-- prev sibling (no argument_part)
-            //       unconditional_assignable_selector
-            //         identifier "method"  <-- the callee
-            //     selector "(args)"        <-- this node
-            //
-            // For the bare shape we read the identifier directly; for the
-            // method shape we descend into the prev selector to find the
-            // member identifier.
-            let has_args = children(node).any(|c| c.kind() == "argument_part");
-            if !has_args {
-                return;
-            }
-            let Some(prev) = node.prev_sibling() else {
+        // Calls are `call_expression{function, arguments}`. The callee is
+        // the `function` identifier for a bare or constructor call
+        // (`helper()`, `Foo()`), or the `property` of a member expression
+        // for a method call (`obj.method()`, `obj?.method()`). A receiver
+        // type hint is recorded only when the `object` is a plain
+        // identifier whose type is known in scope.
+        "call_expression" => {
+            let Some(function) = node.child_by_field_name("function") else {
                 return;
             };
-            let (callee_text, callee_line, receiver_type_hint) = match prev.kind() {
-                "identifier" => (
-                    node_text(prev, source),
-                    prev.start_position().row as u32 + 1,
-                    None,
-                ),
-                "selector" => {
-                    let Some(member) = children(prev).find_map(|c| {
-                        if c.kind() == "unconditional_assignable_selector"
-                            || c.kind() == "conditional_assignable_selector"
-                        {
-                            children(c).find(|g| g.kind() == "identifier")
-                        } else {
-                            None
-                        }
-                    }) else {
+            let (callee, receiver_type_hint) = match function.kind() {
+                "identifier" => (function, None),
+                "member_expression" | "null_aware_member_expression" => {
+                    let Some(property) = function.child_by_field_name("property") else {
                         return;
                     };
-                    // Receiver hint: walk back one more sibling past the
-                    // dot-selector. For `foo.method()` that sibling is the
-                    // bare `identifier "foo"`. Skip cases where the receiver
-                    // is anything else (a `this`, another selector chain,
-                    // parenthesized expression).
-                    let hint = prev.prev_sibling().and_then(|recv| {
-                        if recv.kind() == "identifier" {
-                            let name = node_text(recv, source);
-                            env.and_then(|e| e.get(&name)).cloned()
-                        } else {
-                            None
-                        }
-                    });
-                    (
-                        node_text(member, source),
-                        member.start_position().row as u32 + 1,
-                        hint,
-                    )
+                    let hint = function
+                        .child_by_field_name("object")
+                        .filter(|object| object.kind() == "identifier")
+                        .and_then(|object| env.and_then(|e| e.get(&node_text(object, source))))
+                        .cloned();
+                    (property, hint)
                 }
                 _ => return,
             };
+            let callee_text = node_text(callee, source);
             if callee_text.is_empty() {
                 return;
             }
             references.push(ExtractedReference {
                 name: callee_text,
-                line: callee_line,
+                line: callee.start_position().row as u32 + 1,
                 from_symbol_idx: enclosing,
                 kind: ReferenceKind::Call,
                 qualifier: None,
@@ -757,7 +722,7 @@ fn collect_class_field_types(class_node: Node, source: &[u8], env: &mut ScopeEnv
         return;
     };
     for member in children(body) {
-        if member.kind() != "class_member" {
+        if member.kind() != "member_declaration" {
             continue;
         }
         // A field member wraps a `declaration` whose sibling is `;`. Method
@@ -782,10 +747,9 @@ fn collect_class_field_types(class_node: Node, source: &[u8], env: &mut ScopeEnv
         if has_sig {
             continue;
         }
-        let type_name = children(decl)
-            .find(|c| c.kind() == "type_identifier")
-            .map(|c| node_text(c, source));
-        let Some(type_name) = type_name else { continue };
+        let Some(type_name) = declared_type_name(decl, source) else {
+            continue;
+        };
         if type_name.is_empty() || is_dart_builtin_type(&type_name) {
             continue;
         }
@@ -823,9 +787,7 @@ fn collect_param_types(sig_node: Node, source: &[u8], env: &mut ScopeEnv) {
     let mut stack: Vec<Node> = vec![sig_node];
     while let Some(n) = stack.pop() {
         if n.kind() == "formal_parameter" {
-            let type_name = children(n)
-                .find(|c| c.kind() == "type_identifier")
-                .map(|c| node_text(c, source));
+            let type_name = declared_type_name(n, source);
             let var_name = children(n)
                 .find(|c| c.kind() == "identifier")
                 .map(|c| node_text(c, source));
@@ -852,10 +814,8 @@ fn collect_local_types(body: Node, source: &[u8], env: &mut ScopeEnv) {
     let mut cursor = body.walk();
     let mut stack: Vec<Node> = vec![body];
     while let Some(n) = stack.pop() {
-        if n.kind() == "initialized_variable_definition" {
-            let type_name = children(n)
-                .find(|c| c.kind() == "type_identifier")
-                .map(|c| node_text(c, source));
+        if n.kind() == "initialized_variable_declaration" {
+            let type_name = declared_type_name(n, source);
             let var_name = children(n)
                 .find(|c| c.kind() == "identifier")
                 .map(|c| node_text(c, source));

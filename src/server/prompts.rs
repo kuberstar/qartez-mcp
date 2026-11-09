@@ -10,7 +10,7 @@
 //! test, and free of runtime side effects.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{GetPromptResult, PromptMessage, PromptMessageRole};
+use rmcp::model::{GetPromptResult, PromptMessage, Role};
 use rmcp::{prompt, prompt_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -60,7 +60,7 @@ pub struct SoulArchReviewArgs {
 }
 
 fn user_text(text: String) -> Vec<PromptMessage> {
-    vec![PromptMessage::new_text(PromptMessageRole::User, text)]
+    vec![PromptMessage::new_text(Role::User, text)]
 }
 
 /// Split a comma- or whitespace-separated list of file paths, keeping only

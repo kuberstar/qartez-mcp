@@ -1,12 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import Copy from '@lucide/svelte/icons/copy';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import { fetchClones } from '$lib/api';
-	import type { ClonesResponse } from '$lib/types';
+	import { fetchClones } from '#lib/api.js';
+	import type { ClonesResponse } from '#lib/types.js';
 
 	let data = $state<ClonesResponse | null>(null);
 	let loadError = $state<string | null>(null);

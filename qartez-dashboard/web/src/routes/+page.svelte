@@ -3,13 +3,13 @@
 	import { select, range } from 'd3';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import { Badge } from '$lib/components/ui/badge';
-	import { dashboardSocket } from '$lib/ws.svelte';
-	import { fetchProject, fetchFocusedFile, triggerReindex } from '$lib/api';
-	import type { ProjectSummary, DashboardEvent, FocusedFile } from '$lib/types';
-	import SymbolPanel from '$lib/components/SymbolPanel.svelte';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import { Badge } from '#lib/components/ui/badge/index.js';
+	import { dashboardSocket } from '#lib/ws.svelte.js';
+	import { fetchProject, fetchFocusedFile, triggerReindex } from '#lib/api.js';
+	import type { ProjectSummary, DashboardEvent, FocusedFile } from '#lib/types.js';
+	import SymbolPanel from '#lib/components/SymbolPanel.svelte';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import DatabaseZap from '@lucide/svelte/icons/database-zap';
 
 	async function onPulseReindex(): Promise<void> {

@@ -22,7 +22,7 @@
   </p>
   <p align="center">
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-dual-blue.svg"></a>
-    <img alt="MSRV 1.88" src="https://img.shields.io/badge/MSRV-1.88-orange.svg">
+    <img alt="MSRV 1.90" src="https://img.shields.io/badge/MSRV-1.90-orange.svg">
     <img alt="38 languages" src="https://img.shields.io/badge/languages-38-green.svg">
     <img alt="43 MCP tools" src="https://img.shields.io/badge/MCP_tools-43-purple.svg">
   </p>
@@ -52,7 +52,7 @@ The fix isn't a smarter model. It's a smarter index.
 
 ## Quickstart
 
-**Platform support:** macOS 13+, Ubuntu 22.04+ (and other modern Linux, gnu or musl), Windows (native PowerShell 5.1+/7+) and WSL 2. Architectures: x86_64 and arm64. Rust MSRV is **1.88** - only needed for unsupported platforms or the `--from-source` escape hatch.
+**Platform support:** macOS 13+, Ubuntu 22.04+ (and other modern Linux, gnu or musl), Windows (native PowerShell 5.1+/7+) and WSL 2. Architectures: x86_64 and arm64. Rust MSRV is **1.90** - only needed for unsupported platforms or the `--from-source` escape hatch.
 
 ### Install (recommended)
 
@@ -70,7 +70,7 @@ curl -sSfL https://qartez.dev/install | sh
 powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/kuberstar/qartez-mcp/main/install.ps1 -useb | iex"
 ```
 
-Unsupported platforms (e.g. `linux-musl` arm64 without a published artifact) fall back to a local `cargo build` automatically; pass `--from-source` (bash) or `-FromSource` (PowerShell) to force that path. Rust MSRV **1.88** is only required for that fallback.
+Unsupported platforms (e.g. `linux-musl` arm64 without a published artifact) fall back to a local `cargo build` automatically; pass `--from-source` (bash) or `-FromSource` (PowerShell) to force that path. Rust MSRV **1.90** is only required for that fallback.
 
 Open any project in your IDE - Qartez indexes it automatically on session start. No manual step needed. The file watcher keeps the index fresh as you edit.
 
@@ -408,7 +408,7 @@ One binary. No per-language setup. All 38 languages parsed by tree-sitter (with 
 | Language | Extensions / Filenames |
 |---|---|
 | TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` `.mts` `.cts` `.mjs` `.cjs` |
-| Svelte | `.svelte` - the component, its `<script>` (TS/JS) symbols, its `<style>` (CSS) rules, and components used in markup; `$lib` imports resolved |
+| Svelte | `.svelte` - the component, its `<script>` (TS/JS) symbols, its `<style>` (CSS) rules, and components used in markup; `$lib` and `#lib` imports resolved |
 | Rust | `.rs` |
 | Go | `.go` |
 | Python | `.py` `.pyi` |

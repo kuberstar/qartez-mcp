@@ -609,10 +609,7 @@ fn debounce_paths(
         let opened = Instant::now();
         let mut pending: HashSet<PathBuf> = HashSet::from([first]);
         let mut disconnected = false;
-        loop {
-            let Some(left) = max_wait.checked_sub(opened.elapsed()) else {
-                break;
-            };
+        while let Some(left) = max_wait.checked_sub(opened.elapsed()) {
             match raw_rx.recv_timeout(quiet.min(left)) {
                 Ok(path) => {
                     pending.insert(path);

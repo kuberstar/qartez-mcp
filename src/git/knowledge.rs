@@ -94,7 +94,7 @@ pub fn analyze_knowledge(
         let total_lines: u32 = author_lines.values().sum();
 
         let mut authors: Vec<(String, u32)> = author_lines.into_iter().collect();
-        authors.sort_by(|a, b| b.1.cmp(&a.1));
+        authors.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         if let Some(filter) = author_filter {
             let filter_lower = filter.to_lowercase();
@@ -174,7 +174,7 @@ pub fn rollup_modules(files: &[FileAuthorship]) -> Vec<ModuleKnowledge> {
                 }
             }
             let mut top_authors: Vec<(String, u32)> = combined.into_iter().collect();
-            top_authors.sort_by(|a, b| b.1.cmp(&a.1));
+            top_authors.sort_by_key(|a| std::cmp::Reverse(a.1));
             let bus_factor = compute_bus_factor(&top_authors, total_lines);
 
             ModuleKnowledge {

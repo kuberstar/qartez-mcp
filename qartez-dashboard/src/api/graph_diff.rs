@@ -70,9 +70,11 @@ pub struct GraphDiffResponse {
 /// Allowed character set for `against`. Covers refs (`HEAD`, `HEAD~10`,
 /// `HEAD^`), SHAs (`a1b2c3d`), branch and tag names with slashes, and
 /// the dot used in `..` ranges. Everything else is rejected to keep
-/// shell metacharacters out of the `git` invocation.
+/// shell metacharacters out of the `git` invocation. A leading `-` is
+/// rejected too, so the value can never be parsed as a `git` option
+/// (`--output=...`, `--git-dir=...`).
 fn is_valid_against(rev: &str) -> bool {
-    if rev.is_empty() {
+    if rev.is_empty() || rev.starts_with('-') {
         return false;
     }
     rev.chars()
@@ -229,6 +231,8 @@ fn git_rev_parse(root: &Path, rev: &str) -> Result<String, String> {
         .arg("-C")
         .arg(root)
         .arg("rev-parse")
+        .arg("--verify")
+        .arg("--end-of-options")
         .arg(rev)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -307,6 +311,9 @@ mod tests {
             "HEAD|cat",
             "HEAD&&ls",
             "rev>file",
+            "-h",
+            "--git-dir",
+            "--output=/tmp/x",
         ] {
             assert!(
                 !is_valid_against(invalid),
@@ -329,6 +336,45 @@ mod tests {
         assert_eq!(response.against, "HEAD~10");
         assert_eq!(response.resolved_sha, "");
         assert_eq!(response.error.as_deref(), Some("index db missing"));
+    }
+
+    #[test]
+    fn git_rev_parse_never_treats_rev_as_an_option() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let sha = git_rev_parse(tmp.path(), "HEAD").expect("HEAD resolves");
+        assert_eq!(sha.len(), 40);
+        // Without `--end-of-options` these print a path / succeed as
+        // options instead of failing as unknown revisions.
+        for option in ["--git-dir", "--show-toplevel", "--is-inside-work-tree"] {
+            assert!(
+                git_rev_parse(tmp.path(), option).is_err(),
+                "`{option}` must not be parsed as a git option"
+            );
+        }
     }
 
     #[test]

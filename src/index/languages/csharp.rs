@@ -396,7 +396,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
             // `obj.Method` - try "name" field, fall back to last identifier child.
             node.child_by_field_name("name")
                 .or_else(|| {
-                    node.child(node.child_count().saturating_sub(1) as u32)
+                    node.child(node.child_count().saturating_sub(1))
                         .filter(|n| {
                             matches!(n.kind(), "identifier" | "identifier_name" | "generic_name")
                         })
@@ -426,7 +426,7 @@ fn extract_type_name(node: Node, source: &[u8]) -> String {
         "qualified_name" => {
             // Take the rightmost simple name.
             node.child_by_field_name("right")
-                .or_else(|| node.child(node.child_count().saturating_sub(1) as u32))
+                .or_else(|| node.child(node.child_count().saturating_sub(1)))
                 .map(|n| node_text(n, source))
                 .unwrap_or_default()
         }

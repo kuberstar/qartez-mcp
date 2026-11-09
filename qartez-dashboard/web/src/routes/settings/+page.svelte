@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import { Button } from '$lib/components/ui/button';
-	import EmptyState from '$lib/components/EmptyState.svelte';
-	import { fetchHealth, fetchProject, triggerReindex } from '$lib/api';
-	import type { ProjectSummary } from '$lib/types';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
+	import { fetchHealth, fetchProject, triggerReindex } from '#lib/api.js';
+	import type { ProjectSummary } from '#lib/types.js';
 	import PlugZap from '@lucide/svelte/icons/plug-zap';
 
 	type ColorScheme = 'auto' | 'light' | 'dark';

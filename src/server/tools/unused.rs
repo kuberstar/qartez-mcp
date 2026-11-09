@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use regex::RegexSet;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -136,10 +136,10 @@ fn is_test_symbol(sym: &crate::storage::models::SymbolRow, path: &str) -> bool {
     if basename.contains(".test.") || basename.contains(".spec.") {
         return true;
     }
-    if let Some(stem) = basename.split('.').next() {
-        if stem.ends_with("_test") {
-            return true;
-        }
+    if let Some(stem) = basename.split('.').next()
+        && stem.ends_with("_test")
+    {
+        return true;
     }
     // Name-based conventions, restricted to callables so type names like
     // `TestConfig` are not swept in: pytest/Rust `test_*`, Go `TestXxx`.
@@ -510,7 +510,7 @@ mod reachable_tests {
 
     #[test]
     fn render_reachable_dead_paginates_and_reports_next_offset() {
-        let rows = vec![sym(1, "a", false), sym(2, "b", false), sym(3, "c", false)];
+        let rows = [sym(1, "a", false), sym(2, "b", false), sym(3, "c", false)];
         let dead: Vec<&(SymbolRow, String)> = rows.iter().collect();
 
         let page = render_reachable_dead(&dead, 2, 0);

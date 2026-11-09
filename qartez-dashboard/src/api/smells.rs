@@ -173,7 +173,7 @@ pub(crate) fn load_long_params(conn: &Connection, limit: i64) -> anyhow::Result<
             }
         }
     }
-    out.sort_by(|a, b| b.param_count.cmp(&a.param_count));
+    out.sort_by_key(|a| std::cmp::Reverse(a.param_count));
     Ok(out)
 }
 

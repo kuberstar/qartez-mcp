@@ -18,7 +18,7 @@ use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 
 use qartez_mcp::graph::blast;
-use qartez_mcp::guard::{self, FileFacts, GuardConfig, HookInput};
+use qartez_mcp::guard::{self, FileFacts, GuardConfig, HookInput, bash};
 use qartez_mcp::storage::read;
 
 #[derive(Parser, Debug)]
@@ -79,6 +79,16 @@ fn run() -> anyhow::Result<()> {
 
     let tool_name_lower = hook.tool_name.to_lowercase();
 
+    // Shell-exploration guard. Current Claude Code builds search and read
+    // code only through Bash, so this is where the qartez nudge has to live.
+    // A qartez tool call (matched with `mcp__qartez__.*`) ends the streak.
+    if tool_name_lower.starts_with("mcp__qartez__")
+        || matches!(tool_name_lower.as_str(), "bash" | "run_shell_command")
+    {
+        run_bash_guard(&hook, cli.project_root.clone());
+        return Ok(());
+    }
+
     // Glob/Grep guard: deny when .qartez exists (qartez tools should be used instead)
     // Supports both Claude (Glob, Grep) and Gemini (glob, grep_search) tool names
     if matches!(tool_name_lower.as_str(), "glob" | "grep" | "grep_search") {
@@ -89,21 +99,21 @@ fn run() -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(|cwd| guard::find_project_root(std::path::Path::new(cwd))),
         };
-        if let Some(root) = project_root {
-            if root.join(".qartez").is_dir() {
-                let reason = if tool_name_lower == "glob" || tool_name_lower == "grep_search" {
-                    "STOP: qartez MCP is available. Use `qartez_map` for project structure or `qartez_find` to locate symbols. Use Glob ONLY for non-code file patterns (e.g., *.toml, *.json) — if so, use Bash find/ls instead."
-                } else {
-                    "STOP: qartez MCP is available. Use `qartez_grep` for symbol search or `qartez_find` for definitions. Use Grep ONLY for non-symbol text search (e.g., TODO comments, string literals) — if so, use Bash grep instead."
-                };
-                if let Some(json) = guard::render_stdout(
-                    &guard::GuardDecision::Deny {
-                        reason: reason.to_string(),
-                    },
-                    hook.hook_event_name.as_deref(),
-                ) {
-                    println!("{json}");
-                }
+        if let Some(root) = project_root
+            && root.join(".qartez").is_dir()
+        {
+            let reason = if tool_name_lower == "glob" || tool_name_lower == "grep_search" {
+                "STOP: qartez MCP is available. Use `qartez_map` for project structure or `qartez_find` to locate symbols. For non-code file patterns (e.g., *.toml, *.json) use Bash `find`/`ls`."
+            } else {
+                "STOP: qartez MCP is available. Use `qartez_find` for definitions, `qartez_grep` for symbols, or `qartez_grep` with `search_bodies=true` for text inside code. For non-code files (Markdown, config, logs) use Bash `grep`."
+            };
+            if let Some(json) = guard::render_stdout(
+                &guard::GuardDecision::Deny {
+                    reason: reason.to_string(),
+                },
+                hook.hook_event_name.as_deref(),
+            ) {
+                println!("{json}");
             }
         }
         return Ok(());
@@ -240,6 +250,65 @@ fn merge_config(cli: &Cli) -> GuardConfig {
         cfg.ack_ttl_secs = v;
     }
     cfg
+}
+
+/// Shell-exploration guard for `Bash` calls, and streak reset on qartez
+/// calls. Fail-open: no project, no cwd, or any I/O problem means allow.
+fn run_bash_guard(hook: &HookInput, explicit_root: Option<PathBuf>) {
+    let Some(cwd) = hook.cwd.as_deref().map(PathBuf::from) else {
+        return;
+    };
+    let Some(root) = explicit_root.or_else(|| guard::find_project_root(&cwd)) else {
+        return;
+    };
+    // Paths in commands resolve against the real cwd, and project paths
+    // must compare equal to it: canonicalize both (macOS /tmp -> /private/tmp).
+    let root = root.canonicalize().unwrap_or(root);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if bash::is_home_root(&root, home.as_deref()) {
+        return;
+    }
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let state_file = bash::state_path(&root, hook.session_id.as_deref(), hook.agent_id.as_deref());
+    let mut state = bash::load_state(&state_file);
+
+    if hook.tool_name.to_lowercase().starts_with("mcp__qartez__") {
+        let before = state;
+        state.reset();
+        if state != before {
+            bash::save_state(&state_file, state);
+        }
+        return;
+    }
+    let Some(command) = hook.tool_input.command.as_deref() else {
+        return;
+    };
+    let classified = bash::classify(command, &cwd, &root);
+    if classified.explorations.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let verdict = bash::decide(
+        &mut state,
+        &classified,
+        now,
+        bash::BashGuardConfig::from_env(),
+    );
+    bash::save_state(&state_file, state);
+    let event = hook.hook_event_name.as_deref();
+    let out = match verdict {
+        bash::Verdict::Allow => None,
+        bash::Verdict::Context(text) => guard::render_context(&text, event),
+        bash::Verdict::Deny(reason) => {
+            guard::render_stdout(&guard::GuardDecision::Deny { reason }, event)
+        }
+    };
+    if let Some(json) = out {
+        println!("{json}");
+    }
 }
 
 fn resolve_project_root(hook_cwd: Option<&str>, file_path: &std::path::Path) -> Option<PathBuf> {

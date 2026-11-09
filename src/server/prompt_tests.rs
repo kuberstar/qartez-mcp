@@ -13,7 +13,7 @@
 //! attribute cannot silently drop a slash command.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{PromptMessageContent, PromptMessageRole};
+use rmcp::model::{ContentBlock, Role};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -39,9 +39,9 @@ fn user_text(result: &rmcp::model::GetPromptResult) -> &str {
         "prompts are single-turn recipes with exactly one user message"
     );
     let message = &result.messages[0];
-    assert_eq!(message.role, PromptMessageRole::User);
+    assert_eq!(message.role, Role::User);
     match &message.content {
-        PromptMessageContent::Text { text } => text.as_str(),
+        ContentBlock::Text(content) => content.text.as_str(),
         other => panic!("expected text content, got {other:?}"),
     }
 }

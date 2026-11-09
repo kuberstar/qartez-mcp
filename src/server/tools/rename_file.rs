@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -281,16 +281,15 @@ impl QartezServer {
         if old_rel_stem != new_rel_stem
             && let Some(parent_rel) = find_parent_mod_file(&self.project_root, &params.from)
             && let Ok(parent_abs) = self.safe_resolve(&parent_rel.to_string_lossy())
+            && let Ok(content) = std::fs::read_to_string(&parent_abs)
         {
-            if let Ok(content) = std::fs::read_to_string(&parent_abs) {
-                let rewritten = rewrite_mod_decl(&content, &old_rel_stem, &new_rel_stem);
-                if rewritten != content {
-                    if let Err(e) = refactor_common::write_atomic(&parent_abs, &rewritten) {
-                        failed_writes.push(e);
-                    } else {
-                        mod_rewrite_note =
-                            format!(", parent mod decl updated in {}", parent_rel.display(),);
-                    }
+            let rewritten = rewrite_mod_decl(&content, &old_rel_stem, &new_rel_stem);
+            if rewritten != content {
+                if let Err(e) = refactor_common::write_atomic(&parent_abs, &rewritten) {
+                    failed_writes.push(e);
+                } else {
+                    mod_rewrite_note =
+                        format!(", parent mod decl updated in {}", parent_rel.display(),);
                 }
             }
         }
