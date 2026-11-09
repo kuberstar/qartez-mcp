@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchFocusedFile } from '$lib/api';
-	import type { FocusedFile } from '$lib/types';
+	import { fetchFocusedFile } from '#lib/api.js';
+	import type { FocusedFile } from '#lib/types.js';
 
 	type Props = {
 		path: string | null;

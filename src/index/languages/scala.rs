@@ -365,7 +365,7 @@ fn record_reference(
             let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
             if parent_kind != "call_expression"
                 && let Some(field) = node.child_by_field_name("field").or_else(|| {
-                    node.child(node.child_count().saturating_sub(1) as u32)
+                    node.child(node.child_count().saturating_sub(1))
                         .filter(|n| matches!(n.kind(), "identifier" | "simple_identifier"))
                 })
             {
@@ -412,7 +412,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
     match node.kind() {
         "identifier" | "simple_identifier" => node_text(node, source),
         "field_expression" => node
-            .child(node.child_count().saturating_sub(1) as u32)
+            .child(node.child_count().saturating_sub(1))
             .filter(|n| matches!(n.kind(), "identifier" | "simple_identifier"))
             .map(|n| node_text(n, source))
             .unwrap_or_default(),

@@ -139,7 +139,7 @@ fn collect_top_tables(conn: &Connection) -> Vec<TableStat> {
             row_count: count,
         });
     }
-    out.sort_by(|a, b| b.row_count.cmp(&a.row_count));
+    out.sort_by_key(|a| std::cmp::Reverse(a.row_count));
     out
 }
 

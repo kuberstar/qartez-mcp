@@ -1177,7 +1177,7 @@ mod tests {
         // path is joined onto the sole root regardless of what its first
         // component is.
         let root = std::path::PathBuf::from("/tmp/qartez-test-root");
-        let out = resolve_abs_path("src/lib.rs", &[root.clone()]);
+        let out = resolve_abs_path("src/lib.rs", std::slice::from_ref(&root));
         assert_eq!(out, root.join("src/lib.rs"));
     }
 

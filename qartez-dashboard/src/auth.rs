@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use axum::extract::State;
 use axum_extra::extract::cookie::CookieJar;
 use http::{HeaderValue, Request, StatusCode, header};
-use rand::TryRngCore;
+use rand::TryRng;
 
 use crate::paths;
 use crate::state::AppState;
@@ -35,12 +35,12 @@ pub const SESSION_COOKIE: &str = "qartez_session";
 /// resolve `qartez.localhost`, so we also accept the literal loopback origins.
 const ALLOWED_ORIGIN_HOSTS: &[&str] = &["qartez.localhost", "localhost", "127.0.0.1"];
 
-/// Generate a fresh 32-byte hex token. Source: `OsRng`.
+/// Generate a fresh 32-byte hex token. Source: `SysRng` (the OS CSPRNG).
 pub fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
-        .expect("OsRng should never fail on a healthy system");
+        .expect("SysRng should never fail on a healthy system");
     hex::encode(bytes)
 }
 

@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import AlertTriangle from '@lucide/svelte/icons/triangle-alert';
-	import { fetchSmells } from '$lib/api';
-	import type { GodFunction, LongParams, SmellsResponse } from '$lib/types';
+	import { fetchSmells } from '#lib/api.js';
+	import type { GodFunction, LongParams, SmellsResponse } from '#lib/types.js';
 
 	type Severity = 'all' | 'high' | 'med';
 

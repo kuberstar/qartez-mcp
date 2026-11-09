@@ -12,13 +12,13 @@
 		type ZoomBehavior
 	} from 'd3';
 	import { goto } from '$app/navigation';
-	import { dashboardSocket } from '$lib/ws.svelte';
-	import { fetchGraph, fetchSymbolSearch, fetchGraphDiff, triggerReindex } from '$lib/api';
-	import type { GraphResponse, GraphDiffResponse } from '$lib/types';
-	import FocusPanel from '$lib/components/FocusPanel.svelte';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { dashboardSocket } from '#lib/ws.svelte.js';
+	import { fetchGraph, fetchSymbolSearch, fetchGraphDiff, triggerReindex } from '#lib/api.js';
+	import type { GraphResponse, GraphDiffResponse } from '#lib/types.js';
+	import FocusPanel from '#lib/components/FocusPanel.svelte';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import DatabaseZap from '@lucide/svelte/icons/database-zap';
-	import { hotColor, clusterColor, HOT_LEGEND_STOPS } from '$lib/map/colors';
+	import { hotColor, clusterColor, HOT_LEGEND_STOPS } from '#lib/map/colors.js';
 	import {
 		createForceGraph,
 		paintCanvas,
@@ -26,7 +26,7 @@
 		type ForceGraphHandle,
 		type ForceGraphNode,
 		type ForceGraphLink
-	} from '$lib/map/force-graph';
+	} from '#lib/map/force-graph.js';
 
 	type ViewMode = 'language' | 'hotspots' | 'clusters' | 'diff';
 	type RenderMode = 'auto' | 'svg' | 'canvas';

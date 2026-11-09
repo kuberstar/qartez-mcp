@@ -139,7 +139,7 @@ pub(super) fn extract_callee_name(node: tree_sitter::Node, source: &[u8]) -> Str
             } else {
                 let count = node.child_count();
                 if count > 0 {
-                    if let Some(last) = node.child((count - 1) as u32) {
+                    if let Some(last) = node.child(count - 1) {
                         last.utf8_text(source).unwrap_or("").to_string()
                     } else {
                         String::new()

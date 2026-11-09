@@ -1572,7 +1572,9 @@ mod guard_binary {
             .env_remove("QARTEZ_GUARD_DISABLE")
             .env_remove("QARTEZ_GUARD_PAGERANK_MIN")
             .env_remove("QARTEZ_GUARD_BLAST_MIN")
-            .env_remove("QARTEZ_GUARD_ACK_TTL_SECS");
+            .env_remove("QARTEZ_GUARD_ACK_TTL_SECS")
+            .env_remove("QARTEZ_GUARD_BASH_STREAK")
+            .env_remove("QARTEZ_GUARD_BASH_COOLDOWN_SECS");
         let mut child = cmd.spawn().expect("spawn qartez-guard");
         child
             .stdin
@@ -1614,6 +1616,55 @@ mod guard_binary {
         assert!(out.contains("deny"));
         assert!(out.contains("qartez_impact"));
         assert!(out.contains(&hub));
+    }
+
+    /// The shell block survives a plain retry and is lifted by a qartez call:
+    /// the binary must persist a reset even when only the block, not the
+    /// streak, is non-zero.
+    #[test]
+    fn bash_block_holds_until_a_qartez_call() {
+        let (dir, _db, hub) = indexed_project();
+        let call = |tool: &str, input: serde_json::Value| {
+            let payload = serde_json::json!({
+                "session_id": "block-test",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+                "cwd": dir.path(),
+            })
+            .to_string();
+            run_guard(dir.path(), &payload, &[])
+        };
+        let read = || {
+            call(
+                "Bash",
+                serde_json::json!({"command": format!("sed -n 1,5p {hub}")}),
+            )
+        };
+        assert_eq!(read(), "");
+        assert_eq!(read(), "");
+        assert!(
+            read().contains("\"deny\""),
+            "third code read must be denied"
+        );
+        let retry = read();
+        assert!(
+            retry.contains("Still blocked"),
+            "plain retry must stay blocked: {retry}"
+        );
+        assert_eq!(
+            call(
+                "mcp__qartez__qartez_read",
+                serde_json::json!({"file_path": hub})
+            ),
+            ""
+        );
+        assert_eq!(read(), "", "a qartez call must lift the block");
+        let acked = call(
+            "Bash",
+            serde_json::json!({"command": format!("QARTEZ_SHELL=1 sed -n 1,5p {hub}")}),
+        );
+        assert_eq!(acked, "", "an acked read always passes");
     }
 
     #[test]

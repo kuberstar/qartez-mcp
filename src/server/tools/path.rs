@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -121,12 +121,12 @@ impl QartezServer {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(k) = kind_filter {
-            if !matches!(k, "call" | "type") {
-                return Err(format!(
-                    "unknown kind '{k}'. Valid edge kinds: 'call', 'type' (omit to traverse both)."
-                ));
-            }
+        if let Some(k) = kind_filter
+            && !matches!(k, "call" | "type")
+        {
+            return Err(format!(
+                "unknown kind '{k}'. Valid edge kinds: 'call', 'type' (omit to traverse both)."
+            ));
         }
 
         let token_budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET as u32) as usize;

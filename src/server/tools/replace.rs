@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -753,10 +753,8 @@ fn extract_return_type(after: &str) -> Option<String> {
     let s = after.trim_start();
     let body = if let Some(rest) = s.strip_prefix("->") {
         rest
-    } else if let Some(rest) = s.strip_prefix(':') {
-        rest
     } else {
-        return None;
+        s.strip_prefix(':')?
     };
     // Walk depth so `Result<T, E>` does not get clipped by its inner
     // `,` or `>`. Stop at a top-level `{`, `where`, or `;`.

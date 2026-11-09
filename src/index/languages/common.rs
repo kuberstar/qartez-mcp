@@ -12,7 +12,7 @@ use crate::str_utils::floor_char_boundary;
 pub(super) const MAX_SIGNATURE_LEN: usize = 200;
 
 pub(super) fn children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    (0..node.child_count() as u32).filter_map(move |i| node.child(i))
+    (0..node.child_count()).filter_map(move |i| node.child(i))
 }
 
 pub(super) fn unquote(s: &str) -> String {

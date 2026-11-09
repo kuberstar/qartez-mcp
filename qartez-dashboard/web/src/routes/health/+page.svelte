@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Card, CardHeader, CardTitle, CardContent } from '$lib/components/ui/card';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { Card, CardHeader, CardTitle, CardContent } from '#lib/components/ui/card/index.js';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import HeartPulse from '@lucide/svelte/icons/heart-pulse';
-	import { fetchProjectHealth } from '$lib/api';
-	import type { HealthFile, ProjectHealthResponse, HealthSeverity } from '$lib/types';
+	import { fetchProjectHealth } from '#lib/api.js';
+	import type { HealthFile, ProjectHealthResponse, HealthSeverity } from '#lib/types.js';
 
 	type SeverityFilter = HealthSeverity | 'all';
 

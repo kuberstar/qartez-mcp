@@ -493,10 +493,10 @@ pub fn build_scenario_report(
 /// comparison has been computed. Called from the runner after
 /// `build_scenario_report` + set_compare.
 pub fn fill_effective_savings(report: &mut ScenarioReport) {
-    if let Some(ref sc) = report.set_comparison {
-        if sc.recall > 0.0 {
-            report.savings.effective_savings_pct = Some(report.savings.tokens_pct * sc.recall);
-        }
+    if let Some(ref sc) = report.set_comparison
+        && sc.recall > 0.0
+    {
+        report.savings.effective_savings_pct = Some(report.savings.tokens_pct * sc.recall);
     }
 }
 

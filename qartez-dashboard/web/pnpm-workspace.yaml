@@ -3,7 +3,6 @@ onlyBuiltDependencies:
   - '@tailwindcss/oxide'
 
 overrides:
-  cookie: '^1.0.2'
   # Security floors for transitive deps the direct ranges do not reach
   # (pnpm audit, 2026-11-05): devalue via svelte, postcss/nanoid via the
   # shadcn-svelte CLI, source-map-js via @tailwindcss/node.

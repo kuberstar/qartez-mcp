@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -483,7 +483,7 @@ fn detect_long_params(
             });
         }
     }
-    out.sort_by(|a, b| b.param_count.cmp(&a.param_count));
+    out.sort_by_key(|a| std::cmp::Reverse(a.param_count));
     out
 }
 
@@ -655,12 +655,11 @@ fn detect_feature_envy(
             // Fallback: dominant-method check for single-method dispatch
             // shapes where the aggregate trait_calls sum misses a widely
             // implemented name (defensive, kept for backward compat).
-            if let Some(ref dispatch) = trait_dispatch_method {
-                if let Some(&m_count) = methods.get(dispatch.as_str()) {
-                    if m_count + 1 >= *ext_count {
-                        continue;
-                    }
-                }
+            if let Some(ref dispatch) = trait_dispatch_method
+                && let Some(&m_count) = methods.get(dispatch.as_str())
+                && m_count + 1 >= *ext_count
+            {
+                continue;
             }
 
             let ratio = if own_calls == 0 {

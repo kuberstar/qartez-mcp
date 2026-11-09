@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, ErrorData, GetPromptRequestParams, GetPromptResult,
+    CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResult,
     Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, RawResource, ReadResourceRequestParams, ReadResourceResult,
-    ResourceContents, ServerCapabilities, ServerInfo,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    Resource, ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, prompt_handler, tool, tool_handler, tool_router};
@@ -198,11 +198,7 @@ impl QartezServer {
         // `use super::*;`). A one-time rebuild on startup is cheap - it
         // reads each indexed file once and inserts a row per symbol body
         // - and subsequent opens short-circuit via the count check.
-        let body_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols_body_fts", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
+        let body_count = body_fts_row_count(&conn);
         let symbol_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
             .unwrap_or(0);
@@ -254,6 +250,28 @@ impl QartezServer {
     /// also use it to assert the watcher pipeline is wired up.
     pub fn watch_enabled(&self) -> bool {
         self.watch_enabled
+    }
+
+    /// The tools advertised in `tools/list`: every enabled tool, with the
+    /// core navigation tools marked to load upfront when a project is open.
+    ///
+    /// Outside a project (`db_path` is `None`) nothing is marked, so a
+    /// session started in a non-code directory pays no upfront context.
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        let enabled = self
+            .enabled_tools
+            .read()
+            .expect("enabled_tools lock poisoned");
+        let mut tools: Vec<_> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| enabled.contains(t.name.as_ref()))
+            .collect();
+        if self.db_path.is_some() {
+            tiers::mark_always_load(&mut tools);
+        }
+        tools
     }
 
     /// Spawn a `notify` watcher for `root` and remember the join
@@ -532,13 +550,13 @@ impl QartezServer {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for QartezServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut caps = ServerCapabilities::builder().enable_tools();
         if tiers::is_progressive_mode() {
             caps = caps.enable_tool_list_changed();
         }
         let caps = caps.enable_prompts().enable_resources().build();
-        ServerInfo::new(caps)
+        ServerConfig::new(caps)
             .with_server_info(Implementation::new("qartez-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(include_str!("mcp_instructions.md"))
     }
@@ -548,21 +566,7 @@ impl ServerHandler for QartezServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        let enabled = self
-            .enabled_tools
-            .read()
-            .expect("enabled_tools lock poisoned");
-        let tools = self
-            .tool_router
-            .list_all()
-            .into_iter()
-            .filter(|t| enabled.contains(t.name.as_ref()))
-            .collect();
-        std::future::ready(Ok(ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        }))
+        std::future::ready(Ok(ListToolsResult::with_all_items(self.listed_tools())))
     }
 
     fn list_resources(
@@ -570,66 +574,35 @@ impl ServerHandler for QartezServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        let overview = Annotated {
-            raw: RawResource {
-                uri: "qartez://overview".to_string(),
-                name: "Codebase Overview".to_string(),
-                title: Some("Qartez Codebase Overview".to_string()),
-                description: Some(
-                    "Ranked overview of the most important files, symbols, and dependency structure"
-                        .to_string(),
-                ),
-                mime_type: Some("text/plain".to_string()),
-                size: None,
-                icons: None,
-                meta: None,
-            },
-            annotations: None,
-        };
-        let hotspots = Annotated {
-            raw: RawResource {
-                uri: "qartez://hotspots".to_string(),
-                name: "Hotspots".to_string(),
-                title: Some("Code Hotspots".to_string()),
-                description: Some(
-                    "Top files ranked by composite score (complexity x coupling x change frequency)"
-                        .to_string(),
-                ),
-                mime_type: Some("text/plain".to_string()),
-                size: None,
-                icons: None,
-                meta: None,
-            },
-            annotations: None,
-        };
-        let stats = Annotated {
-            raw: RawResource {
-                uri: "qartez://stats".to_string(),
-                name: "Project Stats".to_string(),
-                title: Some("Project Statistics".to_string()),
-                description: Some(
-                    "File counts, LOC, symbol counts, language breakdown, and top imported files"
-                        .to_string(),
-                ),
-                mime_type: Some("text/plain".to_string()),
-                size: None,
-                icons: None,
-                meta: None,
-            },
-            annotations: None,
-        };
-        std::future::ready(Ok(ListResourcesResult {
-            meta: None,
-            resources: vec![overview, hotspots, stats],
-            next_cursor: None,
-        }))
+        let overview = Resource::new("qartez://overview", "Codebase Overview")
+            .with_title("Qartez Codebase Overview")
+            .with_description(
+                "Ranked overview of the most important files, symbols, and dependency structure",
+            )
+            .with_mime_type("text/plain");
+        let hotspots = Resource::new("qartez://hotspots", "Hotspots")
+            .with_title("Code Hotspots")
+            .with_description(
+                "Top files ranked by composite score (complexity x coupling x change frequency)",
+            )
+            .with_mime_type("text/plain");
+        let stats = Resource::new("qartez://stats", "Project Stats")
+            .with_title("Project Statistics")
+            .with_description(
+                "File counts, LOC, symbol counts, language breakdown, and top imported files",
+            )
+            .with_mime_type("text/plain");
+        std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+            overview, hotspots, stats,
+        ])))
     }
 
     fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
+    {
         let result = match request.uri.as_str() {
             "qartez://overview" => {
                 let text = self.build_overview(20, 4000, None, None, false, false, false);
@@ -668,7 +641,78 @@ impl ServerHandler for QartezServer {
                 None,
             )),
         };
-        std::future::ready(result)
+        std::future::ready(result.map(ReadResourceResponse::from))
+    }
+}
+
+/// Number of rows in `symbols_body_fts`, read from its `_docsize` shadow
+/// table.
+///
+/// `COUNT(*)` on the FTS5 table itself walks the whole content store: on a
+/// 2.5 GB index it took 3-6 s, and it ran before `serve()`, so the MCP
+/// `initialize` reply (and with it every tool) arrived seconds late. The
+/// shadow table holds exactly one small row per document, so counting it
+/// is a cheap b-tree scan. Falls back to the slow count if the shadow
+/// table is missing (an FTS5 table declared with `columnsize=0`), and to 0
+/// if neither query succeeds.
+fn body_fts_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM symbols_body_fts_docsize", [], |row| {
+        row.get(0)
+    })
+    .or_else(|_| {
+        conn.query_row("SELECT COUNT(*) FROM symbols_body_fts", [], |row| {
+            row.get(0)
+        })
+    })
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod body_fts_count_tests {
+    use super::body_fts_row_count;
+    use rusqlite::Connection;
+
+    fn schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::schema::create_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn counts_match_the_fts_table() {
+        let conn = schema_conn();
+        assert_eq!(body_fts_row_count(&conn), 0);
+        for i in 1..=3 {
+            conn.execute(
+                "INSERT INTO symbols_body_fts (rowid, body) VALUES (?1, 'fn body')",
+                [i],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM symbols_body_fts WHERE rowid = 2", [])
+            .unwrap();
+        let slow: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols_body_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(slow, 2);
+        assert_eq!(body_fts_row_count(&conn), slow);
+    }
+
+    #[test]
+    fn falls_back_when_the_shadow_table_is_absent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE symbols_body_fts USING fts5(body, columnsize=0);
+             INSERT INTO symbols_body_fts (rowid, body) VALUES (1, 'a'), (2, 'b');",
+        )
+        .unwrap();
+        assert_eq!(body_fts_row_count(&conn), 2);
+    }
+
+    #[test]
+    fn missing_table_counts_as_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(body_fts_row_count(&conn), 0);
     }
 }
 
@@ -713,6 +757,113 @@ mod progressive_tests {
         let server = test_server();
         let enabled = server.enabled_tools.read().unwrap();
         assert!(enabled.contains("qartez_tools"));
+    }
+
+    #[test]
+    fn always_load_tools_are_registered_core_tools() {
+        let server = test_server();
+        let all = server.tool_router.list_all();
+        let names: HashSet<&str> = all.iter().map(|t| t.name.as_ref()).collect();
+        for &name in tiers::ALWAYS_LOAD_TOOLS {
+            assert!(names.contains(name), "{name} is not a registered tool");
+            assert!(
+                tiers::TIER_CORE.contains(&name),
+                "{name} must stay in the core tier so progressive mode lists it"
+            );
+        }
+    }
+
+    fn always_load_flag(tool: &rmcp::model::Tool) -> Option<&serde_json::Value> {
+        tool.meta
+            .as_ref()
+            .and_then(|m| m.0.get(tiers::ALWAYS_LOAD_META_KEY))
+    }
+
+    #[test]
+    fn listed_tools_mark_only_core_navigation_tools_in_a_project() {
+        let mut server = test_server();
+        server.db_path = Some(PathBuf::from("/tmp/test/.qartez/index.db"));
+        let tools = server.listed_tools();
+        let marked: BTreeSet<&str> = tools
+            .iter()
+            .filter(|t| always_load_flag(t) == Some(&serde_json::Value::Bool(true)))
+            .map(|t| t.name.as_ref())
+            .collect();
+        let expected: BTreeSet<&str> = tiers::ALWAYS_LOAD_TOOLS.iter().copied().collect();
+        assert_eq!(marked, expected);
+        // Every other tool must carry no alwaysLoad flag at all, so the
+        // host keeps it deferred.
+        for tool in tools.iter().filter(|t| !expected.contains(t.name.as_ref())) {
+            assert!(always_load_flag(tool).is_none(), "{} is flagged", tool.name);
+        }
+    }
+
+    /// Claude Code cuts server instructions at 4,096 characters and the
+    /// model sees only the text before the cut.
+    #[test]
+    fn instructions_fit_the_host_limit() {
+        let text = include_str!("mcp_instructions.md");
+        assert!(
+            text.chars().count() < 4096,
+            "mcp_instructions.md is {} chars; Claude Code truncates at 4096",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn instructions_name_only_real_tools() {
+        let server = test_server();
+        let all = server.tool_router.list_all();
+        let names: HashSet<&str> = all.iter().map(|t| t.name.as_ref()).collect();
+        let text = include_str!("mcp_instructions.md");
+        let mentioned: BTreeSet<&str> = text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| w.starts_with("qartez_") && w.len() > "qartez_".len())
+            .collect();
+        assert!(!mentioned.is_empty());
+        // `/qartez_review` and friends are prompts, not tools.
+        let prompts = [
+            "qartez_review",
+            "qartez_architecture",
+            "qartez_debug",
+            "qartez_onboard",
+            "qartez_pre_merge",
+            "qartez_arch_review",
+        ];
+        for name in mentioned {
+            assert!(
+                names.contains(name) || prompts.contains(&name),
+                "instructions mention unknown tool {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_tools_mark_nothing_outside_a_project() {
+        let server = test_server();
+        assert!(server.db_path.is_none());
+        assert!(
+            server
+                .listed_tools()
+                .iter()
+                .all(|t| always_load_flag(t).is_none())
+        );
+    }
+
+    #[test]
+    fn always_load_flag_serializes_as_tool_meta() {
+        let mut server = test_server();
+        server.db_path = Some(PathBuf::from("/tmp/test/.qartez/index.db"));
+        let read = server
+            .listed_tools()
+            .into_iter()
+            .find(|t| t.name == "qartez_read")
+            .expect("qartez_read is listed");
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(
+            wire["_meta"]["anthropic/alwaysLoad"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]

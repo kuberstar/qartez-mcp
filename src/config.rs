@@ -333,10 +333,10 @@ fn normalize_for_dedup(path: &Path) -> PathBuf {
 
 /// Expand a path string relative to `base`, handling `~/` home expansion.
 pub(crate) fn expand_path(path_str: &str, base: &Path) -> PathBuf {
-    if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Some(home) = cross_platform_home() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path_str.strip_prefix("~/")
+        && let Some(home) = cross_platform_home()
+    {
+        return home.join(rest);
     }
     base.join(path_str)
 }
@@ -473,10 +473,10 @@ fn fallback_db_bases(anchor: &Path) -> Vec<PathBuf> {
 /// `~/.cache`. Returns `None` when no home directory can be located, leaving
 /// the OS temp dir as the only fallback.
 fn persistent_cache_root() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg));
     }
     cross_platform_home().map(|home| home.join(".cache"))
 }

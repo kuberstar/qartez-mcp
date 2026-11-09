@@ -1,7 +1,7 @@
 //! Cross-process advisory lock for write-heavy index phases.
 //!
 //! `RepoLock` wraps a per-repository lock file at `<qartez_dir>/index.lock` and
-//! uses an OS-level advisory file lock (`fs4::fs_std::FileExt`) to serialize
+//! uses an OS-level advisory file lock (`std::fs::File::try_lock`) to serialize
 //! concurrent qartez processes that would otherwise race against the same
 //! `.qartez/index.db`. Even with `journal_mode=WAL`, SQLite still serializes
 //! writers via the database header lock, so two qartez processes performing
@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fs4::fs_std::FileExt;
+use std::fs::TryLockError;
 
 /// Default total deadline for `RepoLock::acquire`. Long enough to cover a
 /// full re-index of a moderately-sized repository on the holder side, short
@@ -122,13 +122,13 @@ impl RepoLock {
     pub fn try_acquire(qartez_dir: &Path) -> Result<Option<Self>, LockError> {
         let path = lock_path(qartez_dir);
         let file = open_lock_file(&path)?;
-        match file.try_lock_exclusive() {
-            Ok(true) => {
+        match file.try_lock() {
+            Ok(()) => {
                 write_pid(qartez_dir)?;
                 Ok(Some(RepoLock { file, path }))
             }
-            Ok(false) => Ok(None),
-            Err(e) => Err(LockError::Io {
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => Err(LockError::Io {
                 path: path.clone(),
                 source: e,
             }),
@@ -160,12 +160,12 @@ impl RepoLock {
         let mut backoff = INITIAL_BACKOFF;
 
         loop {
-            match file.try_lock_exclusive() {
-                Ok(true) => {
+            match file.try_lock() {
+                Ok(()) => {
                     write_pid(qartez_dir)?;
                     return Ok(RepoLock { file, path });
                 }
-                Ok(false) => {
+                Err(TryLockError::WouldBlock) => {
                     let elapsed = start.elapsed();
                     if elapsed >= deadline {
                         let holder_pid = read_pid(qartez_dir);
@@ -176,7 +176,7 @@ impl RepoLock {
                     std::thread::sleep(sleep_for);
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
-                Err(e) => {
+                Err(TryLockError::Error(e)) => {
                     return Err(LockError::Io {
                         path: path.clone(),
                         source: e,
@@ -201,7 +201,7 @@ impl Drop for RepoLock {
         // creates a TOCTOU race where another process opens a different
         // inode and gets its own lock concurrently. Cargo's `flock.rs` and
         // git's `.lock` files follow the same leave-on-disk convention.
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 

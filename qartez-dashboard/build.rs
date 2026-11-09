@@ -15,8 +15,13 @@ use std::process::Command;
 /// browser actually parses on first paint. Warning-only.
 ///
 /// Raised from 100 KB in M9 to absorb the new settings page, reindex
-/// button, EmptyState component, and WS reconnect plumbing.
-const IMMUTABLE_GZIP_BUDGET_BYTES: u64 = 120 * 1024;
+/// button, EmptyState component, and WS reconnect plumbing. Raised to
+/// 130 KB for SvelteKit 3 (needed to clear its open security advisories),
+/// whose client runtime and payload entry add about 6.7 KB gzipped. Raised
+/// to 140 KB for the 2026-11 dependency refresh: tailwind-merge 3.7 and
+/// d3 7.9.2 add about 9 KB (tailwind-variants 4 goes through its `lite`
+/// entry so it does not ship a second merge engine).
+const IMMUTABLE_GZIP_BUDGET_BYTES: u64 = 140 * 1024;
 
 /// Extensions counted toward the budget. Anything else is excluded.
 const BUDGETED_EXTENSIONS: &[&str] = &["js", "css"];
@@ -24,7 +29,7 @@ const BUDGETED_EXTENSIONS: &[&str] = &["js", "css"];
 fn main() {
     println!("cargo:rerun-if-changed=web/src");
     println!("cargo:rerun-if-changed=web/package.json");
-    println!("cargo:rerun-if-changed=web/svelte.config.js");
+    println!("cargo:rerun-if-changed=web/vite.config.ts");
     println!("cargo:rerun-if-env-changed=QARTEZ_SKIP_WEB_BUILD");
 
     if std::env::var_os("QARTEZ_SKIP_WEB_BUILD").is_some() {

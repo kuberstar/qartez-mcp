@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -112,7 +112,7 @@ impl QartezServer {
                     "`disable: [\"refactor\"]` still hides a tier for the current session even outside progressive mode.\n",
                 );
             }
-            return Ok(CallToolResult::success(vec![Content::text(out)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(out)]));
         }
 
         // Reject overlap between the two lists up front. Previously a
@@ -305,6 +305,6 @@ impl QartezServer {
                 tiers::ALL_TIER_NAMES.join(", "),
             ));
         }
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 }

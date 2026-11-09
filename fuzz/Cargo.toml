@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 qartez-mcp = { path = ".." }
-toml_edit = { version = "0.22", features = ["serde"] }
+toml_edit = { version = "0.25", features = ["serde"] }
 
 [[bin]]
 name = "parse_boundary_config"

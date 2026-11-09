@@ -20,12 +20,15 @@ Use qartez for **all** code-related exploration and analysis work.
 
 Use built-in tools only for non-code content or when qartez cannot handle the request.
 
-| Built-in intent | Qartez replacement |
+| Built-in or shell intent | Qartez replacement |
 |---|---|
-| `glob` / `ls` / find | `qartez_map` |
-| `grep` / `rg` | `qartez_grep` or `qartez_find` |
-| `read` / `cat` on source (exploration) | `qartez_read` |
+| `glob` / `ls` / `find` | `qartez_map` |
+| `grep` / `rg` for a name | `qartez_find` (definition) or `qartez_grep` (symbols) |
+| `grep` / `rg` for text inside code | `qartez_grep` with `search_bodies=true` |
+| `read` / `cat` / `sed -n 120,180p` / `head` on source (exploration) | `qartez_read` (`symbol_name`, or `file_path` + `start_line`/`limit`) |
 | outline/API surface read | `qartez_outline` |
+
+Current Claude Code builds have no Grep/Glob tools: code search and reads go through Bash, so the shell commands above are exactly what qartez replaces. Keep the shell for Markdown, config, logs, files outside the project and filtering command output. The `qartez-guard` shell hook denies the third consecutive shell read/search of source code with the exact qartez call to use instead (see `references/guard.md`).
 
 `qartez_read` is for **exploration**. When you are about to make a non-symbol `Edit` (imports, partial-line tweaks, config, multi-block edits), a built-in `Read` of the exact target range first is the correct path - the harness must record it in `readFileState` before `Edit`/`Write` succeeds. `qartez_read` does not populate that state. For symbol-level changes, prefer the qartez mutators (Section 5), which need no prior `Read`.
 | dependency inspection | `qartez_deps` |
