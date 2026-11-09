@@ -34,11 +34,15 @@ build: ## Build release binaries
 
 install: build ## Build and install binaries to ~/.local/bin
 	@mkdir -p $(INSTALL_DIR)
+	@# Copy to a temp name and rename over the old binary: a running qartez
+	@# (one per open agent session) keeps its own inode, whereas `cp` onto
+	@# it rewrites the pages it is executing and macOS kills it.
 	@for bin in qartez qartez-guard qartez-setup; do \
-		cp $(TARGET_DIR)/release/$$bin $(INSTALL_DIR)/$$bin; \
+		cp $(TARGET_DIR)/release/$$bin $(INSTALL_DIR)/.$$bin.new || exit 1; \
 		if [ "$$(uname)" = "Darwin" ]; then \
-			codesign -s - -f $(INSTALL_DIR)/$$bin 2>/dev/null || true; \
+			codesign -s - -f $(INSTALL_DIR)/.$$bin.new 2>/dev/null || true; \
 		fi; \
+		mv -f $(INSTALL_DIR)/.$$bin.new $(INSTALL_DIR)/$$bin || exit 1; \
 		echo "\033[0;32m[+]\033[0m Binary: $(INSTALL_DIR)/$$bin ($$(wc -c < $(TARGET_DIR)/release/$$bin | awk '{printf "%.1f MB", $$1/1048576}'))"; \
 	done
 	@ln -sf qartez $(INSTALL_DIR)/qartez-mcp

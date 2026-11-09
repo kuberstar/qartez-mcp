@@ -305,19 +305,20 @@ fn extract_definition_from_source(line: &str) -> Option<String> {
 fn extract_file_line_pair(line: &str) -> Option<String> {
     // Direct `file:line` format
     let parts: Vec<&str> = line.splitn(3, ':').collect();
-    if parts.len() >= 2 && looks_like_path(parts[0]) {
-        if let Ok(_line_num) = parts[1].trim().parse::<u32>() {
-            return Some(format!("{}:{}", normalize_path(parts[0]), parts[1].trim()));
-        }
+    if parts.len() >= 2
+        && looks_like_path(parts[0])
+        && let Ok(_line_num) = parts[1].trim().parse::<u32>()
+    {
+        return Some(format!("{}:{}", normalize_path(parts[0]), parts[1].trim()));
     }
     // MCP `file L42` format
     let words: Vec<&str> = line.split_whitespace().collect();
-    if words.len() >= 2 && looks_like_path(words[0]) {
-        if let Some(line_str) = words[1].strip_prefix('L') {
-            if line_str.parse::<u32>().is_ok() {
-                return Some(format!("{}:{}", normalize_path(words[0]), line_str));
-            }
-        }
+    if words.len() >= 2
+        && looks_like_path(words[0])
+        && let Some(line_str) = words[1].strip_prefix('L')
+        && line_str.parse::<u32>().is_ok()
+    {
+        return Some(format!("{}:{}", normalize_path(words[0]), line_str));
     }
     None
 }

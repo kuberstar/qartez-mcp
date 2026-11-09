@@ -84,6 +84,45 @@ pub(super) const TIER_META: &[&str] = &[
 /// The `qartez_tools` discovery tool is always visible regardless of mode.
 pub(super) const META_TOOL_NAME: &str = "qartez_tools";
 
+/// Tools whose schema the client should load upfront instead of hiding
+/// behind its tool search.
+///
+/// Claude Code defers every MCP tool by default: the model sees only the
+/// name until it runs `ToolSearch`, so in practice it falls back to shell
+/// `grep`/`sed`/`cat` and never calls qartez. These six cover the
+/// navigate-read-assess loop; the rest stay deferred to keep the upfront
+/// context cost small (about 3.5k tokens for these versus about 23k for
+/// every tool).
+pub(super) const ALWAYS_LOAD_TOOLS: &[&str] = &[
+    "qartez_map",
+    "qartez_find",
+    "qartez_grep",
+    "qartez_read",
+    "qartez_outline",
+    "qartez_impact",
+];
+
+/// `_meta` key Claude Code reads to exempt one tool from tool-search
+/// deferral. Other MCP hosts ignore unknown `_meta` keys.
+pub(super) const ALWAYS_LOAD_META_KEY: &str = "anthropic/alwaysLoad";
+
+/// Marks the [`ALWAYS_LOAD_TOOLS`] in `tools` with
+/// `_meta: {"anthropic/alwaysLoad": true}`, keeping any existing `_meta`.
+pub(super) fn mark_always_load(tools: &mut [rmcp::model::Tool]) {
+    for tool in tools
+        .iter_mut()
+        .filter(|t| ALWAYS_LOAD_TOOLS.contains(&t.name.as_ref()))
+    {
+        tool.meta
+            .get_or_insert_with(rmcp::model::MetaObject::default)
+            .0
+            .insert(
+                ALWAYS_LOAD_META_KEY.to_owned(),
+                serde_json::Value::Bool(true),
+            );
+    }
+}
+
 /// Maps a tier name string to its tool list.
 pub(super) fn tier_tools(tier: &str) -> Option<&'static [&'static str]> {
     match tier {

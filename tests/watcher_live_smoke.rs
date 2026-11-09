@@ -55,6 +55,39 @@ fn wait_for_symbol(conn: &Arc<Mutex<Connection>>, name: &str, timeout: Duration)
     false
 }
 
+/// Block until the watcher pipeline is live, instead of sleeping a fixed
+/// interval after spawning it.
+///
+/// `Watcher::run` shells out to `git config` for the global excludes file
+/// before it registers the OS watcher, and an edit made before registration
+/// is never reported. Under load (background QoS, a busy machine) that
+/// setup outlasted the old fixed 400 ms sleep, so every edit in the run was
+/// lost and all three tests failed together. Rewriting a sentinel file
+/// with a fresh symbol until one gets indexed proves events flow end to end.
+async fn wait_until_watching(root: &Path, db: &Arc<Mutex<Connection>>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0u32;
+    while Instant::now() < deadline {
+        let name = format!("watch_ready_{attempt}");
+        write_file(
+            root,
+            "src/watch_ready.rs",
+            &format!("pub fn {name}() {{}}\n"),
+        );
+        let seen = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || wait_for_symbol(&db, &name, Duration::from_secs(1))
+        })
+        .await
+        .unwrap();
+        if seen {
+            return;
+        }
+        attempt += 1;
+    }
+    panic!("watcher never indexed the readiness sentinel within 30 s");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_picks_up_a_file_modification() {
     let tmp = TempDir::new().unwrap();
@@ -75,8 +108,7 @@ async fn watcher_picks_up_a_file_modification() {
         let _ = watcher.run().await;
     });
 
-    // Give the OS-level watcher a moment to register before editing.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_until_watching(&root, &db).await;
 
     write_file(
         &root,
@@ -84,11 +116,12 @@ async fn watcher_picks_up_a_file_modification() {
         "pub fn alpha() {}\npub fn omega() {}\n",
     );
 
-    // Allow up to 5 s: debounce (200 ms) + drain (500 ms) + reindex + FSEvents
-    // latency on slow CI runners.
+    // Allow up to 15 s, matching the delete test: debounce (200 ms) + drain
+    // (500 ms) + reindex + FSEvents latency, which stretches past 5 s on an
+    // overloaded runner.
     let saw_it = tokio::task::spawn_blocking({
         let db = db.clone();
-        move || wait_for_symbol(&db, "omega", Duration::from_secs(5))
+        move || wait_for_symbol(&db, "omega", Duration::from_secs(15))
     })
     .await
     .unwrap();
@@ -116,13 +149,13 @@ async fn watcher_picks_up_a_new_file_in_a_subdir() {
         let _ = watcher.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_until_watching(&root, &db).await;
 
     write_file(&root, "src/extra.rs", "pub fn zeta() {}\n");
 
     let saw_it = tokio::task::spawn_blocking({
         let db = db.clone();
-        move || wait_for_symbol(&db, "zeta", Duration::from_secs(5))
+        move || wait_for_symbol(&db, "zeta", Duration::from_secs(15))
     })
     .await
     .unwrap();
@@ -164,7 +197,7 @@ async fn watcher_processes_a_delete() {
         let _ = watcher.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_until_watching(&root, &db).await;
     std::fs::remove_file(root.join("src/transient.rs")).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);

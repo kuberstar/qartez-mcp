@@ -4,11 +4,11 @@
 	import '@fontsource/inter/latin-500.css';
 	import '@fontsource/inter/latin-600.css';
 	import '@fontsource/jetbrains-mono/latin-400.css';
-	import favicon from '$lib/assets/favicon.svg';
+	import favicon from '#lib/assets/favicon.svg';
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
-	import { dashboardSocket } from '$lib/ws.svelte';
-	import { fetchHealth, triggerReindex } from '$lib/api';
+	import { dashboardSocket } from '#lib/ws.svelte.js';
+	import { fetchHealth, triggerReindex } from '#lib/api.js';
 	import Activity from '@lucide/svelte/icons/activity';
 	import Network from '@lucide/svelte/icons/network';
 	import Boxes from '@lucide/svelte/icons/boxes';

@@ -27,7 +27,7 @@ impl LanguageSupport for YamlSupport {
         let mut references = Vec::new();
         let root = tree.root_node();
 
-        for i in 0..root.child_count() as u32 {
+        for i in 0..root.child_count() {
             if let Some(doc) = root.child(i)
                 && doc.kind() == "document"
             {
@@ -666,7 +666,7 @@ fn collect_key_values_recursive(
         }
         return;
     }
-    for i in 0..node.child_count() as u32 {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             collect_key_values_recursive(child, target_key, source, symbols);
         }
@@ -739,7 +739,7 @@ fn collect_refs_recursive(node: Node, source: &[u8], refs: &mut Vec<(String, Str
             return;
         }
     }
-    for i in 0..node.child_count() as u32 {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             collect_refs_recursive(child, source, refs);
         }
@@ -1043,7 +1043,7 @@ fn find_top_mapping(doc: Node) -> Option<Node> {
 }
 
 fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    for i in 0..node.child_count() as u32 {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i)
             && child.kind() == kind
         {
@@ -1054,7 +1054,7 @@ fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 }
 
 fn iter_mapping_pairs(mapping: Node) -> impl Iterator<Item = Node> {
-    (0..mapping.child_count() as u32)
+    (0..mapping.child_count())
         .filter_map(move |i| mapping.child(i))
         .filter(|n| n.kind() == "block_mapping_pair")
 }
@@ -1068,7 +1068,7 @@ fn iter_sequence_items(node: Node) -> impl Iterator<Item = Node> {
 fn collect_sequence_items<'a>(node: Node<'a>, items: &mut Vec<Node<'a>>) {
     match node.kind() {
         "block_sequence" => {
-            for i in 0..node.child_count() as u32 {
+            for i in 0..node.child_count() {
                 if let Some(child) = node.child(i)
                     && child.kind() == "block_sequence_item"
                 {
@@ -1078,7 +1078,7 @@ fn collect_sequence_items<'a>(node: Node<'a>, items: &mut Vec<Node<'a>>) {
         }
         "flow_sequence" => {
             // Flow sequences: [a, b, c]
-            for i in 0..node.child_count() as u32 {
+            for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     match child.kind() {
                         // Skip brackets and commas
@@ -1089,7 +1089,7 @@ fn collect_sequence_items<'a>(node: Node<'a>, items: &mut Vec<Node<'a>>) {
             }
         }
         "block_node" | "flow_node" => {
-            for i in 0..node.child_count() as u32 {
+            for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     collect_sequence_items(child, items);
                 }
@@ -1111,7 +1111,7 @@ fn scalar_text_recursive(node: Node, source: &[u8]) -> Option<String> {
     if let Some(text) = scalar_text(node, source) {
         return Some(text);
     }
-    for i in 0..node.child_count() as u32 {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i)
             && let Some(text) = scalar_text_recursive(child, source)
         {
@@ -1148,7 +1148,7 @@ fn find_block_mapping_recursive(node: Node) -> Option<Node> {
     if node.kind() == "block_mapping" {
         return Some(node);
     }
-    for i in 0..node.child_count() as u32 {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i)
             && let Some(found) = find_block_mapping_recursive(child)
         {
@@ -1193,7 +1193,7 @@ fn pair_value_text(pair: Node, source: &[u8]) -> Option<String> {
 fn scalar_text(node: Node, source: &[u8]) -> Option<String> {
     match node.kind() {
         "flow_node" | "block_node" => {
-            for i in 0..node.child_count() as u32 {
+            for i in 0..node.child_count() {
                 if let Some(child) = node.child(i)
                     && let Some(text) = scalar_text(child, source)
                 {

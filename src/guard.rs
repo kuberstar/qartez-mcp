@@ -15,6 +15,8 @@
 // flags.
 #![allow(dead_code)]
 
+pub mod bash;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -93,16 +95,25 @@ impl GuardConfig {
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
     pub tool_name: String,
+    #[serde(default)]
     pub tool_input: ToolInput,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub hook_event_name: Option<String>,
+    /// Session the hook fired in; keys the shell-exploration streak.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Set when the hook fires inside a subagent, which keeps its own streak.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
+    /// Shell command of a `Bash` / `run_shell_command` call.
+    pub command: Option<String>,
 }
 
 /// Result of evaluating a hook payload against the index.
@@ -214,6 +225,24 @@ pub fn render_stdout(decision: &GuardDecision, event_name: Option<&str>) -> Opti
             }
         }
     }
+}
+
+/// Render a non-blocking reminder: the tool call proceeds and `text` is
+/// added to the model's context. Claude Code only; Gemini CLI's
+/// `BeforeTool` has no equivalent, so nothing is printed there.
+pub fn render_context(text: &str, event_name: Option<&str>) -> Option<String> {
+    if event_name == Some("BeforeTool") {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": text,
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// Walk up from `start` until a directory containing `.qartez/index.db` is

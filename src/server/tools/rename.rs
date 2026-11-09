@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -389,7 +389,7 @@ impl QartezServer {
                             let new_line = format!(
                                 "{}{}{}",
                                 &old_line[..offset_in_line],
-                                &params.new_name,
+                                params.new_name,
                                 &old_line[end_offset..],
                             );
                             changes.push((rel_path.clone(), line_num, old_line, new_line));

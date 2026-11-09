@@ -82,7 +82,9 @@ fn walk(
             }
             return;
         }
-        "type_synomym" => {
+        // tree-sitter-haskell 0.24 fixed the node name (0.23 spelled it
+        // `type_synomym`).
+        "type_synonym" => {
             if let Some(sym) = extract_type_head(node, source, SymbolKind::Type) {
                 symbols.push(sym);
             }
@@ -405,20 +407,18 @@ fn record_reference(
                 }
             }
         }
-        "variable" => {
-            if should_record_variable(node) {
-                let name = node_text(node, source);
-                if !name.is_empty() && !is_builtin(&name) {
-                    references.push(ExtractedReference {
-                        name,
-                        line,
-                        from_symbol_idx: enclosing,
-                        kind: ReferenceKind::Use,
-                        qualifier: None,
-                        receiver_type_hint: None,
-                        via_method_syntax: false,
-                    });
-                }
+        "variable" if should_record_variable(node) => {
+            let name = node_text(node, source);
+            if !name.is_empty() && !is_builtin(&name) {
+                references.push(ExtractedReference {
+                    name,
+                    line,
+                    from_symbol_idx: enclosing,
+                    kind: ReferenceKind::Use,
+                    qualifier: None,
+                    receiver_type_hint: None,
+                    via_method_syntax: false,
+                });
             }
         }
         _ => {}

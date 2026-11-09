@@ -530,10 +530,9 @@ fn extract_require_include(node: Node, source: &[u8]) -> Option<ExtractedImport>
         rest.trim()
     } else if let Some(rest) = trimmed.strip_prefix("include_once") {
         rest.trim()
-    } else if let Some(rest) = trimmed.strip_prefix("include") {
-        rest.trim()
     } else {
-        return None;
+        let rest = trimmed.strip_prefix("include")?;
+        rest.trim()
     };
 
     let path = common::unquote(path);

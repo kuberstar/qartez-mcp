@@ -960,6 +960,25 @@ fn install_claude_one(
         warn("qartez-guard binary not found; glob/grep guard hook skipped");
     }
 
+    // PreToolUse: shell-exploration guard. Current Claude Code builds have
+    // no Grep/Glob tools and read code through Bash, so this is the entry
+    // that actually steers the agent to qartez; the `mcp__qartez__` half
+    // resets its streak whenever a qartez tool is used.
+    if let Some(guard) = guard_bin_path.as_deref() {
+        ensure_hook_entry(
+            &mut settings,
+            "PreToolUse",
+            HookEntry {
+                matcher: BASH_GUARD_MATCHER,
+                search_term: "qartez-guard",
+                command: guard,
+                timeout: 3000,
+            },
+        );
+    } else {
+        warn("qartez-guard binary not found; shell guard hook skipped");
+    }
+
     // PreToolUse: Edit|Write|MultiEdit modification guard
     if let Some(guard) = guard_bin_path.as_deref() {
         ensure_hook_entry(
@@ -1044,6 +1063,10 @@ struct HookEntry<'a> {
 /// - `qartez-session-start` matches the legacy shell-script variant
 const SESSION_START_SEARCH_TERMS: &[&str] =
     &["qartez-setup", "--session-start", "qartez-session-start"];
+
+/// `PreToolUse` matcher for the shell-exploration guard: every Bash call,
+/// plus every qartez tool call (which resets the guard's streak).
+const BASH_GUARD_MATCHER: &str = "Bash|mcp__qartez__.*";
 
 /// Format a binary path for use as an IDE hook `command` string.
 ///
@@ -3073,7 +3096,7 @@ fn run_session_start() -> anyhow::Result<()> {
 
     // Skip dangerous roots
     let home = home_dir();
-    if project_dir == home || project_dir == PathBuf::from("/") {
+    if project_dir == home || project_dir.as_path() == std::path::Path::new("/") {
         return Ok(());
     }
 
@@ -3199,7 +3222,6 @@ fn update_cache_is_fresh() -> bool {
 // returned file handle must be kept alive for the duration of the
 // critical section - dropping it releases the lock.
 fn acquire_update_lock() -> Option<fs::File> {
-    use fs4::fs_std::FileExt;
     let path = home_dir().join(".qartez").join("update.lock");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -3210,10 +3232,7 @@ fn acquire_update_lock() -> Option<fs::File> {
         .truncate(false)
         .open(&path)
         .ok()?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Some(file),
-        Ok(false) | Err(_) => None,
-    }
+    file.try_lock().is_ok().then_some(file)
 }
 
 // SemVer §11: a pre-release version has lower precedence than the
@@ -4392,8 +4411,14 @@ command = \"/usr/bin/qartez\"
         );
         assert_eq!(
             pretool_entries.len(),
-            2,
-            "expected exactly 2 PreToolUse hooks (Glob|Grep and Edit|Write|MultiEdit): {pretool_entries:#?}"
+            3,
+            "expected exactly 3 PreToolUse hooks (Glob|Grep, Bash|mcp__qartez__.* and Edit|Write|MultiEdit): {pretool_entries:#?}"
+        );
+        assert!(
+            pretool_entries
+                .iter()
+                .any(|e| e["matcher"] == BASH_GUARD_MATCHER),
+            "shell guard hook missing: {pretool_entries:#?}"
         );
     }
 
@@ -4472,7 +4497,7 @@ command = \"/usr/bin/qartez\"
         let session = settings["hooks"]["SessionStart"].as_array().unwrap();
         let pretool = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(session.len(), 1, "SessionStart must not be duplicated");
-        assert_eq!(pretool.len(), 2, "PreToolUse must stay at two entries");
+        assert_eq!(pretool.len(), 3, "PreToolUse must stay at three entries");
         for hook_array in [session, pretool] {
             for entry in hook_array {
                 for hook in entry["hooks"].as_array().unwrap() {

@@ -12,14 +12,14 @@
 		type ZoomBehavior
 	} from 'd3';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
-	import { dashboardSocket } from '$lib/ws.svelte';
-	import { fetchSymbolGraph, triggerReindex } from '$lib/api';
-	import type { SymbolGraphResponse } from '$lib/types';
-	import SymbolPanel from '$lib/components/SymbolPanel.svelte';
-	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { page } from '$app/state';
+	import { dashboardSocket } from '#lib/ws.svelte.js';
+	import { fetchSymbolGraph, triggerReindex } from '#lib/api.js';
+	import type { SymbolGraphResponse } from '#lib/types.js';
+	import SymbolPanel from '#lib/components/SymbolPanel.svelte';
+	import EmptyState from '#lib/components/EmptyState.svelte';
 	import DatabaseZap from '@lucide/svelte/icons/database-zap';
-	import { kindColor, fileColor, KIND_LEGEND } from '$lib/map/symbol-colors';
+	import { kindColor, fileColor, KIND_LEGEND } from '#lib/map/symbol-colors.js';
 	import {
 		createForceGraph,
 		paintCanvas,
@@ -27,7 +27,7 @@
 		type ForceGraphHandle,
 		type ForceGraphNode,
 		type ForceGraphLink
-	} from '$lib/map/force-graph';
+	} from '#lib/map/force-graph.js';
 
 	type ColorBy = 'file' | 'kind';
 	type RenderMode = 'auto' | 'svg' | 'canvas';
@@ -496,7 +496,7 @@
 
 	onMount(() => {
 		loadPersisted();
-		const param = $page.url.searchParams.get('neighbors_of');
+		const param = page.url.searchParams.get('neighbors_of');
 		if (param !== null) {
 			const parsed = parseInt(param, 10);
 			if (Number.isFinite(parsed)) neighborsOf = parsed;

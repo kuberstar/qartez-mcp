@@ -300,7 +300,7 @@ fn record_reference(
             if parent_kind != "call_expression"
                 && let Some(prop) = node
                     .child_by_field_name("suffix")
-                    .or_else(|| node.child(node.child_count().saturating_sub(1) as u32))
+                    .or_else(|| node.child(node.child_count().saturating_sub(1)))
                 && matches!(prop.kind(), "simple_identifier" | "identifier")
             {
                 let name = node_text(prop, source);
@@ -357,7 +357,7 @@ fn extract_callee_name(node: Node, source: &[u8]) -> String {
         "simple_identifier" | "identifier" => node_text(node, source),
         "navigation_expression" => {
             // `obj.method` - use the rightmost identifier as the callee name
-            node.child(node.child_count().saturating_sub(1) as u32)
+            node.child(node.child_count().saturating_sub(1))
                 .filter(|n| matches!(n.kind(), "simple_identifier" | "identifier"))
                 .map(|n| node_text(n, source))
                 .unwrap_or_default()

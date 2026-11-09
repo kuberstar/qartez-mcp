@@ -198,7 +198,7 @@ fn incremental_index_updates_body_fts_for_changed_file() {
     f.set_modified(now).unwrap();
     drop(f);
 
-    index::incremental_index(&conn, primary.path(), &[target.clone()], &[]).unwrap();
+    index::incremental_index(&conn, primary.path(), std::slice::from_ref(&target), &[]).unwrap();
 
     assert!(
         marker_hits(&conn, "MARKER_AFTER") >= 1,

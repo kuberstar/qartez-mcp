@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 
@@ -321,7 +321,7 @@ fn top_authors(authorships: &[crate::git::knowledge::FileAuthorship], n: usize) 
         }
     }
     let mut ranked: Vec<(String, u32)> = totals.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
     ranked.truncate(n);
     if ranked.is_empty() {
         return "(none)".to_string();

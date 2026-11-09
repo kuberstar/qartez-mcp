@@ -12,10 +12,12 @@ Qartez is an AST-based code intelligence MCP server. Use its tools instead of bu
 
 | Instead of | Use | When |
 |---|---|---|
-| File search (Glob, find, ls) | `qartez_map` | Project structure, finding files |
-| Text search (Grep, rg, grep) | `qartez_grep` | Searching for symbols, types, functions |
-| Symbol lookup (Grep, rg) | `qartez_find` | Jump to a specific symbol definition |
-| File reading (Read, cat, head) | `qartez_read` | Reading source code with semantic context |
+| File search (Glob, `find`, `ls`) | `qartez_map` | Project structure, finding files |
+| Text search (Grep, `rg`, `grep`) | `qartez_grep` | Symbols by name; `search_bodies=true` for text inside code |
+| Symbol lookup (Grep, `rg`) | `qartez_find` | Jump to a specific symbol definition |
+| File reading (Read, `cat`, `head`, `sed -n`) | `qartez_read` | Reading source code with semantic context |
+
+This holds for shell commands too: `grep`/`rg`/`sed -n`/`cat` over source code is the case qartez replaces. Keep the shell for Markdown, config, logs and filtering command output.
 
 ### All 21 tools
 
